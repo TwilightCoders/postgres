@@ -47,6 +47,7 @@
 #include "catalog/pg_parameter_acl.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_progsql_shadow.h"
 #include "catalog/pg_propgraph_element.h"
 #include "catalog/pg_propgraph_element_label.h"
 #include "catalog/pg_propgraph_label.h"
@@ -374,6 +375,20 @@ static const ObjectPropertyType ObjectProperty[] =
 		InvalidAttrNumber,
 		OBJECT_OPFAMILY,
 		true
+	},
+	{
+		"progsql shadow entry",
+		ProgsqlShadowRelationId,
+		ProgsqlShadowOidIndexId,
+		-1,
+		-1,
+		Anum_pg_progsql_shadow_oid,
+		InvalidAttrNumber,
+		InvalidAttrNumber,
+		InvalidAttrNumber,
+		InvalidAttrNumber,
+		-1,
+		false
 	},
 	{
 		"property graph element",
@@ -4103,6 +4118,10 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+		case ProgsqlShadowRelationId:
+			appendStringInfo(&buffer, _("progsql shadow entry %u"), object->objectId);
+			break;
+
 		case PropgraphElementLabelRelationId:
 			{
 				Relation	rel;
@@ -4899,6 +4918,10 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 
 		case PolicyRelationId:
 			appendStringInfoString(&buffer, "policy");
+			break;
+
+		case ProgsqlShadowRelationId:
+			appendStringInfoString(&buffer, "progsql shadow entry");
 			break;
 
 		case PropgraphElementRelationId:
@@ -6181,6 +6204,18 @@ getObjectIdentityParts(const ObjectAddress *object,
 					*objname = lappend(*objname, pstrdup(NameStr(pge->pgealias)));
 
 				ReleaseSysCache(tup);
+				break;
+			}
+
+		case ProgsqlShadowRelationId:
+			{
+				char	   *oidstr = psprintf("%u", object->objectId);
+
+				appendStringInfoString(&buffer, oidstr);
+				if (objname)
+					*objname = list_make1(oidstr);
+				else
+					pfree(oidstr);
 				break;
 			}
 

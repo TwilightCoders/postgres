@@ -631,11 +631,12 @@ select conname, contype, conrelid::regclass, conindid::regclass, conkey
   order by conrelid::regclass::text, conname;
 drop table idxpart;
 
--- Verify that multi-layer partitioning honors the requirement that all
--- columns in the partition key must appear in primary/unique key
+-- ProgreSQL: the shadow index enforces cross-partition uniqueness globally,
+-- so a primary/unique key is no longer required to include all partitioning
+-- columns.  Both of the following succeed where vanilla PostgreSQL would error.
 create table idxpart (a int, b int, primary key (a)) partition by range (a);
 create table idxpart2 partition of idxpart
-for values from (0) to (1000) partition by range (b); -- fail
+for values from (0) to (1000) partition by range (b);
 drop table idxpart;
 
 -- Ditto for the ATTACH PARTITION case

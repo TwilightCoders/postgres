@@ -27,6 +27,7 @@ backend_sources += files(
   'pg_operator.c',
   'pg_parameter_acl.c',
   'pg_proc.c',
+  'pg_progsql_shadow.c',
   'pg_publication.c',
   'pg_range.c',
   'pg_shdepend.c',

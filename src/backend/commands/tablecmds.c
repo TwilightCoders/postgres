@@ -49,6 +49,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_progsql_shadow.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic_ext.h"
@@ -2024,6 +2025,88 @@ ExecuteTruncate(TruncateStmt *stmt)
 }
 
 /*
+ * progsql_truncate_shadow_for_root
+ *		Helper for ExecuteTruncateGuts: TRUNCATE the shadow heap table
+ *		associated with a partitioned+inherited root relation.
+ *
+ * Uses heap_truncate (the same routine called internally by TRUNCATE) so we
+ * stay out of the parser/planner/executor stack — no SPI required.
+ */
+static void
+progsql_truncate_shadow_for_root(Oid shadowOid)
+{
+	heap_truncate(list_make1_oid(shadowOid));
+}
+
+/*
+ * progsql_delete_shadow_for_partition
+ *		Helper for ExecuteTruncateGuts: DELETE shadow rows whose
+ *		pss_child_relid matches the partition being truncated.
+ *
+ * Scans the shadow's pss_child_relid index directly with systable_beginscan
+ * and removes matching rows with simple_heap_delete.
+ */
+static void
+progsql_delete_shadow_for_partition(Oid shadowOid, Oid partRelid)
+{
+	Relation	shadowRel;
+	TupleDesc	shadowDesc;
+	Oid			childIdxOid = InvalidOid;
+	Relation	pg_progsql_shadow;
+	ScanKeyData lookupKey[1];
+	SysScanDesc lookupScan;
+	HeapTuple	lookupTup;
+	ScanKeyData skey[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	AttrNumber	pssChildAttno;
+
+	/* Resolve the child-index OID from pg_progsql_shadow. */
+	pg_progsql_shadow = table_open(ProgsqlShadowRelationId, AccessShareLock);
+	ScanKeyInit(&lookupKey[0],
+				Anum_pg_progsql_shadow_pssshadowid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(shadowOid));
+	lookupScan = systable_beginscan(pg_progsql_shadow,
+									InvalidOid, false, NULL, 1, lookupKey);
+	lookupTup = systable_getnext(lookupScan);
+	if (HeapTupleIsValid(lookupTup))
+	{
+		Form_pg_progsql_shadow form =
+			(Form_pg_progsql_shadow) GETSTRUCT(lookupTup);
+
+		childIdxOid = form->psschildidxid;
+	}
+	systable_endscan(lookupScan);
+	table_close(pg_progsql_shadow, AccessShareLock);
+
+	if (!OidIsValid(childIdxOid))
+		elog(ERROR,
+			 "progsql shadow: no child-index OID recorded for shadow %u",
+			 shadowOid);
+
+	shadowRel = table_open(shadowOid, RowExclusiveLock);
+	shadowDesc = RelationGetDescr(shadowRel);
+
+	/* pss_child_relid is the last column. */
+	pssChildAttno = (AttrNumber) shadowDesc->natts;
+
+	ScanKeyInit(&skey[0],
+				pssChildAttno,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(partRelid));
+
+	scan = systable_beginscan(shadowRel, childIdxOid, true,
+							  NULL, 1, skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		simple_heap_delete(shadowRel, &tup->t_self);
+
+	systable_endscan(scan);
+	table_close(shadowRel, RowExclusiveLock);
+}
+
+/*
  * ExecuteTruncateGuts
  *
  * Internal implementation of TRUNCATE.  This is called by the actual TRUNCATE
@@ -2381,6 +2464,70 @@ ExecuteTruncateGuts(List *explicit_rels,
 		XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
 		(void) XLogInsert(RM_HEAP_ID, XLOG_HEAP_TRUNCATE);
+	}
+
+	/*
+	 * ProgreSQL: keep the cross-partition shadow uniqueness tables in sync
+	 * with the truncate.  For each relation in the truncate list:
+	 *	 - if the relation is itself a shadowed root, TRUNCATE its shadow.
+	 *	 - else if a partition ancestor is a shadowed root, DELETE shadow
+	 *	   rows whose pss_child_relid equals this partition's OID.
+	 *
+	 * Track shadow OIDs we've already TRUNCATEd so we don't act on the same
+	 * shadow twice when several partitions of the same root appear together.
+	 */
+	{
+		List	   *truncated_shadows = NIL;
+
+		foreach(cell, rels)
+		{
+			Relation	rel = (Relation) lfirst(cell);
+			Oid			relOid = RelationGetRelid(rel);
+			Oid			shadowOid;
+
+			/* Case 1: this rel is itself a shadowed root. */
+			shadowOid = LookupProgsqlShadowForRoot(relOid);
+			if (OidIsValid(shadowOid))
+			{
+				if (!list_member_oid(truncated_shadows, shadowOid))
+				{
+					progsql_truncate_shadow_for_root(shadowOid);
+					truncated_shadows =
+						lappend_oid(truncated_shadows, shadowOid);
+				}
+				continue;
+			}
+
+			/* Case 2: walk ancestors to find a shadowed root. */
+			if (rel->rd_rel->relispartition)
+			{
+				List	   *ancestors = get_partition_ancestors(relOid);
+				ListCell   *acell;
+
+				foreach(acell, ancestors)
+				{
+					Oid			ancestorOid = lfirst_oid(acell);
+					Oid			ancShadowOid =
+						LookupProgsqlShadowForRoot(ancestorOid);
+
+					if (OidIsValid(ancShadowOid))
+					{
+						/*
+						 * If we've already TRUNCATEd this shadow because the
+						 * root is also in the list, the partition's rows are
+						 * already gone; skip.
+						 */
+						if (!list_member_oid(truncated_shadows, ancShadowOid))
+							progsql_delete_shadow_for_partition(ancShadowOid,
+																relOid);
+						break;
+					}
+				}
+				list_free(ancestors);
+			}
+		}
+
+		list_free(truncated_shadows);
 	}
 
 	/*

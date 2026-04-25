@@ -52,10 +52,17 @@
 
 #include "postgres.h"
 
+#include "access/amapi.h"
+#include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
 #include "access/xact.h"
+#include "catalog/index.h"
+#include "catalog/pg_progsql_shadow.h"
+#include "utils/fmgroids.h"
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
@@ -72,6 +79,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/injection_point.h"
+#include "utils/lsyscache.h"
 #include "utils/rangetypes.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -848,6 +856,286 @@ ExecGetUpdateNewTuple(ResultRelInfo *relinfo,
 	return ExecProject(newProj);
 }
 
+/*
+ * progsql_shadow_populate_slot
+ *		Populate a virtual slot for the shadow heap from the leaf-partition
+ *		slot's key columns plus the leaf relid.
+ *
+ * shadowSlot is cleared and stored as a virtual tuple on return.
+ */
+static void
+progsql_shadow_populate_slot(TupleDesc shadowDesc, TupleTableSlot *shadowSlot,
+							 TupleTableSlot *srcSlot, Oid leafRelid)
+{
+	TupleDesc	srcDesc = srcSlot->tts_tupleDescriptor;
+	int			natts = shadowDesc->natts;
+	int			i;
+
+	ExecClearTuple(shadowSlot);
+	slot_getallattrs(srcSlot);
+
+	for (i = 0; i < natts; i++)
+	{
+		Form_pg_attribute satt = TupleDescAttr(shadowDesc, i);
+		const char *colname = NameStr(satt->attname);
+
+		if (strcmp(colname, "pss_child_relid") == 0)
+		{
+			shadowSlot->tts_values[i] = ObjectIdGetDatum(leafRelid);
+			shadowSlot->tts_isnull[i] = false;
+		}
+		else
+		{
+			int			j;
+			bool		found = false;
+
+			for (j = 0; j < srcDesc->natts; j++)
+			{
+				Form_pg_attribute datt = TupleDescAttr(srcDesc, j);
+
+				if (datt->attisdropped)
+					continue;
+				if (strcmp(NameStr(datt->attname), colname) == 0)
+				{
+					shadowSlot->tts_values[i] = srcSlot->tts_values[j];
+					shadowSlot->tts_isnull[i] = srcSlot->tts_isnull[j];
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				elog(ERROR,
+					 "progsql shadow: column \"%s\" not found in source slot",
+					 colname);
+		}
+	}
+
+	ExecStoreVirtualTuple(shadowSlot);
+}
+
+/*
+ * ExecProgsqlShadowInsert
+ *		Insert a row into the ProgreSQL shadow table to enforce cross-partition
+ *		uniqueness for a partitioned+inherited table.
+ *
+ * shadowOid	- OID of the shadow heap table
+ * slot			- the tuple being inserted into the leaf partition
+ * leafRelid	- OID of the leaf partition (stored as pss_child_relid)
+ * estate		- the executor state used for ExecInsertIndexTuples
+ *
+ * We use direct heap and index APIs (no SPI).  The shadow table's UNIQUE
+ * index is what enforces cross-partition uniqueness: a duplicate in any
+ * partition will produce a unique_violation when ExecInsertIndexTuples
+ * inserts the corresponding index entry.
+ */
+static void
+ExecProgsqlShadowInsert(Oid shadowOid, TupleTableSlot *slot, Oid leafRelid,
+						EState *estate)
+{
+	Relation	shadowRel;
+	TupleDesc	shadowDesc;
+	TupleTableSlot *shadowSlot;
+	ResultRelInfo *shadowRelInfo;
+	List	   *recheckIndexes;
+
+	shadowRel = table_open(shadowOid, RowExclusiveLock);
+	shadowDesc = RelationGetDescr(shadowRel);
+
+	shadowSlot = MakeSingleTupleTableSlot(shadowDesc, &TTSOpsVirtual);
+	progsql_shadow_populate_slot(shadowDesc, shadowSlot, slot, leafRelid);
+
+	/* Insert into the shadow heap. */
+	simple_table_tuple_insert(shadowRel, shadowSlot);
+
+	/*
+	 * Build a transient ResultRelInfo just so we can drive
+	 * ExecInsertIndexTuples; this is where the UNIQUE constraint fires for
+	 * cross-partition duplicates.  For an immediate-mode unique index, a
+	 * duplicate triggers an error here.  For a deferred unique index, a
+	 * potential duplicate is recorded in the returned list and we hand that
+	 * to ExecARInsertTriggers so the deferred recheck trigger fires later
+	 * (at constraint check time / commit / SET CONSTRAINTS IMMEDIATE).
+	 */
+	shadowRelInfo = makeNode(ResultRelInfo);
+	InitResultRelInfo(shadowRelInfo, shadowRel, 0, NULL, 0);
+	ExecOpenIndices(shadowRelInfo, false);
+	recheckIndexes = ExecInsertIndexTuples(shadowRelInfo, estate, 0,
+										   shadowSlot, NIL, NULL);
+	ExecARInsertTriggers(estate, shadowRelInfo, shadowSlot,
+						 recheckIndexes, NULL);
+	list_free(recheckIndexes);
+	ExecCloseIndices(shadowRelInfo);
+
+	ExecDropSingleTupleTableSlot(shadowSlot);
+
+	/*
+	 * Keep the RowExclusiveLock until end of transaction so that any deferred
+	 * unique-constraint recheck triggers queued above can re-open the
+	 * relation with NoLock when they fire at commit time.
+	 */
+	table_close(shadowRel, NoLock);
+}
+
+/*
+ * progsql_shadow_get_key_index_oid
+ *		Look up the OID of the shadow's UNIQUE index on key columns.
+ *
+ * Resolves via pg_progsql_shadow's psskeyidxid column.
+ */
+static Oid
+progsql_shadow_get_key_index_oid(Oid shadowOid)
+{
+	Relation	pg_progsql_shadow;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			result = InvalidOid;
+
+	pg_progsql_shadow = table_open(ProgsqlShadowRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_progsql_shadow_pssshadowid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(shadowOid));
+
+	scan = systable_beginscan(pg_progsql_shadow,
+							  InvalidOid, false, NULL, 1, key);
+
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_progsql_shadow form = (Form_pg_progsql_shadow) GETSTRUCT(tup);
+
+		result = form->psskeyidxid;
+	}
+
+	systable_endscan(scan);
+	table_close(pg_progsql_shadow, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * ExecProgsqlShadowDelete
+ *		Delete the shadow row corresponding to a tuple being removed from a
+ *		leaf partition, so that the same key can be re-inserted later.
+ *
+ * shadowOid	- OID of the shadow heap table
+ * oldSlot		- a slot containing the old tuple's values (must be filled)
+ * leafRelid	- OID of the leaf partition (matched against pss_child_relid)
+ *
+ * Uses the shadow's UNIQUE index ("_pss_<indexOid>_key") to locate the row
+ * via systable_beginscan and then deletes it with simple_heap_delete.  No
+ * SPI involved.
+ */
+static void
+ExecProgsqlShadowDelete(Oid shadowOid, TupleTableSlot *oldSlot, Oid leafRelid)
+{
+	Relation	shadowRel;
+	Relation	keyIdxRel;
+	TupleDesc	shadowDesc;
+	TupleDesc	slotDesc;
+	int			nkeys;
+	int			i;
+	ScanKeyData *skeys;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			keyIdxOid;
+
+	shadowRel = table_open(shadowOid, RowExclusiveLock);
+	shadowDesc = RelationGetDescr(shadowRel);
+	slotDesc = oldSlot->tts_tupleDescriptor;
+
+	/* All columns except pss_child_relid (always last) are key columns. */
+	nkeys = shadowDesc->natts - 1;
+	Assert(nkeys >= 1);
+
+	keyIdxOid = progsql_shadow_get_key_index_oid(shadowOid);
+	if (!OidIsValid(keyIdxOid))
+		elog(ERROR,
+			 "progsql shadow: no key-index OID recorded for shadow %u",
+			 shadowOid);
+
+	/* Open the index so we can fetch its opfamily for the scan keys. */
+	keyIdxRel = index_open(keyIdxOid, RowExclusiveLock);
+
+	skeys = (ScanKeyData *) palloc(nkeys * sizeof(ScanKeyData));
+
+	slot_getallattrs(oldSlot);
+
+	for (i = 0; i < nkeys; i++)
+	{
+		Form_pg_attribute satt = TupleDescAttr(shadowDesc, i);
+		Oid			opfamily = keyIdxRel->rd_opfamily[i];
+		Oid			opcintype = keyIdxRel->rd_opcintype[i];
+		StrategyNumber eq_strategy;
+		Oid			operator;
+		RegProcedure regop;
+		Datum		val = (Datum) 0;
+		bool		isnull = true;
+		int			j;
+
+		/* Find the matching column in the slot by name. */
+		for (j = 0; j < slotDesc->natts; j++)
+		{
+			Form_pg_attribute datt = TupleDescAttr(slotDesc, j);
+
+			if (datt->attisdropped)
+				continue;
+			if (strcmp(NameStr(datt->attname), NameStr(satt->attname)) == 0)
+			{
+				val = oldSlot->tts_values[j];
+				isnull = oldSlot->tts_isnull[j];
+				break;
+			}
+		}
+
+		eq_strategy = IndexAmTranslateCompareType(COMPARE_EQ,
+												  keyIdxRel->rd_rel->relam,
+												  opfamily, false);
+		operator = get_opfamily_member(opfamily, opcintype, opcintype,
+									   eq_strategy);
+		if (!OidIsValid(operator))
+			elog(ERROR,
+				 "progsql shadow: missing equality operator for opfamily %u type %u",
+				 opfamily, opcintype);
+
+		regop = get_opcode(operator);
+
+		ScanKeyInit(&skeys[i],
+					(AttrNumber) (i + 1),
+					eq_strategy,
+					regop,
+					val);
+		skeys[i].sk_collation = keyIdxRel->rd_indcollation[i];
+		if (isnull)
+			skeys[i].sk_flags |= SK_ISNULL;
+	}
+
+	scan = systable_beginscan(shadowRel, keyIdxOid, true,
+							  NULL, nkeys, skeys);
+
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+	{
+		/*
+		 * The constraint key alone is unique, so at most one row will match.
+		 * We don't filter on pss_child_relid here; the row's leafRelid was
+		 * established at insert time and there can only be one shadow row per
+		 * key.
+		 */
+		simple_heap_delete(shadowRel, &tup->t_self);
+	}
+	/* If not found, the row was already gone — not an error. */
+
+	systable_endscan(scan);
+	index_close(keyIdxRel, RowExclusiveLock);
+	table_close(shadowRel, RowExclusiveLock);
+	pfree(skeys);
+
+	(void) leafRelid;			/* not used in the index lookup */
+}
+
 /* ----------------------------------------------------------------
  *		ExecInsert
  *
@@ -902,6 +1190,30 @@ ExecInsert(ModifyTableContext *context,
 	}
 
 	ExecMaterializeSlot(slot);
+
+	/*
+	 * ProgreSQL: enforce cross-partition uniqueness via shadow index.
+	 * Lazy-initialize: look up the shadow OID once per ModifyTable execution.
+	 * If a shadow table exists for this root relation, also insert a row
+	 * there; its UNIQUE index will fire on cross-partition duplicates.
+	 */
+	if (mtstate->operation == CMD_INSERT &&
+		mtstate->rootResultRelInfo != NULL)
+	{
+		if (!mtstate->mt_progsqlShadowValid)
+		{
+			Oid			rootRelId =
+				RelationGetRelid(mtstate->rootResultRelInfo->ri_RelationDesc);
+
+			mtstate->mt_progsqlShadowId = LookupProgsqlShadowForRoot(rootRelId);
+			mtstate->mt_progsqlShadowValid = true;
+		}
+		if (OidIsValid(mtstate->mt_progsqlShadowId))
+			ExecProgsqlShadowInsert(mtstate->mt_progsqlShadowId,
+									slot,
+									RelationGetRelid(resultRelInfo->ri_RelationDesc),
+									estate);
+	}
 
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 
@@ -1831,6 +2143,60 @@ ExecDeleteEpilogue(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	/* AFTER ROW DELETE Triggers */
 	ExecARDeleteTriggers(estate, resultRelInfo, tupleid, oldtuple,
 						 ar_delete_trig_tcs, changingPart);
+
+	/*
+	 * ProgreSQL: remove the corresponding shadow row, if any.  The shadow
+	 * mechanism enforces cross-partition uniqueness for partitioned+inherited
+	 * tables; without this delete, the same key could not be re-inserted.
+	 *
+	 * For partition-key UPDATEs that arrive here as a delete-then-insert
+	 * cycle (changingPart == true), the subsequent INSERT will re-add the
+	 * shadow row with the new key values via the existing INSERT hook.
+	 */
+	if (mtstate->rootResultRelInfo != NULL)
+	{
+		if (!mtstate->mt_progsqlShadowValid)
+		{
+			Oid			rootRelId =
+				RelationGetRelid(mtstate->rootResultRelInfo->ri_RelationDesc);
+
+			mtstate->mt_progsqlShadowId = LookupProgsqlShadowForRoot(rootRelId);
+			mtstate->mt_progsqlShadowValid = true;
+		}
+		if (OidIsValid(mtstate->mt_progsqlShadowId))
+		{
+			Relation	rel = resultRelInfo->ri_RelationDesc;
+			TupleTableSlot *oldSlot;
+			bool		fetched_into_local = false;
+
+			/*
+			 * Get the old tuple's values into a slot.  Prefer the supplied
+			 * HeapTuple (view INSTEAD OF case), otherwise fetch by tupleid
+			 * with SnapshotAny to retrieve the just-deleted row.
+			 */
+			oldSlot = table_slot_create(rel, NULL);
+			fetched_into_local = true;
+
+			if (oldtuple != NULL)
+			{
+				ExecForceStoreHeapTuple(oldtuple, oldSlot, false);
+			}
+			else
+			{
+				if (!table_tuple_fetch_row_version(rel, tupleid,
+												   SnapshotAny, oldSlot))
+					elog(ERROR,
+						 "progsql shadow: failed to fetch deleted tuple for shadow delete");
+			}
+
+			ExecProgsqlShadowDelete(mtstate->mt_progsqlShadowId,
+									oldSlot,
+									RelationGetRelid(rel));
+
+			if (fetched_into_local)
+				ExecDropSingleTupleTableSlot(oldSlot);
+		}
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2608,11 +2974,18 @@ lreplace:
  * Closing steps of updating a tuple.  Must be called if ExecUpdateAct
  * returns indicating that the tuple was updated. It also inserts temporal
  * leftovers from an UPDATE FOR PORTION OF.
+ *
+ * oldSlot, when non-NULL, contains the pre-update row values; used by the
+ * ProgreSQL shadow-index maintenance to detect key-column changes.  Pass
+ * NULL when the caller cannot supply it (in that case, shadow maintenance
+ * is skipped — partition-key updates are still handled because they go
+ * through the cross-partition delete+insert path which has its own hooks).
  */
 static void
 ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 				   ResultRelInfo *resultRelInfo, ItemPointer tupleid,
-				   HeapTuple oldtuple, TupleTableSlot *slot)
+				   HeapTuple oldtuple, TupleTableSlot *oldSlot,
+				   TupleTableSlot *slot)
 {
 	ModifyTableState *mtstate = context->mtstate;
 	List	   *recheckIndexes = NIL;
@@ -2657,6 +3030,116 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
 		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo,
 							 slot, context->estate);
+
+	/*
+	 * ProgreSQL: maintain the shadow uniqueness row, if any.  If the new
+	 * tuple's key columns differ from the old tuple's, delete the old shadow
+	 * row and insert a new one.  If no key column changed, do nothing.
+	 */
+	if (mtstate->rootResultRelInfo != NULL && oldSlot != NULL)
+	{
+		if (!mtstate->mt_progsqlShadowValid)
+		{
+			Oid			rootRelId =
+				RelationGetRelid(mtstate->rootResultRelInfo->ri_RelationDesc);
+
+			mtstate->mt_progsqlShadowId = LookupProgsqlShadowForRoot(rootRelId);
+			mtstate->mt_progsqlShadowValid = true;
+		}
+		if (OidIsValid(mtstate->mt_progsqlShadowId))
+		{
+			Relation	shadowRel;
+			TupleDesc	shadowDesc;
+			TupleDesc	oldDesc;
+			TupleDesc	newDesc;
+			bool		key_changed = false;
+			int			i;
+
+			shadowRel = table_open(mtstate->mt_progsqlShadowId,
+								   AccessShareLock);
+			shadowDesc = RelationGetDescr(shadowRel);
+			oldDesc = oldSlot->tts_tupleDescriptor;
+			newDesc = slot->tts_tupleDescriptor;
+
+			slot_getallattrs(oldSlot);
+			slot_getallattrs(slot);
+
+			for (i = 0; i < shadowDesc->natts && !key_changed; i++)
+			{
+				Form_pg_attribute satt = TupleDescAttr(shadowDesc, i);
+				const char *colname = NameStr(satt->attname);
+				int			oldCol = -1;
+				int			newCol = -1;
+				int			j;
+
+				if (strcmp(colname, "pss_child_relid") == 0)
+					continue;
+
+				for (j = 0; j < oldDesc->natts; j++)
+				{
+					Form_pg_attribute datt = TupleDescAttr(oldDesc, j);
+
+					if (datt->attisdropped)
+						continue;
+					if (strcmp(NameStr(datt->attname), colname) == 0)
+					{
+						oldCol = j;
+						break;
+					}
+				}
+				for (j = 0; j < newDesc->natts; j++)
+				{
+					Form_pg_attribute datt = TupleDescAttr(newDesc, j);
+
+					if (datt->attisdropped)
+						continue;
+					if (strcmp(NameStr(datt->attname), colname) == 0)
+					{
+						newCol = j;
+						break;
+					}
+				}
+
+				if (oldCol < 0 || newCol < 0)
+					elog(ERROR,
+						 "progsql shadow: key column \"%s\" not found in update slots",
+						 colname);
+
+				if (oldSlot->tts_isnull[oldCol] != slot->tts_isnull[newCol])
+					key_changed = true;
+				else if (!oldSlot->tts_isnull[oldCol])
+				{
+					/* Both non-null: compare by type */
+					if (!datumIsEqual(oldSlot->tts_values[oldCol],
+									  slot->tts_values[newCol],
+									  satt->attbyval, satt->attlen))
+					{
+						/*
+						 * datumIsEqual returns false for unequal varlena;
+						 * accept that as a conservative answer (it may also
+						 * report false for two equal but differently-stored
+						 * varlena values, which only causes a redundant
+						 * delete+insert — still correct).
+						 */
+						key_changed = true;
+					}
+				}
+			}
+
+			table_close(shadowRel, AccessShareLock);
+
+			if (key_changed)
+			{
+				Oid			leafRelid =
+					RelationGetRelid(resultRelInfo->ri_RelationDesc);
+
+				ExecProgsqlShadowDelete(mtstate->mt_progsqlShadowId,
+										oldSlot, leafRelid);
+				ExecProgsqlShadowInsert(mtstate->mt_progsqlShadowId,
+										slot, leafRelid, context->estate);
+			}
+		}
+	}
 }
 
 /*
@@ -2988,7 +3471,7 @@ redo_act:
 		(estate->es_processed)++;
 
 	ExecUpdateEpilogue(context, &updateCxt, resultRelInfo, tupleid, oldtuple,
-					   slot);
+					   oldSlot, slot);
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
@@ -3698,7 +4181,9 @@ lmerge_matched:
 				if (result == TM_Ok)
 				{
 					ExecUpdateEpilogue(context, &updateCxt, resultRelInfo,
-									   tupleid, NULL, newslot);
+									   tupleid, NULL,
+									   resultRelInfo->ri_oldTupleSlot,
+									   newslot);
 					mtstate->mt_merge_updated += 1;
 				}
 				break;
@@ -5204,6 +5689,10 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->operation = operation;
 	mtstate->canSetTag = node->canSetTag;
 	mtstate->mt_done = false;
+
+	/* ProgreSQL: shadow-index state is lazily populated on first insert */
+	mtstate->mt_progsqlShadowId = InvalidOid;
+	mtstate->mt_progsqlShadowValid = false;
 
 	mtstate->mt_nrels = nrels;
 	mtstate->resultRelInfo = palloc_array(ResultRelInfo, nrels);

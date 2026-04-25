@@ -51,6 +51,7 @@
 #include "catalog/pg_parameter_acl.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_progsql_shadow.h"
 #include "catalog/pg_propgraph_element.h"
 #include "catalog/pg_propgraph_element_label.h"
 #include "catalog/pg_propgraph_label.h"
@@ -1519,6 +1520,7 @@ doDeletion(const ObjectAddress *object, int flags)
 		case AccessMethodRelationId:
 		case AccessMethodOperatorRelationId:
 		case AccessMethodProcedureRelationId:
+		case ProgsqlShadowRelationId:
 		case PropgraphElementRelationId:
 		case PropgraphElementLabelRelationId:
 		case PropgraphLabelRelationId:

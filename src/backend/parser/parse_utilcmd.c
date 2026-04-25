@@ -255,13 +255,16 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	if (stmt->ofTypename)
 		transformOfType(&cxt, stmt->ofTypename);
 
-	if (stmt->partspec)
-	{
-		if (stmt->inhRelations && !stmt->partbound)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("cannot create partitioned table as inheritance child")));
-	}
+	/*
+	 * progreSQL: The original guard here rejected (INHERITS + PARTITION BY)
+	 * as "cannot create partitioned table as inheritance child".  We now
+	 * permit that combination, because it is the central feature of the
+	 * fork: a table that inherits columns/defaults from a plain parent while
+	 * being itself partitioned.  The grammar already prevents a single
+	 * CREATE TABLE from simultaneously using PARTITION OF and INHERITS, so
+	 * no runtime check is needed here: every remaining code path for
+	 * stmt->partspec is legitimate.
+	 */
 
 	/*
 	 * Run through each primary element in the table creation clause. Separate

@@ -1245,21 +1245,18 @@ select conname, contype, conrelid::regclass, conindid::regclass, conkey
 (18 rows)
 
 drop table idxpart;
--- Verify that multi-layer partitioning honors the requirement that all
--- columns in the partition key must appear in primary/unique key
+-- ProgreSQL: the shadow index enforces cross-partition uniqueness globally,
+-- so a primary/unique key is no longer required to include all partitioning
+-- columns.  Both of the following succeed where vanilla PostgreSQL would error.
 create table idxpart (a int, b int, primary key (a)) partition by range (a);
 create table idxpart2 partition of idxpart
-for values from (0) to (1000) partition by range (b); -- fail
-ERROR:  PRIMARY KEY constraint on partitioned table must include all partitioning columns
-DETAIL:  PRIMARY KEY constraint on table "idxpart2" lacks column "b" which is part of the partition key.
+for values from (0) to (1000) partition by range (b);
 drop table idxpart;
 -- Ditto for the ATTACH PARTITION case
 create table idxpart (a int unique, b int) partition by range (a);
 create table idxpart1 (a int not null, b int, unique (a, b))
   partition by range (a, b);
 alter table idxpart attach partition idxpart1 for values from (1) to (1000);
-ERROR:  UNIQUE constraint on partitioned table must include all partitioning columns
-DETAIL:  UNIQUE constraint on table "idxpart1" lacks column "b" which is part of the partition key.
 DROP TABLE idxpart, idxpart1;
 -- Multi-layer partitioning works correctly in this case:
 create table idxpart (a int, b int, primary key (a, b)) partition by range (a);

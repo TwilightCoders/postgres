@@ -1508,6 +1508,10 @@ typedef struct ModifyTableState
 	List	   *mt_updateColnosLists;
 	List	   *mt_mergeActionLists;
 	List	   *mt_mergeJoinConditions;
+
+	/* ProgreSQL: shadow-index OID for cross-partition uniqueness, cached here */
+	Oid			mt_progsqlShadowId;
+	bool		mt_progsqlShadowValid;
 } ModifyTableState;
 
 /* ----------------

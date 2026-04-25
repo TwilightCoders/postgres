@@ -40,6 +40,7 @@ OBJS = \
 	pg_operator.o \
 	pg_parameter_acl.o \
 	pg_proc.o \
+	pg_progsql_shadow.o \
 	pg_publication.o \
 	pg_range.o \
 	pg_shdepend.o \

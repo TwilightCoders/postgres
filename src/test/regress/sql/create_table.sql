@@ -116,10 +116,10 @@ DROP TABLE two_not_null_constraints;
 -- Partitioned tables
 --
 
--- cannot combine INHERITS and PARTITION BY (although grammar allows)
-CREATE TABLE partitioned (
-	a int
-) INHERITS (some_table) PARTITION BY LIST (a);
+-- progreSQL: INHERITS and PARTITION BY can be combined
+CREATE TABLE inh_part_base (a int);
+CREATE TABLE inh_part_child (b int) INHERITS (inh_part_base) PARTITION BY LIST (a);
+DROP TABLE inh_part_child, inh_part_base;
 
 -- cannot use more than 1 column as partition key for list partitioned table
 CREATE TABLE partitioned (

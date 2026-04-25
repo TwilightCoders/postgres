@@ -36,6 +36,7 @@
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_progsql_shadow.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "commands/comment.h"
@@ -577,6 +578,7 @@ DefineIndex(ParseState *pstate,
 	amoptions_function amoptions;
 	bool		exclusion;
 	bool		partitioned;
+	bool		progsql_bypass = false;
 	bool		safe_index;
 	Datum		reloptions;
 	int16	   *coloptions;
@@ -963,8 +965,18 @@ DefineIndex(ParseState *pstate,
 	 *
 	 * We could lift this limitation if we had global indexes, but those have
 	 * their own problems, so this is a useful feature combination.
+	 *
+	 * ProgreSQL: For partitioned tables that also inherit from a parent
+	 * (INHERITS + PARTITION BY), we bypass this check: a shadow heap table
+	 * is created later to enforce cross-partition uniqueness globally.  This
+	 * permits declarations such as PRIMARY KEY (id) where id is not in the
+	 * partition key.  Exclusion constraints are not yet supported via the
+	 * shadow mechanism.
 	 */
-	if (partitioned && (stmt->unique || exclusion))
+	progsql_bypass = (partitioned && stmt->unique && !exclusion &&
+					  has_superclass(tableId));
+
+	if (partitioned && (stmt->unique || exclusion) && !progsql_bypass)
 	{
 		PartitionKey key = RelationGetPartitionKey(rel);
 		const char *constraint_type;
@@ -1292,6 +1304,22 @@ DefineIndex(ParseState *pstate,
 	AtEOXact_GUC(false, root_save_nestlevel);
 	root_save_nestlevel = NewGUCNestLevel();
 	RestrictSearchPath();
+
+	/*
+	 * ProgreSQL: if we bypassed the partition-key-subset check for an
+	 * inherited+partitioned table, create the shadow table now.  The shadow
+	 * table enforces cross-partition uniqueness; its entry in
+	 * pg_progsql_shadow ties it to this constraint.  We only do this once,
+	 * at the top-level call (parentIndexId unset), because recursive
+	 * partition-index invocations must not create additional shadow tables.
+	 */
+	if (progsql_bypass && OidIsValid(createdConstraintId) &&
+		!OidIsValid(parentIndexId))
+	{
+		(void) CreateProgsqlShadowTable(tableId,
+										indexRelationId,
+										createdConstraintId);
+	}
 
 	/* Add any requested comment */
 	if (stmt->idxcomment != NULL)
