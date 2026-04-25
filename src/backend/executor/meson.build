@@ -63,6 +63,7 @@ backend_sources += files(
   'nodeValuesscan.c',
   'nodeWindowAgg.c',
   'nodeWorktablescan.c',
+  'progsql_shadow_scan.c',
   'spi.c',
   'tqueue.c',
   'tstoreReceiver.c',

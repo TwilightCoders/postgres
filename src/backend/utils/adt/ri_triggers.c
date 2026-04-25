@@ -31,10 +31,12 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_progsql_shadow.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -240,6 +242,14 @@ typedef struct RI_FastPathEntry
 	TupleTableSlot *pk_slot;
 	TupleTableSlot *fk_slot;
 	MemoryContext flush_cxt;	/* short-lived context for per-flush work */
+
+	/*
+	 * When true, pk_rel / idx_rel point at the ProgreSQL shadow heap and its
+	 * key index rather than the partitioned PK table.  The shadow stores key
+	 * columns at attnums 1..nkeys, so tuples drawn from the PK slot must be
+	 * read by shadow position rather than by riinfo->pk_attnums[].
+	 */
+	bool		use_shadow;
 
 	/*
 	 * TODO: batch[] is HeapTuple[] because the AFTER trigger machinery
@@ -2800,8 +2810,32 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	CommandCounterIncrement();
 	snapshot = RegisterSnapshot(GetTransactionSnapshot());
 
-	pk_rel = table_open(riinfo->pk_relid, RowShareLock);
-	idx_rel = index_open(riinfo->conindid, AccessShareLock);
+	/*
+	 * For partitioned PK tables, substitute the ProgreSQL shadow heap and its
+	 * UNIQUE key index.  The shadow table's key columns mirror the PK index
+	 * (column i of the shadow = PK column i), so ri_ExtractValues and
+	 * build_index_scankeys work unchanged.  ri_fastpath_is_applicable()
+	 * already verified that a shadow entry exists.
+	 */
+	if (riinfo->pk_is_partitioned)
+	{
+		Oid			pk_conid = get_index_constraint(riinfo->conindid);
+		HeapTuple	tup;
+		Form_pg_progsql_shadow shadow;
+
+		Assert(OidIsValid(pk_conid));
+		tup = SearchSysCache1(PROGSQLSHADOWCONID, ObjectIdGetDatum(pk_conid));
+		Assert(HeapTupleIsValid(tup));
+		shadow = (Form_pg_progsql_shadow) GETSTRUCT(tup);
+		pk_rel = table_open(shadow->pssshadowid, RowShareLock);
+		idx_rel = index_open(shadow->psskeyidxid, AccessShareLock);
+		ReleaseSysCache(tup);
+	}
+	else
+	{
+		pk_rel = table_open(riinfo->pk_relid, RowShareLock);
+		idx_rel = index_open(riinfo->conindid, AccessShareLock);
+	}
 
 	slot = table_slot_create(pk_rel, NULL);
 	scandesc = index_beginscan(pk_rel, idx_rel,
@@ -2820,7 +2854,24 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	{
 		/* Reload to ensure it's valid. */
 		riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
-		ri_populate_fastpath_metadata(riinfo, fk_rel, idx_rel);
+
+		/*
+		 * fpmeta's index_attnos are derived from the index-column-to-PK-column
+		 * mapping.  When using the shadow path, look that mapping up via the
+		 * original PK index (pk_attnums are root attnums), then reuse the
+		 * resulting index_attnos to position scan keys in the shadow's key
+		 * index (which mirrors the PK index's column order).
+		 */
+		if (riinfo->pk_is_partitioned)
+		{
+			Relation	pk_idx_rel = index_open(riinfo->conindid,
+												AccessShareLock);
+
+			ri_populate_fastpath_metadata(riinfo, fk_rel, pk_idx_rel);
+			index_close(pk_idx_rel, AccessShareLock);
+		}
+		else
+			ri_populate_fastpath_metadata(riinfo, fk_rel, idx_rel);
 	}
 	Assert(riinfo->fpmeta);
 	ri_ExtractValues(fk_rel, newslot, riinfo, false, pk_vals, pk_nulls);
@@ -2833,9 +2884,28 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	UnregisterSnapshot(snapshot);
 
 	if (!found)
-		ri_ReportViolation(riinfo, pk_rel, fk_rel,
+	{
+		Relation	err_pk_rel = pk_rel;
+		Relation	root_pk_rel = NULL;
+
+		/*
+		 * When we substituted the shadow for the partitioned PK, open the
+		 * real PK root table for error reporting so messages name the
+		 * user-visible relation rather than the internal shadow.
+		 */
+		if (riinfo->pk_is_partitioned)
+		{
+			root_pk_rel = table_open(riinfo->pk_relid, AccessShareLock);
+			err_pk_rel = root_pk_rel;
+		}
+
+		ri_ReportViolation(riinfo, err_pk_rel, fk_rel,
 						   newslot, NULL,
 						   RI_PLAN_CHECK_LOOKUPPK, false, false);
+		/* ri_ReportViolation does not return; unreachable cleanup below. */
+		if (root_pk_rel != NULL)
+			table_close(root_pk_rel, NoLock);
+	}
 
 	index_close(idx_rel, NoLock);
 	table_close(pk_rel, NoLock);
@@ -2940,7 +3010,22 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	{
 		/* Reload to ensure it's valid. */
 		riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
-		ri_populate_fastpath_metadata(riinfo, fk_rel, idx_rel);
+
+		/*
+		 * fpmeta's index_attnos are derived from the index-column-to-PK-column
+		 * mapping.  When using the shadow path, look that mapping up via the
+		 * original PK index.  See ri_FastPathCheck() for details.
+		 */
+		if (fpentry->use_shadow)
+		{
+			Relation	pk_idx_rel = index_open(riinfo->conindid,
+												AccessShareLock);
+
+			ri_populate_fastpath_metadata(riinfo, fk_rel, pk_idx_rel);
+			index_close(pk_idx_rel, AccessShareLock);
+		}
+		else
+			ri_populate_fastpath_metadata(riinfo, fk_rel, idx_rel);
 	}
 	Assert(riinfo->fpmeta);
 
@@ -2958,10 +3043,27 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 
 	if (violation_index >= 0)
 	{
+		Relation	err_pk_rel = pk_rel;
+		Relation	root_pk_rel = NULL;
+
+		/*
+		 * When we substituted the shadow for the partitioned PK, open the
+		 * real PK root table for error reporting so messages name the
+		 * user-visible relation rather than the internal shadow.
+		 */
+		if (fpentry->use_shadow)
+		{
+			root_pk_rel = table_open(riinfo->pk_relid, AccessShareLock);
+			err_pk_rel = root_pk_rel;
+		}
+
 		ExecStoreHeapTuple(fpentry->batch[violation_index], fk_slot, false);
-		ri_ReportViolation(riinfo, pk_rel, fk_rel,
+		ri_ReportViolation(riinfo, err_pk_rel, fk_rel,
 						   fk_slot, NULL,
 						   RI_PLAN_CHECK_LOOKUPPK, false, false);
+		/* ri_ReportViolation does not return; unreachable cleanup below. */
+		if (root_pk_rel != NULL)
+			table_close(root_pk_rel, NoLock);
 	}
 
 	MemoryContextReset(fpentry->flush_cxt);
@@ -3124,8 +3226,15 @@ ri_FastPathFlushArray(RI_FastPathEntry *fpentry, TupleTableSlot *fk_slot,
 		if (!ri_LockPKTuple(pk_rel, pk_slot, snapshot, &concurrently_updated))
 			continue;
 
-		/* Extract the PK value from the matched and locked tuple */
-		found_val = slot_getattr(pk_slot, riinfo->pk_attnums[0], &found_null);
+		/*
+		 * Extract the PK value from the matched and locked tuple.  When
+		 * probing the ProgreSQL shadow heap, the PK key column lives at the
+		 * shadow's first attribute (attnum 1) rather than at the original
+		 * PK table's column position.
+		 */
+		found_val = slot_getattr(pk_slot,
+								 fpentry->use_shadow ? 1 : riinfo->pk_attnums[0],
+								 &found_null);
 		Assert(!found_null);
 
 		if (concurrently_updated)
@@ -3287,12 +3396,29 @@ static bool
 ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo)
 {
 	/*
-	 * Partitioned referenced tables are skipped for simplicity, since they
-	 * require routing the probe through the correct partition using
-	 * PartitionDirectory.
+	 * Partitioned referenced tables are normally skipped for simplicity, since
+	 * they require routing the probe through the correct partition using
+	 * PartitionDirectory.  However, ProgreSQL maintains a global shadow key
+	 * index that covers all partitions; when one is registered for this
+	 * constraint we can fast-path the FK existence check against the shadow.
+	 *
+	 * The shadow catalog is keyed by the PK constraint OID, which owns the
+	 * PK index referenced by riinfo->conindid.
 	 */
 	if (riinfo->pk_is_partitioned)
-		return false;
+	{
+		Oid			pk_conid = get_index_constraint(riinfo->conindid);
+		HeapTuple	tup;
+
+		if (!OidIsValid(pk_conid))
+			return false;
+		tup = SearchSysCache1(PROGSQLSHADOWCONID,
+							  ObjectIdGetDatum(pk_conid));
+		if (!HeapTupleIsValid(tup))
+			return false;		/* vanilla partitioned table, no shadow */
+		ReleaseSysCache(tup);
+		return true;
+	}
 
 	/*
 	 * Temporal foreign keys use range overlap and containment semantics (&&,
@@ -4284,9 +4410,33 @@ ri_FastPathGetEntry(const RI_ConstraintInfo *riinfo, Relation fk_rel)
 		 *
 		 * We don't release these locks until end of transaction, matching SPI
 		 * behavior.
+		 *
+		 * For partitioned PK tables, substitute the ProgreSQL shadow heap and
+		 * its UNIQUE key index.  ri_fastpath_is_applicable() has already
+		 * confirmed that a shadow entry exists for this constraint.
 		 */
-		entry->pk_rel = table_open(riinfo->pk_relid, RowShareLock);
-		entry->idx_rel = index_open(riinfo->conindid, AccessShareLock);
+		if (riinfo->pk_is_partitioned)
+		{
+			Oid			pk_conid = get_index_constraint(riinfo->conindid);
+			HeapTuple	tup;
+			Form_pg_progsql_shadow shadow;
+
+			Assert(OidIsValid(pk_conid));
+			tup = SearchSysCache1(PROGSQLSHADOWCONID,
+								  ObjectIdGetDatum(pk_conid));
+			Assert(HeapTupleIsValid(tup));
+			shadow = (Form_pg_progsql_shadow) GETSTRUCT(tup);
+			entry->pk_rel = table_open(shadow->pssshadowid, RowShareLock);
+			entry->idx_rel = index_open(shadow->psskeyidxid, AccessShareLock);
+			ReleaseSysCache(tup);
+			entry->use_shadow = true;
+		}
+		else
+		{
+			entry->pk_rel = table_open(riinfo->pk_relid, RowShareLock);
+			entry->idx_rel = index_open(riinfo->conindid, AccessShareLock);
+			entry->use_shadow = false;
+		}
 		entry->pk_slot = table_slot_create(entry->pk_rel, NULL);
 
 		/*

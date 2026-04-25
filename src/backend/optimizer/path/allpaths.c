@@ -23,6 +23,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "executor/progsql_shadow_scan.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -575,6 +576,15 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				break;
 		}
 	}
+
+	/*
+	 * ProgreSQL: if this is a partitioned+inherited root with a registered
+	 * shadow index and the WHERE clause probes one of its key columns, add
+	 * a CustomPath that routes the lookup through the shadow.  This runs
+	 * for all base relations (including partitioned-append cases where the
+	 * set_plain_rel_pathlist branch is not used).
+	 */
+	progsql_add_shadow_paths(root, rel, rti, rte);
 
 	/*
 	 * Allow a plugin to editorialize on the set of Paths for this base

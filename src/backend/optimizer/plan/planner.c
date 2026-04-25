@@ -27,6 +27,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
+#include "executor/progsql_shadow_scan.h"
 #include "foreign/fdwapi.h"
 #include "jit/jit.h"
 #include "lib/bipartite_match.h"
@@ -8171,6 +8172,19 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 
 		/* Build new paths for this relation by appending child paths. */
 		add_paths_to_append_rel(root, rel, live_children);
+
+		/*
+		 * ProgreSQL: re-add shadow-backed CustomPath after the planner zaps
+		 * and rebuilds the partitioned rel's pathlist.  The earlier
+		 * set_rel_pathlist hook ran before the zap in apply_scanjoin_target_
+		 * to_paths, so anything we added there was lost.
+		 */
+		{
+			RangeTblEntry *rte_here = root->simple_rte_array[rel->relid];
+
+			if (rte_here != NULL)
+				progsql_add_shadow_paths(root, rel, rel->relid, rte_here);
+		}
 	}
 
 	/*

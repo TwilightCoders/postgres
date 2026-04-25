@@ -75,6 +75,7 @@ OBJS = \
 	nodeValuesscan.o \
 	nodeWindowAgg.o \
 	nodeWorktablescan.o \
+	progsql_shadow_scan.o \
 	spi.o \
 	tqueue.o \
 	tstoreReceiver.o

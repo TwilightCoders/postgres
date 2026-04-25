@@ -33,6 +33,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
+#include "executor/progsql_shadow_scan.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "mb/pg_wchar.h"
@@ -1244,6 +1245,13 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* Initialize this backend's session state. */
 	InitializeSession();
+
+	/*
+	 * Register ProgreSQL built-in CustomScan providers.  This is safe here
+	 * because every backend runs InitPostgres exactly once before handling
+	 * any queries.
+	 */
+	progsql_shadow_scan_init();
 
 	/*
 	 * If this is an interactive session, load any libraries that should be
