@@ -14,6 +14,18 @@
  * root relation.  No SPI is involved, and no allowSystemTableMods escape
  * hatch is required.
  *
+ * pg_upgrade compatibility:
+ *   - Shadow heap tables (_pss_<indexOid>) are regular heap relations in user
+ *     namespace with OIDs >= FirstNormalObjectId.  pg_upgrade's info.c query
+ *     includes all such relations unconditionally; they are migrated exactly
+ *     like any other user table — relfilenode copied, indexes rebuilt.
+ *   - pg_progsql_shadow itself is a BKI-bootstrapped system catalog in
+ *     pg_catalog.  pg_upgrade treats it as a catalog relation: the new cluster
+ *     is initialized with an empty copy via initdb, then pg_upgrade's catalog
+ *     copy pass (relfilenumber.c swap_catalog_files) replaces the new-cluster
+ *     file with a pg_restore-generated file containing the old-cluster rows.
+ *     No special-casing in pg_upgrade source is required.
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -450,6 +462,23 @@ CreateProgsqlShadowTable(Oid rootrelid, Oid indexOid, Oid constraintOid)
 	/* Make the new heap visible. */
 	CommandCounterIncrement();
 
+	/* Shadow tables must not be independently replicated. */
+	{
+		Relation	pg_class_rel;
+		HeapTuple	classTup;
+		Form_pg_class classForm;
+
+		pg_class_rel = table_open(RelationRelationId, RowExclusiveLock);
+		classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(shadowOid));
+		if (!HeapTupleIsValid(classTup))
+			elog(ERROR, "cache lookup failed for relation %u", shadowOid);
+		classForm = (Form_pg_class) GETSTRUCT(classTup);
+		classForm->relreplident = REPLICA_IDENTITY_NOTHING;
+		CatalogTupleUpdate(pg_class_rel, &classTup->t_self, classTup);
+		heap_freetuple(classTup);
+		table_close(pg_class_rel, RowExclusiveLock);
+	}
+
 	/* Open the new heap to feed it to index_create. */
 	shadowRel = table_open(shadowOid, ShareLock);
 
@@ -473,7 +502,7 @@ CreateProgsqlShadowTable(Oid rootrelid, Oid indexOid, Oid constraintOid)
 	keyIndexInfo->ii_IndexUnchanged = false;
 	keyIndexInfo->ii_Concurrent = false;
 	keyIndexInfo->ii_BrokenHotChain = false;
-	keyIndexInfo->ii_ParallelWorkers = 0;
+	keyIndexInfo->ii_ParallelWorkers = max_parallel_maintenance_workers;
 	keyIndexInfo->ii_Am = BTREE_AM_OID;
 	keyIndexInfo->ii_AmCache = NULL;
 	keyIndexInfo->ii_Context = CurrentMemoryContext;
@@ -518,7 +547,7 @@ CreateProgsqlShadowTable(Oid rootrelid, Oid indexOid, Oid constraintOid)
 	childIndexInfo->ii_IndexUnchanged = false;
 	childIndexInfo->ii_Concurrent = false;
 	childIndexInfo->ii_BrokenHotChain = false;
-	childIndexInfo->ii_ParallelWorkers = 0;
+	childIndexInfo->ii_ParallelWorkers = max_parallel_maintenance_workers;
 	childIndexInfo->ii_Am = BTREE_AM_OID;
 	childIndexInfo->ii_AmCache = NULL;
 	childIndexInfo->ii_Context = CurrentMemoryContext;

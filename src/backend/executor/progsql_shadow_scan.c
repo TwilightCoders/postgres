@@ -30,6 +30,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/relscan.h"
@@ -39,6 +41,7 @@
 #include "catalog/pg_amop.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_progsql_shadow.h"
+#include "commands/explain_format.h"
 #include "executor/executor.h"
 #include "executor/progsql_shadow_scan.h"
 #include "miscadmin.h"
@@ -96,6 +99,10 @@ typedef struct ProgsqlShadowScanState
 	Oid			pkIndexOid;		/* original PK index OID -- for attno map */
 
 	bool		done;
+
+	/* EXPLAIN ANALYZE counters */
+	int64		probes;			/* total index probes into shadow */
+	int64		hits;			/* shadow rows that led to a partition fetch */
 } ProgsqlShadowScanState;
 
 
@@ -112,6 +119,8 @@ static void progsql_shadow_begin(CustomScanState *node, EState *estate, int efla
 static TupleTableSlot *progsql_shadow_exec(CustomScanState *node);
 static void progsql_shadow_end(CustomScanState *node);
 static void progsql_shadow_rescan(CustomScanState *node);
+static void progsql_shadow_explain(CustomScanState *node, List *ancestors,
+								   ExplainState *es);
 
 static void progsql_close_current_partition(ProgsqlShadowScanState *psss);
 static AttrNumber progsql_map_root_attno_to_part(Relation partRel, Relation rootRel,
@@ -138,6 +147,7 @@ static const CustomExecMethods progsql_shadow_exec_methods = {
 	.ExecCustomScan = progsql_shadow_exec,
 	.EndCustomScan = progsql_shadow_end,
 	.ReScanCustomScan = progsql_shadow_rescan,
+	.ExplainCustomScan = progsql_shadow_explain,
 };
 
 
@@ -403,18 +413,35 @@ progsql_add_shadow_paths(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * selectivities, which the planner may already have computed, but for
 	 * a unique lookup we can safely cap it at one.
 	 */
-	rows = 1.0;
-	startup_cost = 0.0;
 	/*
-	 * Cost model: one random-page index probe on the shadow's key index,
-	 * plus one random-page fetch on the owning partition.  Two operator
-	 * evaluations per key column (one in the shadow probe, one in the
-	 * partition filter) plus tuple/page baseline costs.
+	 * Use actual shadow table stats when available.  reltuples == -1 means
+	 * no ANALYZE has run yet; fall back to safe constants in that case.
 	 */
-	total_cost = 2 * random_page_cost +
-				 2 * cpu_index_tuple_cost +
-				 cpu_tuple_cost +
-				 cpu_operator_cost * 4 * nmatched;
+	{
+		double		shadowTuples;
+		double		shadowPages;
+		double		log2_rows;
+		Relation	shadowRelForStats;
+
+		shadowRelForStats = table_open(shadowOid, AccessShareLock);
+		shadowTuples = shadowRelForStats->rd_rel->reltuples;
+		shadowPages = shadowRelForStats->rd_rel->relpages;
+		table_close(shadowRelForStats, AccessShareLock);
+
+		if (shadowTuples < 1)
+			shadowTuples = 1000.0;	/* pre-ANALYZE default */
+		if (shadowPages < 1)
+			shadowPages = 10.0;
+
+		log2_rows = ceil(log(shadowTuples + 1) / log(2.0));
+		startup_cost = 0.0;
+		total_cost = random_page_cost * log2_rows	/* shadow idx descent */
+					 + cpu_index_tuple_cost			/* shadow tuple eval */
+					 + random_page_cost				/* partition heap page */
+					 + cpu_tuple_cost				/* partition tuple eval */
+					 + cpu_operator_cost * 2 * nmatched;	/* key comparisons */
+		rows = 1.0;
+	}
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -723,6 +750,7 @@ progsql_shadow_exec(CustomScanState *node)
 		/*
 		 * Get the next shadow tuple that matches.
 		 */
+		psss->probes++;
 		if (!index_getnext_slot(psss->shadowScan, ForwardScanDirection,
 								psss->shadowSlot))
 		{
@@ -806,6 +834,8 @@ progsql_shadow_exec(CustomScanState *node)
 									   ForwardScanDirection,
 									   psss->partSlot))
 			{
+				psss->hits++;
+
 				/*
 				 * Project the partition tuple through the scan target.
 				 */
@@ -916,4 +946,30 @@ progsql_shadow_rescan(CustomScanState *node)
 			psss->done = true;
 			break;
 		}
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Executor: ExplainCustomScan                                        */
+/* ------------------------------------------------------------------ */
+
+static void
+progsql_shadow_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	ProgsqlShadowScanState *psss = (ProgsqlShadowScanState *) node;
+	char		buf[NAMEDATALEN * 2 + 32];
+
+	if (psss->shadowRel != NULL)
+	{
+		const char *shadowName = RelationGetRelationName(psss->shadowRel);
+		const char *keyIdxName = RelationGetRelationName(psss->shadowIdxRel);
+
+		snprintf(buf, sizeof(buf), "%s via %s", shadowName, keyIdxName);
+		ExplainPropertyText("Shadow Index", buf, es);
+	}
+	if (es->analyze)
+	{
+		ExplainPropertyInteger("Shadow Probes", NULL, psss->probes, es);
+		ExplainPropertyInteger("Shadow Hits", NULL, psss->hits, es);
+	}
 }
