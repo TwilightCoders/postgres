@@ -638,6 +638,7 @@ UpdateIndexRelation(Oid indexoid,
 	values[Anum_pg_index_indrelid - 1] = ObjectIdGetDatum(heapoid);
 	values[Anum_pg_index_indnatts - 1] = Int16GetDatum(indexInfo->ii_NumIndexAttrs);
 	values[Anum_pg_index_indnkeyatts - 1] = Int16GetDatum(indexInfo->ii_NumIndexKeyAttrs);
+	values[Anum_pg_index_indnuniqatts - 1] = Int16GetDatum(indexInfo->ii_NumUniqKeyAtts);
 	values[Anum_pg_index_indisunique - 1] = BoolGetDatum(indexInfo->ii_Unique);
 	values[Anum_pg_index_indnullsnotdistinct - 1] = BoolGetDatum(indexInfo->ii_NullsNotDistinct);
 	values[Anum_pg_index_indisprimary - 1] = BoolGetDatum(primary);

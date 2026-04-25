@@ -573,6 +573,7 @@ DefineIndex(Oid tableId,
 	amoptions_function amoptions;
 	bool		exclusion;
 	bool		partitioned;
+	bool		progresql_bypass;
 	bool		safe_index;
 	Datum		reloptions;
 	int16	   *coloptions;
@@ -738,6 +739,16 @@ DefineIndex(Oid tableId,
 					 errmsg("cannot create index on partitioned table \"%s\" concurrently",
 							RelationGetRelationName(rel))));
 	}
+
+	/*
+	 * ProgreSQL spanning index: a PRIMARY KEY or UNIQUE on a table that is
+	 * both partitioned and inherits from another table.  We create a real
+	 * btree on the root instead of a hollow partitioned-index stub.
+	 */
+	progresql_bypass = partitioned &&
+		(stmt->unique || stmt->primary) &&
+		!exclusion &&
+		has_superclass(tableId);
 
 	/*
 	 * Don't try to CREATE INDEX on temp tables of other backends.
@@ -960,7 +971,7 @@ DefineIndex(Oid tableId,
 	 * We could lift this limitation if we had global indexes, but those have
 	 * their own problems, so this is a useful feature combination.
 	 */
-	if (partitioned && (stmt->unique || exclusion))
+	if (partitioned && (stmt->unique || exclusion) && !progresql_bypass)
 	{
 		PartitionKey key = RelationGetPartitionKey(rel);
 		const char *constraint_type;
@@ -1168,6 +1179,29 @@ DefineIndex(Oid tableId,
 		}
 	}
 
+	if (progresql_bypass)
+	{
+		int			N = indexInfo->ii_NumIndexKeyAttrs;
+
+		/* Record how many columns are truly unique (excludes tableoid). */
+		indexInfo->ii_NumUniqKeyAtts = N;
+
+		/* Append tableoid (system column -6) as the (N+1)th key column. */
+		Assert(N < INDEX_MAX_KEYS);
+		indexInfo->ii_IndexAttrNumbers[N] = TableOidAttributeNumber;
+		indexInfo->ii_NumIndexKeyAttrs = N + 1;
+		indexInfo->ii_NumIndexAttrs = N + 1;
+
+		/* Extend the collation/opclass/coloption arrays. */
+		collationIds = repalloc(collationIds, (N + 1) * sizeof(Oid));
+		opclassIds = repalloc(opclassIds, (N + 1) * sizeof(Oid));
+		coloptions = repalloc(coloptions, (N + 1) * sizeof(int16));
+
+		collationIds[N] = InvalidOid;
+		opclassIds[N] = GetDefaultOpClass(OIDOID, BTREE_AM_OID);
+		coloptions[N] = 0;
+	}
+
 	/* Is index safe for others to ignore?  See set_indexsafe_procflags() */
 	safe_index = indexInfo->ii_Expressions == NIL &&
 		indexInfo->ii_Predicate == NIL;
@@ -1214,13 +1248,13 @@ DefineIndex(Oid tableId,
 	flags = constr_flags = 0;
 	if (stmt->isconstraint)
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
-	if (skip_build || concurrent || partitioned)
+	if (skip_build || concurrent || (partitioned && !progresql_bypass))
 		flags |= INDEX_CREATE_SKIP_BUILD;
 	if (stmt->if_not_exists)
 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
 	if (concurrent)
 		flags |= INDEX_CREATE_CONCURRENT;
-	if (partitioned)
+	if (partitioned && !progresql_bypass)
 		flags |= INDEX_CREATE_PARTITIONED;
 	if (stmt->primary)
 		flags |= INDEX_CREATE_IS_PRIMARY;

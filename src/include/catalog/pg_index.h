@@ -33,6 +33,13 @@ CATALOG(pg_index,2610,IndexRelationId) BKI_SCHEMA_MACRO
 												 * indexes */
 	int16		indnatts;		/* total number of columns in index */
 	int16		indnkeyatts;	/* number of key columns in index */
+	int16		indnuniqatts BKI_DEFAULT(0);	/* key columns that participate
+												 * in uniqueness; 0 means same
+												 * as indnkeyatts (all of them).
+												 * ProgreSQL spanning indexes set
+												 * this to indnkeyatts-1 to
+												 * exclude the appended
+												 * child_relid column. */
 	bool		indisunique;	/* is this a unique index? */
 	bool		indnullsnotdistinct;	/* null treatment in unique index */
 	bool		indisprimary;	/* is this index for primary key? */

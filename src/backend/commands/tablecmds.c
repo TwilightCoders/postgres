@@ -17,6 +17,7 @@
 #include "access/attmap.h"
 #include "access/genam.h"
 #include "access/gist.h"
+#include "access/table.h"
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/multixact.h"
@@ -101,6 +102,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/partcache.h"
+#include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
@@ -1968,6 +1970,155 @@ ExecuteTruncate(TruncateStmt *stmt)
 	}
 }
 
+/* Callback state for progresql_bulk_delete_for_partition */
+typedef struct
+{
+	ItemPointerData *tids;		/* sorted array of TIDs to delete */
+	int			ntids;
+} ProgresqlBulkDeleteState;
+
+static int
+progresql_tid_cmp(const void *a, const void *b)
+{
+	const ItemPointerData *ta = (const ItemPointerData *) a;
+	const ItemPointerData *tb = (const ItemPointerData *) b;
+
+	return ItemPointerCompare(ta, tb);
+}
+
+static bool
+progresql_bulk_delete_callback(ItemPointer itemptr, void *state)
+{
+	ProgresqlBulkDeleteState *st = (ProgresqlBulkDeleteState *) state;
+
+	/* Binary search for itemptr in the sorted TID array. */
+	int			lo = 0,
+				hi = st->ntids - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = (lo + hi) / 2;
+		int			cmp = ItemPointerCompare(itemptr, &st->tids[mid]);
+
+		if (cmp == 0)
+			return true;
+		else if (cmp < 0)
+			hi = mid - 1;
+		else
+			lo = mid + 1;
+	}
+	return false;
+}
+
+/*
+ * Clean all ProgreSQL spanning index entries that reference the truncated
+ * partition.  Called after a partition's heap storage has been truncated.
+ */
+static void
+progresql_clean_spanning_indexes_for_partition(Relation partRel)
+{
+	List	   *ancestors;
+	ListCell   *lc;
+	Oid			partOid = RelationGetRelid(partRel);
+
+	/* Only leaf partitions that are also inheritance children need cleaning. */
+	if (!partRel->rd_rel->relispartition)
+		return;
+
+	ancestors = get_partition_ancestors(partOid);
+
+	foreach(lc, ancestors)
+	{
+		Oid			parentOid = lfirst_oid(lc);
+		Relation	parentRel;
+		List	   *indexoidlist;
+		ListCell   *il;
+
+		parentRel = table_open(parentOid, AccessShareLock);
+		indexoidlist = RelationGetIndexList(parentRel);
+
+		foreach(il, indexoidlist)
+		{
+			Oid				indexOid = lfirst_oid(il);
+			Relation		idxRel;
+			IndexScanDesc	scan;
+			ScanKeyData		skey;
+			ItemPointer		tid;
+			ItemPointerData *tids;
+			int				ntids = 0,
+							tids_max = 64;
+			IndexVacuumInfo	ivinfo;
+			IndexBulkDeleteResult *istat;
+			ProgresqlBulkDeleteState cbstate;
+
+			idxRel = index_open(indexOid, RowExclusiveLock);
+
+			/* Only spanning indexes. */
+			if (idxRel->rd_index->indnuniqatts == 0)
+			{
+				index_close(idxRel, RowExclusiveLock);
+				continue;
+			}
+
+			/* Scan for entries where the last key column equals partOid. */
+			ScanKeyInit(&skey,
+						idxRel->rd_index->indnkeyatts,
+						BTEqualStrategyNumber,
+						F_OIDEQ,
+						ObjectIdGetDatum(partOid));
+
+			scan = index_beginscan(parentRel, idxRel, SnapshotAny, NULL,
+								   1, 0);
+			index_rescan(scan, &skey, 1, NULL, 0);
+
+			tids = (ItemPointerData *) palloc(tids_max * sizeof(ItemPointerData));
+
+			while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
+			{
+				if (ntids >= tids_max)
+				{
+					tids_max *= 2;
+					tids = repalloc(tids, tids_max * sizeof(ItemPointerData));
+				}
+				ItemPointerCopy(tid, &tids[ntids++]);
+			}
+			index_endscan(scan);
+
+			if (ntids > 0)
+			{
+				/* Sort so the bulk-delete callback can binary-search. */
+				qsort(tids, ntids, sizeof(ItemPointerData), progresql_tid_cmp);
+
+				cbstate.tids = tids;
+				cbstate.ntids = ntids;
+
+				ivinfo.index = idxRel;
+				ivinfo.heaprel = parentRel;
+				ivinfo.analyze_only = false;
+				ivinfo.report_progress = false;
+				ivinfo.estimated_count = false;
+				ivinfo.message_level = DEBUG2;
+				ivinfo.num_heap_tuples = 0;
+				ivinfo.strategy = NULL;
+
+				istat = index_bulk_delete(&ivinfo, NULL,
+										  progresql_bulk_delete_callback,
+										  &cbstate);
+				if (istat)
+					pfree(istat);
+			}
+
+			pfree(tids);
+			index_close(idxRel, RowExclusiveLock);
+		}
+
+		list_free(indexoidlist);
+		table_close(parentRel, AccessShareLock);
+	}
+
+	list_free(ancestors);
+}
+
 /*
  * ExecuteTruncateGuts
  *
@@ -2251,6 +2402,10 @@ ExecuteTruncateGuts(List *explicit_rels,
 		}
 
 		pgstat_count_truncate(rel);
+
+		/* Clean any ProgreSQL spanning index entries that pointed into this partition. */
+		if (rel->rd_rel->relispartition)
+			progresql_clean_spanning_indexes_for_partition(rel);
 	}
 
 	/* Now go through the hash table, and truncate foreign tables */

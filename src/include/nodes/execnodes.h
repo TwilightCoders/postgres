@@ -195,6 +195,12 @@ typedef struct IndexInfo
 	NodeTag		type;
 	int			ii_NumIndexAttrs;	/* total number of columns in index */
 	int			ii_NumIndexKeyAttrs;	/* number of key columns in index */
+	/*
+	 * Number of key columns that participate in uniqueness; 0 means all of
+	 * them.  ProgreSQL spanning indexes set this to ii_NumIndexKeyAttrs-1 to
+	 * exclude the appended tableoid disambiguation column.
+	 */
+	int			ii_NumUniqKeyAtts;
 	AttrNumber	ii_IndexAttrNumbers[INDEX_MAX_KEYS];
 	List	   *ii_Expressions; /* list of Expr */
 	List	   *ii_ExpressionsState;	/* list of ExprState */

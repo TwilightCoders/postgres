@@ -17,6 +17,8 @@
 
 #include "access/nbtree.h"
 #include "access/nbtxlog.h"
+#include "access/table.h"
+#include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xloginsert.h"
 #include "common/int.h"
@@ -25,6 +27,7 @@
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
+#include "utils/rel.h"
 
 /* Minimum tree height for application of fastpath optimization */
 #define BTREE_FASTPATH_MIN_LEVEL	2
@@ -423,6 +426,19 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 	bool		inposting = false;
 	bool		prevalldead = true;
 	int			curposti = 0;
+	int			nuniqs;
+	int			saved_keysz;
+
+	/*
+	 * For ProgreSQL spanning indexes, uniqueness is enforced on fewer columns
+	 * than are stored (the last key column is the child-table OID, used only
+	 * for disambiguation, not uniqueness).  Limit the scan-key comparison to
+	 * the true unique columns for the duration of this check.
+	 */
+	nuniqs = IndexRelationGetNumberOfUniqueAttributes(rel);
+	saved_keysz = itup_key->keysz;
+	if (nuniqs < itup_key->keysz)
+		itup_key->keysz = nuniqs;
 
 	/* Assume unique until we find a duplicate */
 	*is_unique = true;
@@ -556,143 +572,222 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				 * satisfying SnapshotDirty. This is necessary because for AMs
 				 * with optimizations like heap's HOT, we have just a single
 				 * index entry for the entire chain.
+				 *
+				 * For ProgreSQL spanning indexes, the TID lives in a partition,
+				 * not in heapRel (the root).  Extract the child OID from the
+				 * last key column of the candidate tuple and open that
+				 * partition for the liveness check.
 				 */
-				else if (table_index_fetch_tuple_check(heapRel, &htid,
-													   &SnapshotDirty,
-													   &all_dead))
+				else
 				{
-					TransactionId xwait;
+					Relation	checkRel = heapRel;
+					Relation	spanChildRel = NULL;
 
-					/*
-					 * It is a duplicate. If we are only doing a partial
-					 * check, then don't bother checking if the tuple is being
-					 * updated in another transaction. Just return the fact
-					 * that it is a potential conflict and leave the full
-					 * check till later. Don't invalidate binary search
-					 * bounds.
-					 */
-					if (checkUnique == UNIQUE_CHECK_PARTIAL)
+					if (nuniqs < saved_keysz)
 					{
-						if (nbuf != InvalidBuffer)
-							_bt_relbuf(rel, nbuf);
-						*is_unique = false;
-						return InvalidTransactionId;
+						bool		oidnull;
+						Datum		oidval;
+
+						oidval = index_getattr(curitup, saved_keysz,
+											   RelationGetDescr(rel), &oidnull);
+						if (!oidnull)
+						{
+							Oid		child_relid = DatumGetObjectId(oidval);
+
+							spanChildRel = table_open(child_relid, NoLock);
+							checkRel = spanChildRel;
+						}
 					}
 
-					/*
-					 * If this tuple is being updated by other transaction
-					 * then we have to wait for its commit/abort.
-					 */
-					xwait = (TransactionIdIsValid(SnapshotDirty.xmin)) ?
-						SnapshotDirty.xmin : SnapshotDirty.xmax;
-
-					if (TransactionIdIsValid(xwait))
+					if (table_index_fetch_tuple_check(checkRel, &htid,
+													  &SnapshotDirty,
+													  &all_dead))
 					{
+						TransactionId xwait;
+
+						/*
+						 * It is a duplicate. If we are only doing a partial
+						 * check, then don't bother checking if the tuple is being
+						 * updated in another transaction. Just return the fact
+						 * that it is a potential conflict and leave the full
+						 * check till later. Don't invalidate binary search
+						 * bounds.
+						 */
+						if (checkUnique == UNIQUE_CHECK_PARTIAL)
+						{
+							if (spanChildRel)
+								table_close(spanChildRel, NoLock);
+							if (nbuf != InvalidBuffer)
+								_bt_relbuf(rel, nbuf);
+							*is_unique = false;
+							itup_key->keysz = saved_keysz;
+							return InvalidTransactionId;
+						}
+
+						/*
+						 * If this tuple is being updated by other transaction
+						 * then we have to wait for its commit/abort.
+						 */
+						xwait = (TransactionIdIsValid(SnapshotDirty.xmin)) ?
+							SnapshotDirty.xmin : SnapshotDirty.xmax;
+
+						if (TransactionIdIsValid(xwait))
+						{
+							if (spanChildRel)
+								table_close(spanChildRel, NoLock);
+							if (nbuf != InvalidBuffer)
+								_bt_relbuf(rel, nbuf);
+							/* Tell _bt_doinsert to wait... */
+							*speculativeToken = SnapshotDirty.speculativeToken;
+							/* Caller releases lock on buf immediately */
+							insertstate->bounds_valid = false;
+							itup_key->keysz = saved_keysz;
+							return xwait;
+						}
+
+						/*
+						 * Otherwise we have a definite conflict.  But before
+						 * complaining, look to see if the tuple we want to insert
+						 * is itself now committed dead --- if so, don't complain.
+						 * This is a waste of time in normal scenarios but we must
+						 * do it to support CREATE INDEX CONCURRENTLY.
+						 *
+						 * We must follow HOT-chains here because during
+						 * concurrent index build, we insert the root TID though
+						 * the actual tuple may be somewhere in the HOT-chain.
+						 * While following the chain we might not stop at the
+						 * exact tuple which triggered the insert, but that's OK
+						 * because if we find a live tuple anywhere in this chain,
+						 * we have a unique key conflict.  The other live tuple is
+						 * not part of this chain because it had a different index
+						 * entry.
+						 *
+						 * For spanning indexes, use the partition that owns the
+						 * new tuple (last key column of itup carries its tableoid).
+						 */
+						{
+							Relation	selfCheckRel = heapRel;
+							Relation	selfChildRel = NULL;
+
+							if (nuniqs < saved_keysz)
+							{
+								bool		soidnull;
+								Datum		soidval;
+
+								soidval = index_getattr(itup, saved_keysz,
+													   RelationGetDescr(rel),
+													   &soidnull);
+								if (!soidnull)
+								{
+									Oid		self_relid = DatumGetObjectId(soidval);
+
+									selfChildRel = table_open(self_relid, NoLock);
+									selfCheckRel = selfChildRel;
+								}
+							}
+
+							htid = itup->t_tid;
+							if (table_index_fetch_tuple_check(selfCheckRel, &htid,
+															  SnapshotSelf, NULL))
+							{
+								/* Normal case --- it's still live */
+							}
+							else
+							{
+								/*
+								 * It's been deleted, so no error, and no need to
+								 * continue searching.
+								 */
+								if (selfChildRel)
+									table_close(selfChildRel, NoLock);
+								if (spanChildRel)
+									table_close(spanChildRel, NoLock);
+								break;
+							}
+
+							if (selfChildRel)
+								table_close(selfChildRel, NoLock);
+						}
+
+						/*
+						 * Check for a conflict-in as we would if we were going to
+						 * write to this page.  We aren't actually going to write,
+						 * but we want a chance to report SSI conflicts that would
+						 * otherwise be masked by this unique constraint
+						 * violation.
+						 */
+						CheckForSerializableConflictIn(rel, NULL, BufferGetBlockNumber(insertstate->buf));
+
+						if (spanChildRel)
+							table_close(spanChildRel, NoLock);
+
+						/*
+						 * This is a definite conflict.  Break the tuple down into
+						 * datums and report the error.  But first, make sure we
+						 * release the buffer locks we're holding ---
+						 * BuildIndexValueDescription could make catalog accesses,
+						 * which in the worst case might touch this same index and
+						 * cause deadlocks.
+						 */
 						if (nbuf != InvalidBuffer)
 							_bt_relbuf(rel, nbuf);
-						/* Tell _bt_doinsert to wait... */
-						*speculativeToken = SnapshotDirty.speculativeToken;
-						/* Caller releases lock on buf immediately */
+						_bt_relbuf(rel, insertstate->buf);
+						insertstate->buf = InvalidBuffer;
 						insertstate->bounds_valid = false;
-						return xwait;
-					}
 
-					/*
-					 * Otherwise we have a definite conflict.  But before
-					 * complaining, look to see if the tuple we want to insert
-					 * is itself now committed dead --- if so, don't complain.
-					 * This is a waste of time in normal scenarios but we must
-					 * do it to support CREATE INDEX CONCURRENTLY.
-					 *
-					 * We must follow HOT-chains here because during
-					 * concurrent index build, we insert the root TID though
-					 * the actual tuple may be somewhere in the HOT-chain.
-					 * While following the chain we might not stop at the
-					 * exact tuple which triggered the insert, but that's OK
-					 * because if we find a live tuple anywhere in this chain,
-					 * we have a unique key conflict.  The other live tuple is
-					 * not part of this chain because it had a different index
-					 * entry.
-					 */
-					htid = itup->t_tid;
-					if (table_index_fetch_tuple_check(heapRel, &htid,
-													  SnapshotSelf, NULL))
-					{
-						/* Normal case --- it's still live */
+						{
+							Datum		values[INDEX_MAX_KEYS];
+							bool		isnull[INDEX_MAX_KEYS];
+							char	   *key_desc;
+
+							index_deform_tuple(itup, RelationGetDescr(rel),
+											   values, isnull);
+
+							key_desc = BuildIndexValueDescription(rel, values,
+																  isnull);
+
+							ereport(ERROR,
+									(errcode(ERRCODE_UNIQUE_VIOLATION),
+									 errmsg("duplicate key value violates unique constraint \"%s\"",
+											RelationGetRelationName(rel)),
+									 key_desc ? errdetail("Key %s already exists.",
+														  key_desc) : 0,
+									 errtableconstraint(heapRel,
+														RelationGetRelationName(rel))));
+						}
 					}
-					else
+					else if (all_dead && (!inposting ||
+										  (prevalldead &&
+										   curposti == BTreeTupleGetNPosting(curitup) - 1)))
 					{
 						/*
-						 * It's been deleted, so no error, and no need to
-						 * continue searching
+						 * The conflicting tuple (or all HOT chains pointed to by
+						 * all posting list TIDs) is dead to everyone, so mark
+						 * the index entry killed.  It's ok if we're not allowed
+						 * to, this isn't required for correctness.
 						 */
-						break;
+						Buffer		buf;
+
+						if (spanChildRel)
+							table_close(spanChildRel, NoLock);
+
+						/* Be sure to operate on the proper buffer */
+						if (nbuf != InvalidBuffer)
+							buf = nbuf;
+						else
+							buf = insertstate->buf;
+
+						ItemIdMarkDead(curitemid);
+						opaque->btpo_flags |= BTP_HAS_GARBAGE;
+
+						/*
+						 * Mark buffer with a dirty hint, since state is not
+						 * crucial.
+						 */
+						MarkBufferDirtyHint(buf, true);
 					}
-
-					/*
-					 * Check for a conflict-in as we would if we were going to
-					 * write to this page.  We aren't actually going to write,
-					 * but we want a chance to report SSI conflicts that would
-					 * otherwise be masked by this unique constraint
-					 * violation.
-					 */
-					CheckForSerializableConflictIn(rel, NULL, BufferGetBlockNumber(insertstate->buf));
-
-					/*
-					 * This is a definite conflict.  Break the tuple down into
-					 * datums and report the error.  But first, make sure we
-					 * release the buffer locks we're holding ---
-					 * BuildIndexValueDescription could make catalog accesses,
-					 * which in the worst case might touch this same index and
-					 * cause deadlocks.
-					 */
-					if (nbuf != InvalidBuffer)
-						_bt_relbuf(rel, nbuf);
-					_bt_relbuf(rel, insertstate->buf);
-					insertstate->buf = InvalidBuffer;
-					insertstate->bounds_valid = false;
-
-					{
-						Datum		values[INDEX_MAX_KEYS];
-						bool		isnull[INDEX_MAX_KEYS];
-						char	   *key_desc;
-
-						index_deform_tuple(itup, RelationGetDescr(rel),
-										   values, isnull);
-
-						key_desc = BuildIndexValueDescription(rel, values,
-															  isnull);
-
-						ereport(ERROR,
-								(errcode(ERRCODE_UNIQUE_VIOLATION),
-								 errmsg("duplicate key value violates unique constraint \"%s\"",
-										RelationGetRelationName(rel)),
-								 key_desc ? errdetail("Key %s already exists.",
-													  key_desc) : 0,
-								 errtableconstraint(heapRel,
-													RelationGetRelationName(rel))));
-					}
-				}
-				else if (all_dead && (!inposting ||
-									  (prevalldead &&
-									   curposti == BTreeTupleGetNPosting(curitup) - 1)))
-				{
-					/*
-					 * The conflicting tuple (or all HOT chains pointed to by
-					 * all posting list TIDs) is dead to everyone, so mark the
-					 * index entry killed.
-					 */
-					ItemIdMarkDead(curitemid);
-					opaque->btpo_flags |= BTP_HAS_GARBAGE;
-
-					/*
-					 * Mark buffer with a dirty hint, since state is not
-					 * crucial. Be sure to mark the proper buffer dirty.
-					 */
-					if (nbuf != InvalidBuffer)
-						MarkBufferDirtyHint(nbuf, true);
-					else
-						MarkBufferDirtyHint(insertstate->buf, true);
+					else if (spanChildRel)
+						table_close(spanChildRel, NoLock);
 				}
 
 				/*
@@ -768,6 +863,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 	if (nbuf != InvalidBuffer)
 		_bt_relbuf(rel, nbuf);
 
+	itup_key->keysz = saved_keysz;
 	return InvalidTransactionId;
 }
 

@@ -30,6 +30,7 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -187,7 +188,7 @@ BuildIndexValueDescription(Relation indexRelation,
 	Oid			indrelid;
 	AclResult	aclresult;
 
-	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(indexRelation);
+	indnkeyatts = IndexRelationGetNumberOfUniqueAttributes(indexRelation);
 
 	/*
 	 * Check permissions- if the user does not have access to view all of the
@@ -236,8 +237,31 @@ BuildIndexValueDescription(Relation indexRelation,
 	}
 
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "(%s)=(",
-					 pg_get_indexdef_columns(indexrelid, true));
+
+	/*
+	 * Build the column-name list for the first indnkeyatts columns.  For
+	 * spanning indexes indnkeyatts has already been reduced to indnuniqatts
+	 * so tableoid is excluded from both the names and the values below.
+	 */
+	appendStringInfoChar(&buf, '(');
+	for (i = 0; i < indnkeyatts; i++)
+	{
+		AttrNumber	attnum = idxrec->indkey.values[i];
+
+		if (i > 0)
+			appendStringInfoString(&buf, ", ");
+
+		if (attnum == InvalidAttrNumber)
+			appendStringInfoString(&buf, "<expr>");
+		else
+		{
+			char	   *attname = get_attname(indrelid, attnum, false);
+
+			appendStringInfoString(&buf, quote_identifier(attname));
+			pfree(attname);
+		}
+	}
+	appendStringInfoString(&buf, ")=(");
 
 	for (i = 0; i < indnkeyatts; i++)
 	{

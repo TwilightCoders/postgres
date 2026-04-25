@@ -1,0 +1,143 @@
+--
+-- ProgreSQL: INHERITS + PARTITION BY with spanning uniqueness indexes
+--
+-- A table with both INHERITS and PARTITION BY is permitted.  PRIMARY KEY
+-- and UNIQUE constraints whose columns don't match the partition key are
+-- implemented as "spanning indexes": a real btree on the root storing
+-- (key_cols..., tableoid) entries that enforce cross-partition uniqueness
+-- via indnuniqatts in pg_index.
+--
+-- Section 1: Basic table creation
+-- A table with both INHERITS and PARTITION BY must now succeed.
+-- (Pure PARTITION BY without INHERITS still enforces the partition-key
+-- subset rule.)
+CREATE TABLE progresql_base (
+    id      bigint,
+    kind    text,
+    ts      timestamptz NOT NULL
+);
+CREATE TABLE progresql_data (
+    PRIMARY KEY (id),      -- not the partition key
+    CHECK (ts IS NOT NULL)
+) INHERITS (progresql_base)
+  PARTITION BY RANGE (ts);
+-- Section 2: Spanning index catalog state
+-- indnuniqatts=1 (just id), indnkeyatts=2 (id + tableoid disambiguation col)
+SELECT indnuniqatts, indnkeyatts, indnatts
+FROM pg_index
+WHERE indrelid = 'progresql_data'::regclass
+  AND indisprimary;
+ indnuniqatts | indnkeyatts | indnatts
+--------------+-------------+----------
+            1 |           2 |        2
+(1 row)
+
+-- Section 3: Add partitions
+CREATE TABLE progresql_data_2024
+    PARTITION OF progresql_data (ts NOT NULL)
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE progresql_data_2025
+    PARTITION OF progresql_data (ts NOT NULL)
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+-- Section 4: Basic inserts across partitions
+INSERT INTO progresql_data VALUES (1, 'alpha', '2024-06-15 00:00:00+00');
+INSERT INTO progresql_data VALUES (2, 'beta',  '2025-03-10 00:00:00+00');
+SELECT id, kind FROM progresql_data ORDER BY id;
+ id | kind
+----+-------
+  1 | alpha
+  2 | beta
+(2 rows)
+
+-- Section 5: Same-partition PK duplicate is rejected
+BEGIN;
+INSERT INTO progresql_data VALUES (1, 'dup', '2024-09-01 00:00:00+00');
+ERROR:  duplicate key value violates unique constraint "progresql_data_pkey"
+DETAIL:  Key (id)=(1) already exists.
+ROLLBACK;
+-- Section 6: Cross-partition PK duplicate is rejected
+-- id=1 is in 2024 partition; try inserting id=1 into 2025 partition
+BEGIN;
+INSERT INTO progresql_data VALUES (1, 'crossdup', '2025-06-01 00:00:00+00');
+ERROR:  duplicate key value violates unique constraint "progresql_data_pkey"
+DETAIL:  Key (id)=(1) already exists.
+ROLLBACK;
+-- Section 7: DELETE then reinsert same key succeeds
+DELETE FROM progresql_data WHERE id = 1;
+INSERT INTO progresql_data VALUES (1, 'reinsert', '2024-11-01 00:00:00+00');
+SELECT id, kind FROM progresql_data WHERE id = 1;
+ id |   kind
+----+----------
+  1 | reinsert
+(1 row)
+
+-- Section 8: UPDATE key column (moves the spanning index entry)
+UPDATE progresql_data SET id = 99 WHERE id = 2;
+SELECT id, kind FROM progresql_data ORDER BY id;
+ id |   kind
+----+----------
+  1 | reinsert
+ 99 | beta
+(2 rows)
+
+-- Duplicate after update is rejected
+BEGIN;
+UPDATE progresql_data SET id = 99 WHERE id = 1;
+ERROR:  duplicate key value violates unique constraint "progresql_data_pkey"
+DETAIL:  Key (id)=(99) already exists.
+ROLLBACK;
+-- Section 9: Normal indexes still have indnuniqatts = 0
+CREATE TABLE progresql_normal (a int PRIMARY KEY, b int);
+SELECT indnuniqatts, indnkeyatts
+FROM pg_index
+WHERE indrelid = 'progresql_normal'::regclass AND indisprimary;
+ indnuniqatts | indnkeyatts
+--------------+-------------
+            0 |           1
+(1 row)
+
+DROP TABLE progresql_normal;
+-- Section 10: UNIQUE (not just PK) also gets a spanning index
+ALTER TABLE progresql_data ADD CONSTRAINT progresql_data_kind_uniq UNIQUE (kind);
+SELECT indnuniqatts, indnkeyatts
+FROM pg_index
+WHERE indrelid = 'progresql_data'::regclass
+  AND NOT indisprimary
+  AND indisunique;
+ indnuniqatts | indnkeyatts
+--------------+-------------
+            1 |           2
+(1 row)
+
+-- Reject cross-partition kind duplicate
+BEGIN;
+INSERT INTO progresql_data VALUES (50, 'reinsert', '2025-07-01 00:00:00+00');
+ERROR:  duplicate key value violates unique constraint "progresql_data_kind_uniq"
+DETAIL:  Key (kind)=(reinsert) already exists.
+ROLLBACK;
+-- Section 11: TRUNCATE partition clears spanning index
+-- After truncating 2024, id=1 should be gone
+TRUNCATE progresql_data_2024;
+SELECT count(*) FROM progresql_data WHERE id = 1;  -- should be 0
+ count
+-------
+     0
+(1 row)
+
+-- And id=1 should now be insertable (spanning index cleaned up)
+INSERT INTO progresql_data VALUES (1, 'after_truncate', '2024-02-01 00:00:00+00');
+SELECT id, kind FROM progresql_data WHERE id = 1;
+ id |      kind
+----+----------------
+  1 | after_truncate
+(1 row)
+
+-- Section 12: Pure PARTITION BY (no INHERITS) still enforces old rule
+CREATE TABLE partonly (a int, b int) PARTITION BY RANGE (b);
+CREATE UNIQUE INDEX ON partonly (a);  -- should fail: a not in partition key
+ERROR:  UNIQUE constraint on partitioned table must include all partitioning columns
+DETAIL:  UNIQUE constraint on table "partonly" lacks column "b" which is part of the partition key.
+DROP TABLE partonly;
+-- Cleanup
+DROP TABLE progresql_data;
+DROP TABLE progresql_base;

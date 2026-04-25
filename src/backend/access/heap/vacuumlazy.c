@@ -135,10 +135,13 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/table.h"
 #include "access/tidstore.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
+#include "catalog/index.h"
+#include "catalog/partition.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
@@ -156,6 +159,7 @@
 #include "storage/read_stream.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_rusage.h"
+#include "utils/rel.h"
 #include "utils/timestamp.h"
 
 
@@ -440,6 +444,7 @@ static bool lazy_scan_noprune(LVRelState *vacrel, Buffer buf,
 							  bool *has_lpdead_items);
 static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
+static void progresql_vacuum_spanning_indexes(LVRelState *vacrel);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
 static void lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
 								  Buffer buffer, OffsetNumber *deadoffsets,
@@ -2446,6 +2451,72 @@ lazy_scan_noprune(LVRelState *vacrel,
  * ongoing VACUUM operation will definitely only have one index scan/round of
  * index vacuuming.
  */
+
+/*
+ * progresql_vacuum_spanning_indexes
+ *
+ * After vacuuming the indexes of a leaf partition, clean any dead entries
+ * from ProgreSQL spanning indexes on ancestor (root) relations.  Called
+ * only when vacrel->rel->rd_rel->relispartition is true.
+ */
+static void
+progresql_vacuum_spanning_indexes(LVRelState *vacrel)
+{
+	Oid			partOid = RelationGetRelid(vacrel->rel);
+	List	   *ancestors = get_partition_ancestors(partOid);
+	ListCell   *lc;
+
+	foreach(lc, ancestors)
+	{
+		Oid			parentOid = lfirst_oid(lc);
+		Relation	parentRel;
+		List	   *indexoidlist;
+		ListCell   *il;
+
+		parentRel = table_open(parentOid, AccessShareLock);
+		indexoidlist = RelationGetIndexList(parentRel);
+
+		foreach(il, indexoidlist)
+		{
+			Oid				indexOid = lfirst_oid(il);
+			Relation		idxRel;
+			IndexVacuumInfo	ivinfo;
+			IndexBulkDeleteResult *istat;
+
+			idxRel = index_open(indexOid, RowExclusiveLock);
+
+			/* Only spanning indexes. */
+			if (idxRel->rd_index->indnuniqatts == 0)
+			{
+				index_close(idxRel, RowExclusiveLock);
+				continue;
+			}
+
+			ivinfo.index = idxRel;
+			ivinfo.heaprel = parentRel;
+			ivinfo.analyze_only = false;
+			ivinfo.report_progress = false;
+			ivinfo.estimated_count = true;
+			ivinfo.message_level = DEBUG2;
+			ivinfo.num_heap_tuples = vacrel->rel->rd_rel->reltuples;
+			ivinfo.strategy = vacrel->bstrategy;
+
+			istat = vac_bulkdel_one_index(&ivinfo, NULL,
+										  vacrel->dead_items,
+										  vacrel->dead_items_info);
+			if (istat)
+				pfree(istat);
+
+			index_close(idxRel, RowExclusiveLock);
+		}
+
+		list_free(indexoidlist);
+		table_close(parentRel, AccessShareLock);
+	}
+
+	list_free(ancestors);
+}
+
 static void
 lazy_vacuum(LVRelState *vacrel)
 {
@@ -2539,6 +2610,15 @@ lazy_vacuum(LVRelState *vacrel)
 		 * heap vacuuming now.
 		 */
 		lazy_vacuum_heap_rel(vacrel);
+
+		/*
+		 * For ProgreSQL leaf partitions, also vacuum dead entries from
+		 * spanning indexes on the root.  dead_items is still populated here
+		 * (cleared below by dead_items_reset), so the bulk-delete callback
+		 * can use it directly.
+		 */
+		if (vacrel->rel->rd_rel->relispartition)
+			progresql_vacuum_spanning_indexes(vacrel);
 	}
 	else
 	{

@@ -108,15 +108,18 @@
 
 #include "access/genam.h"
 #include "access/relscan.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/partition.h"
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/multirangetypes.h"
 #include "utils/rangetypes.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 /* waitMode argument to check_exclusion_or_unique_constraint() */
@@ -1122,6 +1125,89 @@ index_unchanged_by_update(ResultRelInfo *resultRelInfo, EState *estate,
  *
  * Returns true when Var that appears within allUpdatedCols located.
  */
+/*
+ * ExecInsertSpanningIndexTuples
+ *
+ * After inserting a tuple into a leaf partition, update any ProgreSQL
+ * spanning indexes that exist on the root relation.
+ *
+ * slot        - the just-inserted tuple slot (in the partition)
+ * tupleid     - the physical TID of the new tuple in the partition
+ * partition   - the leaf partition relation
+ * estate      - executor estate
+ */
+void
+ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
+							   ItemPointer tupleid,
+							   Relation partition,
+							   EState *estate)
+{
+	List	   *ancestors = get_partition_ancestors(RelationGetRelid(partition));
+	ListCell   *lc;
+
+	foreach(lc, ancestors)
+	{
+		Oid			parentOid = lfirst_oid(lc);
+		Relation	parentRel;
+		List	   *indexoidlist;
+		ListCell   *il;
+
+		parentRel = table_open(parentOid, AccessShareLock);
+		indexoidlist = RelationGetIndexList(parentRel);
+
+		foreach(il, indexoidlist)
+		{
+			Oid			indexOid = lfirst_oid(il);
+			Relation	indexRel;
+			IndexInfo  *indexInfo;
+			Datum		values[INDEX_MAX_KEYS];
+			bool		isnull[INDEX_MAX_KEYS];
+			int			i;
+
+			indexRel = index_open(indexOid, RowExclusiveLock);
+
+			/* Only spanning indexes (indnuniqatts > 0) need this treatment. */
+			if (indexRel->rd_index->indnuniqatts == 0)
+			{
+				index_close(indexRel, RowExclusiveLock);
+				continue;
+			}
+
+			indexInfo = BuildIndexInfo(indexRel);
+
+			/*
+			 * FormIndexDatum evaluates each index key column against the slot.
+			 * For the tableoid column (attnum = TableOidAttributeNumber), it
+			 * calls slot_getsysattr which returns the relation OID from the slot.
+			 * That would be the root OID in some contexts.  Override the last key
+			 * column with the partition's OID explicitly to be safe.
+			 */
+			FormIndexDatum(indexInfo, slot, estate, values, isnull);
+
+			/* Last key column must be this partition's OID. */
+			i = indexInfo->ii_NumIndexKeyAttrs - 1;
+			values[i] = ObjectIdGetDatum(RelationGetRelid(partition));
+			isnull[i] = false;
+
+			index_insert(indexRel,
+						 values,
+						 isnull,
+						 tupleid,
+						 parentRel,
+						 UNIQUE_CHECK_YES,
+						 false,
+						 indexInfo);
+
+			index_close(indexRel, RowExclusiveLock);
+		}
+
+		list_free(indexoidlist);
+		table_close(parentRel, AccessShareLock);
+	}
+
+	list_free(ancestors);
+}
+
 static bool
 index_expression_changed_walker(Node *node, Bitmapset *allUpdatedCols)
 {

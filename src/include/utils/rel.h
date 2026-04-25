@@ -536,6 +536,17 @@ typedef struct ViewOptions
 		((relation)->rd_index->indnkeyatts)
 
 /*
+ * IndexRelationGetNumberOfUniqueAttributes - number of key columns that
+ * participate in the unique constraint.  For normal indexes this equals
+ * the key-attr count; for ProgreSQL spanning indexes it is one less
+ * (the last key column is the child-relation OID, not part of uniqueness).
+ */
+#define IndexRelationGetNumberOfUniqueAttributes(indexrelation) \
+	((indexrelation)->rd_index->indnuniqatts > 0 ? \
+	 (int) (indexrelation)->rd_index->indnuniqatts : \
+	 IndexRelationGetNumberOfKeyAttributes(indexrelation))
+
+/*
  * RelationGetDescr
  *		Returns tuple descriptor for a relation.
  */

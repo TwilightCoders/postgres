@@ -1242,6 +1242,14 @@ ExecInsert(ModifyTableContext *context,
 													   false, NULL, NIL,
 													   false);
 		}
+
+		/*
+		 * For ProgreSQL tables: if we just inserted into a leaf partition,
+		 * propagate the insert into any spanning indexes on the root.
+		 */
+		if (resultRelationDesc->rd_rel->relispartition)
+			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid,
+										  resultRelationDesc, estate);
 	}
 
 	if (canSetTag)

@@ -57,6 +57,7 @@
  */
 
 /*							yyyymmddN */
-#define CATALOG_VERSION_NO	202506291
+/* ProgreSQL: bumped to add indnuniqatts column to pg_index (spanning indexes) */
+#define CATALOG_VERSION_NO	202605041
 
 #endif
