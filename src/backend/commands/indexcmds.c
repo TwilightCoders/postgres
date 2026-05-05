@@ -116,7 +116,7 @@ static bool ReindexRelationConcurrently(const ReindexStmt *stmt,
 										const ReindexParams *params);
 static void update_relispartition(Oid relationId, bool newval);
 static inline void set_indexsafe_procflags(void);
-static void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
+/* Exposed via defrem.h so reindex_index can call it after rebuild. */
 
 /*
  * callback argument type for RangeVarCallbackForReindexIndex()
@@ -2889,7 +2889,7 @@ ChooseIndexColumnNames(const List *indexElems)
  * (user_columns... + tableoid) via FormIndexDatum and call index_insert with
  * UNIQUE_CHECK_YES so that pre-existing duplicates are caught.
  */
-static void
+void
 BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 {
 	Relation	idxRel;

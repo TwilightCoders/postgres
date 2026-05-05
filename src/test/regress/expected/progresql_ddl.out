@@ -156,9 +156,13 @@ REINDEX INDEX pgddl_data_pkey;
 -- Both of these should fail but succeed: BUG B
 BEGIN;
 INSERT INTO pgddl_data VALUES (10, 'post-reindex-dup', '2025-08-01 00:00:00+00');  -- should fail: BUG B
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(10) already exists.
 ROLLBACK;
 BEGIN;
 INSERT INTO pgddl_data VALUES (1, 'post-reindex-dup2', '2025-04-01 00:00:00+00');  -- should fail: BUG B
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(1) already exists.
 ROLLBACK;
 -- Workaround: TRUNCATE + re-insert to restore spanning index.
 TRUNCATE pgddl_data;
@@ -192,12 +196,13 @@ ALTER TABLE pgddl_data ATTACH PARTITION pgddl_attach
     FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 -- id=20 has no spanning index entry; duplicate insert succeeds: BUG C
 INSERT INTO pgddl_data VALUES (20, 'gap-dup', '2025-10-01 00:00:00+00');
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(20) already exists.
 SELECT id, kind FROM pgddl_data WHERE id = 20 ORDER BY ts;
  id |    kind    
 ----+------------
- 20 | gap-dup
  20 | pre-attach
-(2 rows)
+(1 row)
 
 DELETE FROM pgddl_data WHERE id = 20 AND kind = 'gap-dup';
 -- New inserts AFTER attach are covered by the spanning index.

@@ -2095,6 +2095,111 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
  * WAL-logging.  This is all a bit redundant, but the existing callers have
  * this information handy in this form.
  */
+/*
+ * progresql_backfill_spanning_indexes_for_attached_partition
+ *
+ * After ATTACH PARTITION, walk all spanning indexes on partitioned-root
+ * ancestors of attachrel and insert (user_columns..., attachrel_oid) keys
+ * for each existing row in attachrel.  Without this step, BUG C: rows
+ * already in the attached partition are absent from the spanning index,
+ * so cross-partition uniqueness checks miss them.
+ *
+ * Called from ATExecAttachPartition immediately after
+ * AttachPartitionEnsureIndexes, while pg_inherits already has the new
+ * row so get_partition_ancestors can find ancestor roots.
+ */
+static void
+progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
+{
+	List	   *ancestors;
+	ListCell   *lc;
+	Oid			attachOid = RelationGetRelid(attachrel);
+
+	if (attachrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		return;					/* sub-partitioned: handled by leaf ATTACH */
+
+	ancestors = get_partition_ancestors(attachOid);
+
+	foreach(lc, ancestors)
+	{
+		Oid			parentOid = lfirst_oid(lc);
+		Relation	parentRel;
+		List	   *indexoidlist;
+		ListCell   *il;
+
+		parentRel = table_open(parentOid, AccessShareLock);
+
+		/* Spanning indexes only live on PARTITION BY roots. */
+		if (parentRel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		{
+			table_close(parentRel, AccessShareLock);
+			continue;
+		}
+
+		indexoidlist = RelationGetIndexList(parentRel);
+
+		foreach(il, indexoidlist)
+		{
+			Oid			indexOid = lfirst_oid(il);
+			Relation	idxRel;
+			IndexInfo  *idxInfo;
+			TupleTableSlot *slot;
+			TableScanDesc scan;
+			Datum		values[INDEX_MAX_KEYS];
+			bool		isnull[INDEX_MAX_KEYS];
+			Snapshot	snapshot;
+
+			idxRel = index_open(indexOid, RowExclusiveLock);
+
+			if (idxRel->rd_index->indnuniqatts == 0)
+			{
+				index_close(idxRel, RowExclusiveLock);
+				continue;
+			}
+
+			idxInfo = BuildIndexInfo(idxRel);
+
+			snapshot = GetTransactionSnapshot();
+			PushActiveSnapshot(snapshot);
+
+			slot = table_slot_create(attachrel, NULL);
+			scan = table_beginscan(attachrel, GetActiveSnapshot(), 0, NULL);
+
+			while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+			{
+				int			k;
+
+				FormIndexDatum(idxInfo, slot, NULL, values, isnull);
+
+				/* Trailing key column: the attaching partition's OID. */
+				k = idxInfo->ii_NumIndexKeyAttrs - 1;
+				values[k] = ObjectIdGetDatum(attachOid);
+				isnull[k] = false;
+
+				/*
+				 * Pass parentRel as heapRelation: the partitioned root has
+				 * rd_tableam == NULL, which signals nbtinsert.c to skip
+				 * heap-liveness deletion passes that would be unsafe across
+				 * partitions.  UNIQUE_CHECK_YES so any pre-existing
+				 * cross-partition duplicates are reported.
+				 */
+				index_insert(idxRel, values, isnull, &slot->tts_tid,
+							 parentRel, UNIQUE_CHECK_YES, false, idxInfo);
+			}
+
+			table_endscan(scan);
+			ExecDropSingleTupleTableSlot(slot);
+			PopActiveSnapshot();
+			index_close(idxRel, RowExclusiveLock);
+		}
+
+		list_free(indexoidlist);
+		table_close(parentRel, AccessShareLock);
+	}
+
+	list_free(ancestors);
+}
+
 void
 ExecuteTruncateGuts(List *explicit_rels,
 					List *relids,
@@ -20572,6 +20677,15 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 
 	/* Ensure there exists a correct set of indexes in the partition. */
 	AttachPartitionEnsureIndexes(wqueue, rel, attachrel);
+
+	/*
+	 * ProgreSQL: AttachPartitionEnsureIndexes does not propagate spanning
+	 * indexes to the attaching partition (they live only on the root).
+	 * Existing rows in attachrel must be backfilled into the root's spanning
+	 * indexes so cross-partition uniqueness covers them.  BUG-C-safe: runs
+	 * after pg_inherits has the new row, so get_partition_ancestors works.
+	 */
+	progresql_backfill_spanning_indexes_for_attached_partition(attachrel);
 
 	/* and triggers */
 	CloneRowTriggersToPartition(rel, attachrel);

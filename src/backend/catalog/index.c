@@ -52,6 +52,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
@@ -3839,6 +3840,17 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 
 	/* Re-allow use of target index */
 	ResetReindexProcessing();
+
+	/*
+	 * ProgreSQL: REINDEX of a spanning index leaves it empty because the
+	 * heap is the partitioned root with no storage.  Repopulate from leaf
+	 * partitions so cross-partition uniqueness is restored.  Detect the
+	 * spanning index by indnuniqatts > 0.  Must run after
+	 * ResetReindexProcessing so the index is openable again.
+	 */
+	if (iRel->rd_index->indnuniqatts > 0 &&
+		heapRelation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		BuildSpanningIndexFromPartitions(heapRelation, indexId);
 
 	/*
 	 * If the index is marked invalid/not-ready/dead (ie, it's from a failed
