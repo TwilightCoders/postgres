@@ -273,8 +273,16 @@ index_beginscan(Relation heapRelation,
 	scan->xs_snapshot = snapshot;
 	scan->instrument = instrument;
 
-	/* prepare to fetch index matches from table */
-	scan->xs_heapfetch = table_index_fetch_begin(heapRelation);
+	/*
+	 * Prepare to fetch index matches from the table.  Skip for ProgreSQL
+	 * spanning indexes where heapRelation is a partitioned root with no
+	 * table AM; callers that do this must use index_getnext_tid only (not
+	 * index_getnext, which would dereference xs_heapfetch).
+	 */
+	if (heapRelation != NULL && heapRelation->rd_tableam != NULL)
+		scan->xs_heapfetch = table_index_fetch_begin(heapRelation);
+	else
+		scan->xs_heapfetch = NULL;
 
 	return scan;
 }

@@ -116,6 +116,7 @@ static bool ReindexRelationConcurrently(const ReindexStmt *stmt,
 										const ReindexParams *params);
 static void update_relispartition(Oid relationId, bool newval);
 static inline void set_indexsafe_procflags(void);
+static void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
 
 /*
  * callback argument type for RangeVarCallbackForReindexIndex()
@@ -742,12 +743,18 @@ DefineIndex(Oid tableId,
 
 	/*
 	 * ProgreSQL spanning index: a PRIMARY KEY or UNIQUE on a table that is
-	 * both partitioned and inherits from another table.  We create a real
-	 * btree on the root instead of a hollow partitioned-index stub.
+	 * both partitioned and inherits via INHERITS (not just being a member of
+	 * a partition tree) from another table.  We create a real btree on the
+	 * root instead of a hollow partitioned-index stub.
+	 *
+	 * has_superclass() returns true for both kinds of pg_inherits rows
+	 * (explicit INHERITS and partition membership), so we additionally
+	 * exclude sub-partitions via !relispartition.
 	 */
 	progresql_bypass = partitioned &&
 		(stmt->unique || stmt->primary) &&
 		!exclusion &&
+		!rel->rd_rel->relispartition &&
 		has_superclass(tableId);
 
 	/*
@@ -1192,14 +1199,19 @@ DefineIndex(Oid tableId,
 		indexInfo->ii_NumIndexKeyAttrs = N + 1;
 		indexInfo->ii_NumIndexAttrs = N + 1;
 
-		/* Extend the collation/opclass/coloption arrays. */
+		/* Extend the collation/opclass/coloption/opclassOptions arrays. */
 		collationIds = repalloc(collationIds, (N + 1) * sizeof(Oid));
 		opclassIds = repalloc(opclassIds, (N + 1) * sizeof(Oid));
 		coloptions = repalloc(coloptions, (N + 1) * sizeof(int16));
+		opclassOptions = repalloc(opclassOptions, (N + 1) * sizeof(Datum));
 
 		collationIds[N] = InvalidOid;
 		opclassIds[N] = GetDefaultOpClass(OIDOID, BTREE_AM_OID);
 		coloptions[N] = 0;
+		opclassOptions[N] = (Datum) 0;
+
+		/* Add a column name for the appended tableoid key column. */
+		indexColNames = lappend(indexColNames, "tableoid");
 	}
 
 	/* Is index safe for others to ignore?  See set_indexsafe_procflags() */
@@ -1325,7 +1337,18 @@ DefineIndex(Oid tableId,
 		CreateComments(indexRelationId, RelationRelationId, 0,
 					   stmt->idxcomment);
 
-	if (partitioned)
+	/*
+	 * ProgreSQL spanning indexes live only on the partitioned root.  Skip the
+	 * partition-propagation step (which would clone the tableoid-bearing key
+	 * onto each child and fail the system-column check).  Instead, populate
+	 * the newly-created spanning index from any existing tuples in child
+	 * partitions so that uniqueness enforcement works immediately (e.g.
+	 * ALTER TABLE ADD CONSTRAINT on a non-empty table).
+	 */
+	if (progresql_bypass && OidIsValid(indexRelationId))
+		BuildSpanningIndexFromPartitions(rel, indexRelationId);
+
+	if (partitioned && !progresql_bypass)
 	{
 		PartitionDesc partdesc;
 
@@ -1334,6 +1357,10 @@ DefineIndex(Oid tableId,
 		 * partition to make sure they all contain a corresponding index.
 		 *
 		 * If we're called internally (no stmt->relation), recurse always.
+		 *
+		 * For ProgreSQL spanning indexes (progresql_bypass), this propagation
+		 * is intentionally skipped: the index lives only on the root and
+		 * partitions do not get per-partition copies.
 		 */
 		partdesc = RelationGetPartitionDesc(rel, true);
 		if ((!stmt->relation || stmt->relation->inh) && partdesc->nparts > 0)
@@ -2847,6 +2874,102 @@ ChooseIndexColumnNames(const List *indexElems)
 		result = lappend(result, pstrdup(curname));
 	}
 	return result;
+}
+
+/*
+ * BuildSpanningIndexFromPartitions
+ *
+ * After creating a ProgreSQL spanning index on a partitioned root, populate
+ * it with entries for all existing tuples in all leaf child partitions.
+ * Without this step the spanning index is empty after ALTER TABLE ADD
+ * CONSTRAINT on a non-empty table, so cross-partition uniqueness checks
+ * miss pre-existing rows.
+ *
+ * For each live tuple in each partition we compute the index key
+ * (user_columns... + tableoid) via FormIndexDatum and call index_insert with
+ * UNIQUE_CHECK_YES so that pre-existing duplicates are caught.
+ */
+static void
+BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
+{
+	Relation	idxRel;
+	IndexInfo  *idxInfo;
+	PartitionDesc partdesc;
+	Snapshot	snapshot;
+	int			pi;
+
+	idxRel = index_open(indexRelationId, RowExclusiveLock);
+	idxInfo = BuildIndexInfo(idxRel);
+
+	partdesc = RelationGetPartitionDesc(rel, true);
+
+	/*
+	 * Push the transaction snapshot as active so that heap visibility checks
+	 * inside table_scan_getnextslot (and the btree uniqueness check path) can
+	 * satisfy the snapshot active_count assertions.  DDL commands do not
+	 * push a snapshot automatically, so we must do it explicitly here.
+	 */
+	snapshot = GetTransactionSnapshot();
+	PushActiveSnapshot(snapshot);
+
+	for (pi = 0; pi < partdesc->nparts; pi++)
+	{
+		Oid			partOid = partdesc->oids[pi];
+		Relation	partRel;
+		TupleTableSlot *slot;
+		TableScanDesc scan;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+
+		partRel = table_open(partOid, AccessShareLock);
+
+		/*
+		 * Skip sub-partitioned tables; their leaf children are visited in
+		 * their own iterations of the outer loop.
+		 */
+		if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			table_close(partRel, AccessShareLock);
+			continue;
+		}
+
+		slot = table_slot_create(partRel, NULL);
+		scan = table_beginscan(partRel, GetActiveSnapshot(), 0, NULL);
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			int			k;
+
+			FormIndexDatum(idxInfo, slot, NULL, values, isnull);
+
+			/*
+			 * The trailing key column is the partition's OID.  slot's
+			 * tts_tableOid is set by the heap scan to partRel's OID, but be
+			 * explicit in case any code path does not set it.
+			 */
+			k = idxInfo->ii_NumIndexKeyAttrs - 1;
+			values[k] = ObjectIdGetDatum(RelationGetRelid(partRel));
+			isnull[k] = false;
+
+			/*
+			 * Pass rel (the partitioned root) as heapRelation, not partRel.
+			 * The root has rd_tableam == NULL, which signals nbtinsert.c to
+			 * skip the heap-liveness deletion passes (_bt_simpledel_pass and
+			 * _bt_bottomupdel_pass) that cannot safely process TIDs spread
+			 * across multiple partitions.
+			 */
+			index_insert(idxRel, values, isnull, &slot->tts_tid,
+						 rel, UNIQUE_CHECK_YES, false, idxInfo);
+		}
+
+		table_endscan(scan);
+		ExecDropSingleTupleTableSlot(slot);
+		table_close(partRel, AccessShareLock);
+	}
+
+	PopActiveSnapshot();
+
+	index_close(idxRel, RowExclusiveLock);
 }
 
 /*

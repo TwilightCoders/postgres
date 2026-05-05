@@ -239,29 +239,36 @@ BuildIndexValueDescription(Relation indexRelation,
 	initStringInfo(&buf);
 
 	/*
-	 * Build the column-name list for the first indnkeyatts columns.  For
-	 * spanning indexes indnkeyatts has already been reduced to indnuniqatts
-	 * so tableoid is excluded from both the names and the values below.
+	 * Build the column-name list.  For ProgreSQL spanning indexes
+	 * (indnuniqatts > 0), indnkeyatts has been reduced to indnuniqatts so we
+	 * exclude the appended tableoid disambiguation column from the message.
+	 * Spanning indexes never have expression columns, so a manual loop using
+	 * column names suffices.  For ordinary indexes we fall back to
+	 * pg_get_indexdef_columns to preserve full expression rendering.
 	 */
-	appendStringInfoChar(&buf, '(');
-	for (i = 0; i < indnkeyatts; i++)
+	if (idxrec->indnuniqatts > 0)
 	{
-		AttrNumber	attnum = idxrec->indkey.values[i];
-
-		if (i > 0)
-			appendStringInfoString(&buf, ", ");
-
-		if (attnum == InvalidAttrNumber)
-			appendStringInfoString(&buf, "<expr>");
-		else
+		appendStringInfoChar(&buf, '(');
+		for (i = 0; i < indnkeyatts; i++)
 		{
-			char	   *attname = get_attname(indrelid, attnum, false);
+			AttrNumber	attnum = idxrec->indkey.values[i];
+			char	   *attname;
 
+			if (i > 0)
+				appendStringInfoString(&buf, ", ");
+
+			Assert(attnum != InvalidAttrNumber);
+			attname = get_attname(indrelid, attnum, false);
 			appendStringInfoString(&buf, quote_identifier(attname));
 			pfree(attname);
 		}
+		appendStringInfoString(&buf, ")=(");
 	}
-	appendStringInfoString(&buf, ")=(");
+	else
+	{
+		appendStringInfo(&buf, "(%s)=(",
+						 pg_get_indexdef_columns(indexrelid, true));
+	}
 
 	for (i = 0; i < indnkeyatts; i++)
 	{

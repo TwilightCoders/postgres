@@ -594,7 +594,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						{
 							Oid		child_relid = DatumGetObjectId(oidval);
 
-							spanChildRel = table_open(child_relid, NoLock);
+							spanChildRel = table_open(child_relid, AccessShareLock);
 							checkRel = spanChildRel;
 						}
 					}
@@ -616,7 +616,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						if (checkUnique == UNIQUE_CHECK_PARTIAL)
 						{
 							if (spanChildRel)
-								table_close(spanChildRel, NoLock);
+								table_close(spanChildRel, AccessShareLock);
 							if (nbuf != InvalidBuffer)
 								_bt_relbuf(rel, nbuf);
 							*is_unique = false;
@@ -634,7 +634,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						if (TransactionIdIsValid(xwait))
 						{
 							if (spanChildRel)
-								table_close(spanChildRel, NoLock);
+								table_close(spanChildRel, AccessShareLock);
 							if (nbuf != InvalidBuffer)
 								_bt_relbuf(rel, nbuf);
 							/* Tell _bt_doinsert to wait... */
@@ -681,7 +681,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 								{
 									Oid		self_relid = DatumGetObjectId(soidval);
 
-									selfChildRel = table_open(self_relid, NoLock);
+									selfChildRel = table_open(self_relid, AccessShareLock);
 									selfCheckRel = selfChildRel;
 								}
 							}
@@ -699,14 +699,14 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 								 * continue searching.
 								 */
 								if (selfChildRel)
-									table_close(selfChildRel, NoLock);
+									table_close(selfChildRel, AccessShareLock);
 								if (spanChildRel)
-									table_close(spanChildRel, NoLock);
+									table_close(spanChildRel, AccessShareLock);
 								break;
 							}
 
 							if (selfChildRel)
-								table_close(selfChildRel, NoLock);
+								table_close(selfChildRel, AccessShareLock);
 						}
 
 						/*
@@ -719,7 +719,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						CheckForSerializableConflictIn(rel, NULL, BufferGetBlockNumber(insertstate->buf));
 
 						if (spanChildRel)
-							table_close(spanChildRel, NoLock);
+							table_close(spanChildRel, AccessShareLock);
 
 						/*
 						 * This is a definite conflict.  Break the tuple down into
@@ -769,7 +769,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						Buffer		buf;
 
 						if (spanChildRel)
-							table_close(spanChildRel, NoLock);
+							table_close(spanChildRel, AccessShareLock);
 
 						/* Be sure to operate on the proper buffer */
 						if (nbuf != InvalidBuffer)
@@ -787,7 +787,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						MarkBufferDirtyHint(buf, true);
 					}
 					else if (spanChildRel)
-						table_close(spanChildRel, NoLock);
+						table_close(spanChildRel, AccessShareLock);
 				}
 
 				/*

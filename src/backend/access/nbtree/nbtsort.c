@@ -474,9 +474,19 @@ _bt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
 
 	/* Fill spool using either serial or parallel heap scan */
 	if (!buildstate->btleader)
-		reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
-										   _bt_build_callback, buildstate,
-										   NULL);
+	{
+		/*
+		 * ProgreSQL spanning indexes: the heap is a partitioned root with no
+		 * physical storage.  Skip the scan and leave the spool empty so that
+		 * _bt_leafbuild() writes the empty-index metapage structure.  The
+		 * index will be populated separately from the child partitions by
+		 * BuildSpanningIndexFromPartitions().
+		 */
+		if (heap->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+			reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
+											   _bt_build_callback, buildstate,
+											   NULL);
+	}
 	else
 		reltuples = _bt_parallel_heapscan(buildstate,
 										  &indexInfo->ii_BrokenHotChain);

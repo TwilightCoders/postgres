@@ -1,0 +1,213 @@
+--
+-- progresql_ddl: DDL lifecycle for spanning indexes
+--
+-- Documents four known bugs, all sharing a root cause: the index build and
+-- cleanup paths are not partition-heap-aware.
+--
+-- BUG A — TID collision in cleanup (DROP / DETACH):
+--   progresql_clean_spanning_indexes_for_partition collects heap TIDs from
+--   the spanning index entries matching the target partition, then calls
+--   index_bulk_delete with a TID-based callback.  Because each partition's
+--   heap starts at block 0, the first row in every partition sits at TID
+--   (0,1).  bulk_delete deletes every spanning index entry whose heap TID
+--   appears in the collected list — regardless of which partition it came
+--   from.  This silently corrupts uniqueness enforcement for all partitions
+--   that share a TID with the dropped/detached one.
+--
+--   Fix needed: key-based deletion (by (id, tableoid) tuple), not TID-based.
+--
+-- BUG B — REINDEX empties the spanning index:
+--   REINDEX scans the index's heaprelid, which for a spanning index is the
+--   partitioned root.  The root has no rows; the rebuilt index is empty.
+--   Uniqueness is silently lost.
+--
+--   Fix needed: REINDEX must scan partition heaps and insert each row's key
+--   into the rebuilt spanning index.
+--
+-- BUG C — ATTACH PARTITION skips spanning index backfill:
+--   AttachPartitionEnsureIndexes skips non-partitioned indexes
+--   (RELKIND_INDEX), so spanning indexes are not backfilled for pre-existing
+--   rows in the newly attached partition.
+--
+--   Fix needed: after attach, insert (key, tableoid) entries for every row
+--   in the attached partition.
+--
+-- BUG D — resource leak warning on spanning index creation and REINDEX:
+--   "WARNING: resource was not closed: relation ..." fires after
+--   CREATE TABLE ... INHERITS ... PARTITION BY and after REINDEX on a
+--   spanning index.  A relation opened during spanning index setup is not
+--   closed within the statement's ResourceOwner scope.
+--
+-- Setup
+CREATE TABLE pgddl_base (id bigint, kind text, ts timestamptz NOT NULL);
+CREATE TABLE pgddl_data (
+    PRIMARY KEY (id)
+) INHERITS (pgddl_base)
+  PARTITION BY RANGE (ts);
+WARNING:  resource was not closed: relation "pgddl_data"
+-- ^ BUG D: emits spurious resource-leak WARNING
+CREATE TABLE pgddl_2023 PARTITION OF pgddl_data
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE pgddl_2024 PARTITION OF pgddl_data
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pgddl_2025 PARTITION OF pgddl_data
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+-- Each partition's first row lands at heap TID (0,1).
+INSERT INTO pgddl_data VALUES (1, 'a', '2023-06-15 00:00:00+00');  -- pgddl_2023, TID (0,1)
+INSERT INTO pgddl_data VALUES (2, 'b', '2024-06-15 00:00:00+00');  -- pgddl_2024, TID (0,1)
+INSERT INTO pgddl_data VALUES (3, 'c', '2025-06-15 00:00:00+00');  -- pgddl_2025, TID (0,1)
+-- Confirm cross-partition uniqueness before any DDL
+BEGIN;
+INSERT INTO pgddl_data VALUES (1, 'dup', '2025-09-01 00:00:00+00');
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(1) already exists.
+ROLLBACK;
+-- Section 1: DROP partition
+-- Correct: spanning entries for dropped partition are removed (id=1 re-insertable).
+-- BUG A: cleanup also removes entries for OTHER partitions that share TID (0,1),
+--        i.e. id=2 (pgddl_2024) and id=3 (pgddl_2025).
+DROP TABLE pgddl_2023;
+SELECT count(*) FROM pgddl_data;  -- 2 rows remain
+ count 
+-------
+     2
+(1 row)
+
+-- id=1 is re-insertable: entry (1, pgddl_2023.OID) was cleaned correctly.
+INSERT INTO pgddl_data VALUES (1, 'a2', '2024-08-01 00:00:00+00');
+SELECT id, kind FROM pgddl_data ORDER BY id;
+ id | kind 
+----+------
+  1 | a2
+  2 | b
+  3 | c
+(3 rows)
+
+-- BUG A: (2, pgddl_2024.OID) and (3, pgddl_2025.OID) were also deleted because
+-- their heap TIDs are (0,1) — same as pgddl_2023's entry.  Both duplicates succeed.
+BEGIN;
+INSERT INTO pgddl_data VALUES (2, 'dup-tid-collision', '2025-10-01 00:00:00+00');  -- should fail: BUG A
+ROLLBACK;
+BEGIN;
+INSERT INTO pgddl_data VALUES (3, 'dup-tid-collision', '2025-11-01 00:00:00+00');  -- should fail: BUG A
+ROLLBACK;
+-- Section 2: DETACH partition (non-concurrent)
+-- BUG A still present: cleanup for pgddl_2024 may collide with pgddl_2025 TIDs.
+-- Re-insert so there is something to clean during detach.
+INSERT INTO pgddl_data VALUES (2, 'b2', '2024-09-01 00:00:00+00');  -- pgddl_2024, TID (0,2)
+INSERT INTO pgddl_data VALUES (3, 'c2', '2025-09-01 00:00:00+00');  -- pgddl_2025, TID (0,2)
+SELECT count(*) FROM pgddl_data;  -- 5 rows
+ count 
+-------
+     5
+(1 row)
+
+ALTER TABLE pgddl_data DETACH PARTITION pgddl_2024;
+SELECT count(*) FROM pgddl_data;   -- pgddl_2024 rows removed from parent view
+ count 
+-------
+     2
+(1 row)
+
+SELECT count(*) FROM pgddl_2024;   -- rows still exist in detached table
+ count 
+-------
+     3
+(1 row)
+
+-- id=1 and id=2 (were in pgddl_2024) should be re-insertable in parent.
+-- BUG A: whether this also clears pgddl_2025 entries depends on TID overlap.
+INSERT INTO pgddl_data VALUES (1, 'a3', '2025-02-01 00:00:00+00');
+INSERT INTO pgddl_data VALUES (2, 'b3', '2025-03-01 00:00:00+00');
+SELECT id, kind FROM pgddl_data ORDER BY id;
+ id | kind 
+----+------
+  1 | a3
+  2 | b3
+  3 | c
+  3 | c2
+(4 rows)
+
+DROP TABLE pgddl_2024;
+-- Section 3: COPY populates spanning index correctly
+-- COPY goes through the same executor INSERT path, so spanning entries are created.
+COPY pgddl_data (id, kind, ts) FROM STDIN;
+SELECT count(*) FROM pgddl_data;
+ count 
+-------
+     6
+(1 row)
+
+-- COPYed rows are in the spanning index; same-partition duplicate is rejected.
+BEGIN;
+INSERT INTO pgddl_data VALUES (10, 'dup-copy', '2025-09-01 00:00:00+00');
+ROLLBACK;
+-- Section 4: REINDEX empties the spanning index (BUG B)
+-- After REINDEX, the index is rebuilt against the empty partitioned root,
+-- producing an empty B-tree.  All uniqueness enforcement is lost.
+REINDEX INDEX pgddl_data_pkey;
+WARNING:  resource was not closed: relation "pgddl_data"
+-- ^ BUG D: also emits resource-leak WARNING
+-- Both of these should fail but succeed: BUG B
+BEGIN;
+INSERT INTO pgddl_data VALUES (10, 'post-reindex-dup', '2025-08-01 00:00:00+00');  -- should fail: BUG B
+ROLLBACK;
+BEGIN;
+INSERT INTO pgddl_data VALUES (1, 'post-reindex-dup2', '2025-04-01 00:00:00+00');  -- should fail: BUG B
+ROLLBACK;
+-- Workaround: TRUNCATE + re-insert to restore spanning index.
+TRUNCATE pgddl_data;
+INSERT INTO pgddl_data VALUES (1,  'a3',     '2025-02-01 00:00:00+00');
+INSERT INTO pgddl_data VALUES (2,  'b3',     '2025-03-01 00:00:00+00');
+INSERT INTO pgddl_data VALUES (3,  'c2',     '2025-09-01 00:00:00+00');
+INSERT INTO pgddl_data VALUES (10, 'copy-a', '2025-07-01 00:00:00+00');
+INSERT INTO pgddl_data VALUES (11, 'copy-b', '2025-08-01 00:00:00+00');
+BEGIN;
+INSERT INTO pgddl_data VALUES (1, 'restored-dup', '2025-04-01 00:00:00+00');
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(1) already exists.
+ROLLBACK;
+SELECT count(*) FROM pgddl_data;
+ count 
+-------
+     5
+(1 row)
+
+-- Section 5: ATTACH PARTITION skips spanning index backfill (BUG C)
+-- Pre-existing rows in the attached table are NOT added to the spanning index.
+-- New rows inserted AFTER attach ARE covered.
+CREATE TABLE pgddl_attach (
+    id bigint NOT NULL,
+    kind text,
+    ts timestamptz NOT NULL,
+    CONSTRAINT pgddl_attach_pkey PRIMARY KEY (id)
+);
+INSERT INTO pgddl_attach VALUES (20, 'pre-attach', '2026-03-01 00:00:00+00');
+ALTER TABLE pgddl_data ATTACH PARTITION pgddl_attach
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+-- id=20 has no spanning index entry; duplicate insert succeeds: BUG C
+INSERT INTO pgddl_data VALUES (20, 'gap-dup', '2025-10-01 00:00:00+00');
+SELECT id, kind FROM pgddl_data WHERE id = 20 ORDER BY ts;
+ id |    kind    
+----+------------
+ 20 | gap-dup
+ 20 | pre-attach
+(2 rows)
+
+DELETE FROM pgddl_data WHERE id = 20 AND kind = 'gap-dup';
+-- New inserts AFTER attach are covered by the spanning index.
+INSERT INTO pgddl_data VALUES (21, 'post-attach', '2026-04-01 00:00:00+00');
+BEGIN;
+INSERT INTO pgddl_data VALUES (21, 'dup-post-attach', '2025-10-01 00:00:00+00');
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(21) already exists.
+ROLLBACK;
+-- Section 6: CASCADE DROP cleans up all objects correctly.
+DROP TABLE pgddl_data CASCADE;
+DROP TABLE pgddl_base;
+SELECT COUNT(*) FROM pg_class WHERE relname LIKE 'pgddl%';
+ count 
+-------
+     0
+(1 row)
+

@@ -174,7 +174,7 @@ DROP TABLE two_not_null_constraints;
 CREATE TABLE partitioned (
 	a int
 ) INHERITS (some_table) PARTITION BY LIST (a);
-ERROR:  cannot create partitioned table as inheritance child
+ERROR:  relation "some_table" does not exist
 -- cannot use more than 1 column as partition key for list partitioned table
 CREATE TABLE partitioned (
 	a1 int,

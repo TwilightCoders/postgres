@@ -283,6 +283,20 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				continue;
 			}
 
+			/*
+			 * Skip ProgreSQL spanning indexes: RELKIND_INDEX btrees on
+			 * partitioned roots whose key is (user_cols..., tableoid).  They
+			 * exist only for cross-partition DML uniqueness enforcement.  The
+			 * planner cannot scan the partitioned root directly (no storage),
+			 * and the appended tableoid column makes the key shape useless
+			 * for query optimization, so they are invisible to plan time.
+			 */
+			if (index->indnuniqatts > 0)
+			{
+				index_close(indexRelation, NoLock);
+				continue;
+			}
+
 			info = makeNode(IndexOptInfo);
 
 			info->indexoid = index->indexrelid;

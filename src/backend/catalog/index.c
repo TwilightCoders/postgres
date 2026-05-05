@@ -342,12 +342,23 @@ ConstructTupleDescriptor(Relation heapRelation,
 			/* Simple index column */
 			const FormData_pg_attribute *from;
 
-			Assert(atnum > 0);	/* should've been caught above */
-
-			if (atnum > natts)	/* safety check */
-				elog(ERROR, "invalid column number %d", atnum);
-			from = TupleDescAttr(heapTupDesc,
-								 AttrNumberGetAttrOffset(atnum));
+			if (atnum < 0)
+			{
+				/*
+				 * ProgreSQL spanning indexes use system attributes (e.g.
+				 * tableoid) as appended disambiguation columns.  Look up the
+				 * canonical system-attribute definition rather than the heap
+				 * tupdesc, since system columns have no heap entry.
+				 */
+				from = SystemAttributeDefinition(atnum);
+			}
+			else
+			{
+				if (atnum > natts)	/* safety check */
+					elog(ERROR, "invalid column number %d", atnum);
+				from = TupleDescAttr(heapTupDesc,
+									 AttrNumberGetAttrOffset(atnum));
+			}
 
 			to->atttypid = from->atttypid;
 			to->attlen = from->attlen;

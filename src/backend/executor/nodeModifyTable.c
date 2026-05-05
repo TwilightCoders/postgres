@@ -2354,6 +2354,33 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	list_free(recheckIndexes);
 
 	/*
+	 * For ProgreSQL spanning indexes: if this is an in-partition UPDATE on a
+	 * leaf partition, propagate the new key values into any spanning indexes
+	 * on the partitioned root.  Cross-partition UPDATEs are handled as
+	 * DELETE + INSERT and the INSERT path already calls
+	 * ExecInsertSpanningIndexTuples.
+	 *
+	 * HOT updates do not move the tuple to a new TID from the partition's
+	 * perspective (updateIndexes != TU_All), but they do create a
+	 * HEAP_ONLY_TUPLE at the new TID that is not a valid chain root.
+	 * heap_hot_search_buffer skips HEAP_ONLY_TUPLE at chain start, so
+	 * storing a HOT-only TID in the spanning index would make uniqueness
+	 * checks always treat the entry as dead.  Use the OLD tuple's TID
+	 * (tupleid) as the chain root so heap_hot_search_buffer can follow
+	 * t_ctid to the live version.
+	 */
+	if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
+	{
+		ItemPointer span_tid = (updateCxt->updateIndexes != TU_All)
+			? tupleid			/* HOT: old TID is the chain root */
+			: &slot->tts_tid;	/* non-HOT: new TID is correct */
+
+		ExecInsertSpanningIndexTuples(slot, span_tid,
+									  resultRelInfo->ri_RelationDesc,
+									  context->estate);
+	}
+
+	/*
 	 * Check any WITH CHECK OPTION constraints from parent views.  We are
 	 * required to do this after testing all constraints and uniqueness
 	 * violations per the SQL spec, so we do it after actually updating the

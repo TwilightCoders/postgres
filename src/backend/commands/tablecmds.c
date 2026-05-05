@@ -1278,6 +1278,18 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			IndexStmt  *idxstmt;
 			Oid			constraintOid;
 
+			/*
+			 * Skip ProgreSQL spanning indexes: they live as RELKIND_INDEX
+			 * directly on the partitioned root and are NOT propagated to
+			 * partitions.  Cloning would fail the system-column check
+			 * because the spanning key includes tableoid (a system column).
+			 */
+			if (idxRel->rd_index->indnuniqatts > 0)
+			{
+				index_close(idxRel, AccessShareLock);
+				continue;
+			}
+
 			if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 			{
 				if (idxRel->rd_index->indisunique)
