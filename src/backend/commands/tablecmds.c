@@ -1982,51 +1982,27 @@ ExecuteTruncate(TruncateStmt *stmt)
 	}
 }
 
-/* Callback state for progresql_bulk_delete_for_partition */
-typedef struct
-{
-	ItemPointerData *tids;		/* sorted array of TIDs to delete */
-	int			ntids;
-} ProgresqlBulkDeleteState;
-
-static int
-progresql_tid_cmp(const void *a, const void *b)
-{
-	const ItemPointerData *ta = (const ItemPointerData *) a;
-	const ItemPointerData *tb = (const ItemPointerData *) b;
-
-	return ItemPointerCompare(ta, tb);
-}
-
-static bool
-progresql_bulk_delete_callback(ItemPointer itemptr, void *state)
-{
-	ProgresqlBulkDeleteState *st = (ProgresqlBulkDeleteState *) state;
-
-	/* Binary search for itemptr in the sorted TID array. */
-	int			lo = 0,
-				hi = st->ntids - 1;
-
-	while (lo <= hi)
-	{
-		int			mid = (lo + hi) / 2;
-		int			cmp = ItemPointerCompare(itemptr, &st->tids[mid]);
-
-		if (cmp == 0)
-			return true;
-		else if (cmp < 0)
-			hi = mid - 1;
-		else
-			lo = mid + 1;
-	}
-	return false;
-}
-
 /*
- * Clean all ProgreSQL spanning index entries that reference the truncated
- * partition.  Called after a partition's heap storage has been truncated.
+ * Clean all ProgreSQL spanning index entries that reference partRel.
+ * Called after a partition's heap storage is gone (TRUNCATE, DROP, or
+ * DETACH); any stale entries in spanning indexes on ancestor partitioned
+ * roots are removed so they don't dangle to a now-invalid heap TID.
+ *
+ * Implementation: scan the spanning index for entries whose trailing
+ * tableoid key column equals partOid, and set kill_prior_tuple on each
+ * match so the btree marks the index entry LP_DEAD.  _bt_check_unique
+ * skips LP_DEAD items (nbtinsert.c, the !ItemIdIsDead test in the leaf
+ * scan loop), so future uniqueness checks correctly ignore them.
+ * Physical removal happens lazily via btree's simple/bottom-up deletion
+ * passes when pages are next modified, or via VACUUM.
+ *
+ * This is the BUG-A-safe replacement for the prior bulk_delete-based
+ * cleanup, which collided across partitions whenever heap TIDs (e.g.
+ * (0,1), the first row of every partition) were shared.  Filtering by
+ * (key, tableoid) via the index scan key is exact: no false positives,
+ * no false negatives.
  */
-static void
+void
 progresql_clean_spanning_indexes_for_partition(Relation partRel)
 {
 	List	   *ancestors;
@@ -2055,13 +2031,6 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 			Relation		idxRel;
 			IndexScanDesc	scan;
 			ScanKeyData		skey;
-			ItemPointer		tid;
-			ItemPointerData *tids;
-			int				ntids = 0,
-							tids_max = 64;
-			IndexVacuumInfo	ivinfo;
-			IndexBulkDeleteResult *istat;
-			ProgresqlBulkDeleteState cbstate;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
@@ -2079,48 +2048,30 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 						F_OIDEQ,
 						ObjectIdGetDatum(partOid));
 
+			/*
+			 * Pass parentRel as heapRelation.  The partitioned root has no
+			 * table AM (rd_tableam == NULL); index_beginscan skips
+			 * table_index_fetch_begin in that case.  We only call
+			 * index_getnext_tid (TID-only), never index_getnext (heap fetch),
+			 * so xs_heapfetch is never dereferenced.
+			 */
 			scan = index_beginscan(parentRel, idxRel, SnapshotAny, NULL,
 								   1, 0);
 			index_rescan(scan, &skey, 1, NULL, 0);
 
-			tids = (ItemPointerData *) palloc(tids_max * sizeof(ItemPointerData));
-
-			while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
+			while (index_getnext_tid(scan, ForwardScanDirection) != NULL)
 			{
-				if (ntids >= tids_max)
-				{
-					tids_max *= 2;
-					tids = repalloc(tids, tids_max * sizeof(ItemPointerData));
-				}
-				ItemPointerCopy(tid, &tids[ntids++]);
+				/*
+				 * Mark this entry LP_DEAD on the next index_getnext_tid call
+				 * (or on index_endscan).  btree's _bt_check_unique skips
+				 * LP_DEAD items, so future inserts won't see these stale
+				 * entries as conflicts; they're physically reclaimed when
+				 * the page is next modified or VACUUMed.
+				 */
+				scan->kill_prior_tuple = true;
 			}
+
 			index_endscan(scan);
-
-			if (ntids > 0)
-			{
-				/* Sort so the bulk-delete callback can binary-search. */
-				qsort(tids, ntids, sizeof(ItemPointerData), progresql_tid_cmp);
-
-				cbstate.tids = tids;
-				cbstate.ntids = ntids;
-
-				ivinfo.index = idxRel;
-				ivinfo.heaprel = parentRel;
-				ivinfo.analyze_only = false;
-				ivinfo.report_progress = false;
-				ivinfo.estimated_count = false;
-				ivinfo.message_level = DEBUG2;
-				ivinfo.num_heap_tuples = 0;
-				ivinfo.strategy = NULL;
-
-				istat = index_bulk_delete(&ivinfo, NULL,
-										  progresql_bulk_delete_callback,
-										  &cbstate);
-				if (istat)
-					pfree(istat);
-			}
-
-			pfree(tids);
 			index_close(idxRel, RowExclusiveLock);
 		}
 
@@ -21129,7 +21080,14 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	 * non-concurrent mode) or just set the inhdetachpending flag.
 	 */
 	if (!concurrent)
+	{
+		/*
+		 * ProgreSQL: clean spanning index entries before pg_inherits is
+		 * updated.  get_partition_ancestors needs the row to find the root.
+		 */
+		progresql_clean_spanning_indexes_for_partition(partRel);
 		RemoveInheritance(partRel, rel, false);
+	}
 	else
 		MarkInheritDetached(partRel, rel);
 
@@ -21278,6 +21236,15 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 
 	if (concurrent)
 	{
+		/*
+		 * ProgreSQL: in concurrent detach the pg_inherits row is still
+		 * present here.  Clean spanning index entries before RemoveInheritance
+		 * removes the row, otherwise get_partition_ancestors cannot resolve
+		 * the parent root.  In non-concurrent detach, ATExecDetachPartition
+		 * cleans before calling RemoveInheritance().
+		 */
+		progresql_clean_spanning_indexes_for_partition(partRel);
+
 		/*
 		 * We can remove the pg_inherits row now. (In the non-concurrent case,
 		 * this was already done).

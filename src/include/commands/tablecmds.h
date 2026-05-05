@@ -31,6 +31,13 @@ extern TupleDesc BuildDescForRelation(const List *columns);
 
 extern void RemoveRelations(DropStmt *drop);
 
+/*
+ * ProgreSQL: clean any spanning-index entries that reference partRel.
+ * Called during DROP, DETACH, and TRUNCATE of a partition so the root
+ * spanning index does not retain stale references.
+ */
+extern void progresql_clean_spanning_indexes_for_partition(Relation partRel);
+
 extern Oid	AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode);
 
 extern void AlterTable(AlterTableStmt *stmt, LOCKMODE lockmode,

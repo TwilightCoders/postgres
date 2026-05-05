@@ -44,7 +44,6 @@ CREATE TABLE pgddl_data (
     PRIMARY KEY (id)
 ) INHERITS (pgddl_base)
   PARTITION BY RANGE (ts);
-WARNING:  resource was not closed: relation "pgddl_data"
 -- ^ BUG D: emits spurious resource-leak WARNING
 CREATE TABLE pgddl_2023 PARTITION OF pgddl_data
     FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
@@ -87,32 +86,40 @@ SELECT id, kind FROM pgddl_data ORDER BY id;
 -- their heap TIDs are (0,1) — same as pgddl_2023's entry.  Both duplicates succeed.
 BEGIN;
 INSERT INTO pgddl_data VALUES (2, 'dup-tid-collision', '2025-10-01 00:00:00+00');  -- should fail: BUG A
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(2) already exists.
 ROLLBACK;
 BEGIN;
 INSERT INTO pgddl_data VALUES (3, 'dup-tid-collision', '2025-11-01 00:00:00+00');  -- should fail: BUG A
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(3) already exists.
 ROLLBACK;
 -- Section 2: DETACH partition (non-concurrent)
 -- BUG A still present: cleanup for pgddl_2024 may collide with pgddl_2025 TIDs.
 -- Re-insert so there is something to clean during detach.
 INSERT INTO pgddl_data VALUES (2, 'b2', '2024-09-01 00:00:00+00');  -- pgddl_2024, TID (0,2)
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(2) already exists.
 INSERT INTO pgddl_data VALUES (3, 'c2', '2025-09-01 00:00:00+00');  -- pgddl_2025, TID (0,2)
+ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
+DETAIL:  Key (id)=(3) already exists.
 SELECT count(*) FROM pgddl_data;  -- 5 rows
  count 
 -------
-     5
+     3
 (1 row)
 
 ALTER TABLE pgddl_data DETACH PARTITION pgddl_2024;
 SELECT count(*) FROM pgddl_data;   -- pgddl_2024 rows removed from parent view
  count 
 -------
-     2
+     1
 (1 row)
 
 SELECT count(*) FROM pgddl_2024;   -- rows still exist in detached table
  count 
 -------
-     3
+     2
 (1 row)
 
 -- id=1 and id=2 (were in pgddl_2024) should be re-insertable in parent.
@@ -125,8 +132,7 @@ SELECT id, kind FROM pgddl_data ORDER BY id;
   1 | a3
   2 | b3
   3 | c
-  3 | c2
-(4 rows)
+(3 rows)
 
 DROP TABLE pgddl_2024;
 -- Section 3: COPY populates spanning index correctly
@@ -135,7 +141,7 @@ COPY pgddl_data (id, kind, ts) FROM STDIN;
 SELECT count(*) FROM pgddl_data;
  count 
 -------
-     6
+     5
 (1 row)
 
 -- COPYed rows are in the spanning index; same-partition duplicate is rejected.
@@ -146,7 +152,6 @@ ROLLBACK;
 -- After REINDEX, the index is rebuilt against the empty partitioned root,
 -- producing an empty B-tree.  All uniqueness enforcement is lost.
 REINDEX INDEX pgddl_data_pkey;
-WARNING:  resource was not closed: relation "pgddl_data"
 -- ^ BUG D: also emits resource-leak WARNING
 -- Both of these should fail but succeed: BUG B
 BEGIN;

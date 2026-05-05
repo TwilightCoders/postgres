@@ -1890,6 +1890,16 @@ heap_drop_with_catalog(Oid relid)
 		update_default_partition_oid(parentOid, InvalidOid);
 
 	/*
+	 * ProgreSQL: remove any spanning index entries that reference this
+	 * partition before its storage is freed.  Must happen while pg_inherits
+	 * still has the parent-child row so get_partition_ancestors can find the
+	 * parent.  Spanning indexes only exist on partitioned roots that combine
+	 * INHERITS + PARTITION BY, so the cleanup is a no-op for ordinary tables.
+	 */
+	if (rel->rd_rel->relispartition)
+		progresql_clean_spanning_indexes_for_partition(rel);
+
+	/*
 	 * Schedule unlinking of the relation's physical files at commit.
 	 */
 	if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
