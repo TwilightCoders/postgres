@@ -3036,8 +3036,20 @@ index_build(Relation heapRelation,
 	 *
 	 * Note that planner considers parallel safety for us.
 	 */
+	/*
+	 * For ProgreSQL spanning indexes the heap is the partitioned root with
+	 * no storage to scan, so parallel-worker estimation is unnecessary and
+	 * also unsafe: plan_create_index_workers builds a planner RelOptInfo
+	 * via build_simple_rel/get_relation_info, which calls
+	 * set_relation_partition_info → PartitionDirectoryLookup.  That keeps
+	 * a refcount on the heap relation in a partition directory whose owner
+	 * (the planner state) is not unwound by index_build's caller, so the
+	 * relation reference leaks at the end of the command and triggers
+	 * "resource was not closed" warnings.
+	 */
 	if (parallel && IsNormalProcessingMode() &&
-		indexRelation->rd_indam->amcanbuildparallel)
+		indexRelation->rd_indam->amcanbuildparallel &&
+		heapRelation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 		indexInfo->ii_ParallelWorkers =
 			plan_create_index_workers(RelationGetRelid(heapRelation),
 									  RelationGetRelid(indexRelation));

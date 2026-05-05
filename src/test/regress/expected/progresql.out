@@ -21,7 +21,6 @@ CREATE TABLE progresql_data (
     CHECK (ts IS NOT NULL)
 ) INHERITS (progresql_base)
   PARTITION BY RANGE (ts);
-WARNING:  resource was not closed: relation "progresql_data"
 -- Section 2: Spanning index catalog state
 -- indnuniqatts=1 (just id), indnkeyatts=2 (id + tableoid disambiguation col)
 SELECT indnuniqatts, indnkeyatts, indnatts
@@ -100,7 +99,6 @@ WHERE indrelid = 'progresql_normal'::regclass AND indisprimary;
 DROP TABLE progresql_normal;
 -- Section 10: UNIQUE (not just PK) also gets a spanning index
 ALTER TABLE progresql_data ADD CONSTRAINT progresql_data_kind_uniq UNIQUE (kind);
-WARNING:  resource was not closed: relation "progresql_data"
 SELECT indnuniqatts, indnkeyatts
 FROM pg_index
 WHERE indrelid = 'progresql_data'::regclass
