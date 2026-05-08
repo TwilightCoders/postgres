@@ -165,6 +165,8 @@ CreateExecutorState(void)
 	estate->es_jit_flags = 0;
 	estate->es_jit = NULL;
 
+	estate->es_progresql_partition_cache = NULL;
+
 	/*
 	 * Return the executor state structure
 	 */
@@ -220,6 +222,13 @@ FreeExecutorState(EState *estate)
 	{
 		DestroyPartitionDirectory(estate->es_partition_directory);
 		estate->es_partition_directory = NULL;
+	}
+
+	/* release ProgreSQL spanning-index per-partition cache, if allocated */
+	if (estate->es_progresql_partition_cache)
+	{
+		ProgresqlReleasePartitionCache(estate);
+		estate->es_progresql_partition_cache = NULL;
 	}
 
 	/*

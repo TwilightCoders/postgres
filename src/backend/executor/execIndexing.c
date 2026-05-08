@@ -1126,25 +1126,74 @@ index_unchanged_by_update(ResultRelInfo *resultRelInfo, EState *estate,
  * Returns true when Var that appears within allUpdatedCols located.
  */
 /*
- * ExecInsertSpanningIndexTuples
+ * ProgreSQL spanning-index per-statement cache.
  *
- * After inserting a tuple into a leaf partition, update any ProgreSQL
- * spanning indexes that exist on the root relation.
+ * For every leaf partition that this statement inserts/updates rows in, we
+ * cache: the open ancestor partitioned relations (AccessShareLock), the open
+ * spanning indexes on those ancestors (RowExclusiveLock), and a precomputed
+ * IndexInfo per spanning index.  The cache is built lazily on the first
+ * tuple landing in a given partition and torn down by FreeExecutorState.
  *
- * slot        - the just-inserted tuple slot (in the partition)
- * tupleid     - the physical TID of the new tuple in the partition
- * partition   - the leaf partition relation
- * estate      - executor estate
+ * Without this cache, every inserted tuple paid for: a pg_inherits scan
+ * (get_partition_ancestors), a relcache lookup + lock acquire on each
+ * ancestor, RelationGetIndexList, and an index_open + BuildIndexInfo +
+ * index_close for *every* index on every ancestor (not just spanning ones).
+ * For a deeply partitioned table with several non-spanning indexes per root,
+ * that is 100s of relcache/lock-manager hits per row.
  */
-void
-ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
-							   ItemPointer tupleid,
-							   Relation partition,
-							   EState *estate)
+typedef struct ProgresqlSpanningEntry
 {
-	List	   *ancestors = get_partition_ancestors(RelationGetRelid(partition));
-	ListCell   *lc;
+	Relation	parentRel;		/* root the spanning index lives on
+								 * (AccessShareLock held) */
+	Relation	indexRel;		/* the spanning index (RowExclusiveLock) */
+	IndexInfo  *indexInfo;
+	int			tableoidKeyPos; /* 0-based position of the tableoid column
+								 * in indexInfo->ii_IndexAttrNumbers */
+} ProgresqlSpanningEntry;
 
+typedef struct ProgresqlPartitionCacheEntry
+{
+	Oid			partOid;		/* hash key */
+	int			nEntries;
+	ProgresqlSpanningEntry *entries;
+} ProgresqlPartitionCacheEntry;
+
+static ProgresqlPartitionCacheEntry *
+progresql_build_partition_cache_entry(EState *estate, Relation partition)
+{
+	ProgresqlPartitionCacheEntry *pe;
+	List	   *ancestors;
+	ListCell   *lc;
+	MemoryContext oldcxt;
+	List	   *entries = NIL;
+	bool		found;
+
+	if (estate->es_progresql_partition_cache == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(ProgresqlPartitionCacheEntry);
+		ctl.hcxt = estate->es_query_cxt;
+		estate->es_progresql_partition_cache =
+			hash_create("ProgreSQL partition spanning-index cache",
+						32, &ctl,
+						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	pe = (ProgresqlPartitionCacheEntry *)
+		hash_search(estate->es_progresql_partition_cache,
+					&RelationGetRelid(partition),
+					HASH_ENTER, &found);
+	if (found)
+		return pe;
+
+	pe->nEntries = 0;
+	pe->entries = NULL;
+
+	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+
+	ancestors = get_partition_ancestors(RelationGetRelid(partition));
 	foreach(lc, ancestors)
 	{
 		Oid			parentOid = lfirst_oid(lc);
@@ -1159,53 +1208,184 @@ ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 		{
 			Oid			indexOid = lfirst_oid(il);
 			Relation	indexRel;
-			IndexInfo  *indexInfo;
-			Datum		values[INDEX_MAX_KEYS];
-			bool		isnull[INDEX_MAX_KEYS];
-			int			i;
+			ProgresqlSpanningEntry *se;
 
 			indexRel = index_open(indexOid, RowExclusiveLock);
-
-			/* Only spanning indexes (indnuniqatts > 0) need this treatment. */
 			if (indexRel->rd_index->indnuniqatts == 0)
 			{
 				index_close(indexRel, RowExclusiveLock);
 				continue;
 			}
 
-			indexInfo = BuildIndexInfo(indexRel);
-
+			se = (ProgresqlSpanningEntry *)
+				palloc(sizeof(ProgresqlSpanningEntry));
+			se->indexRel = indexRel;
+			se->indexInfo = BuildIndexInfo(indexRel);
+			se->tableoidKeyPos = se->indexInfo->ii_NumIndexKeyAttrs - 1;
 			/*
-			 * FormIndexDatum evaluates each index key column against the slot.
-			 * For the tableoid column (attnum = TableOidAttributeNumber), it
-			 * calls slot_getsysattr which returns the relation OID from the slot.
-			 * That would be the root OID in some contexts.  Override the last key
-			 * column with the partition's OID explicitly to be safe.
+			 * Take an independent table_open for each entry so cleanup can
+			 * pair each open with a close.  Lock-manager fast path makes
+			 * repeat opens of the same OID effectively free.
 			 */
-			FormIndexDatum(indexInfo, slot, estate, values, isnull);
-
-			/* Last key column must be this partition's OID. */
-			i = indexInfo->ii_NumIndexKeyAttrs - 1;
-			values[i] = ObjectIdGetDatum(RelationGetRelid(partition));
-			isnull[i] = false;
-
-			index_insert(indexRel,
-						 values,
-						 isnull,
-						 tupleid,
-						 parentRel,
-						 UNIQUE_CHECK_YES,
-						 false,
-						 indexInfo);
-
-			index_close(indexRel, RowExclusiveLock);
+			se->parentRel = table_open(parentOid, AccessShareLock);
+			entries = lappend(entries, se);
 		}
 
 		list_free(indexoidlist);
 		table_close(parentRel, AccessShareLock);
 	}
-
 	list_free(ancestors);
+
+	pe->nEntries = list_length(entries);
+	if (pe->nEntries > 0)
+	{
+		int			i = 0;
+		ListCell   *lc2;
+
+		pe->entries = (ProgresqlSpanningEntry *)
+			palloc(sizeof(ProgresqlSpanningEntry) * pe->nEntries);
+		foreach(lc2, entries)
+		{
+			ProgresqlSpanningEntry *src = (ProgresqlSpanningEntry *) lfirst(lc2);
+
+			pe->entries[i++] = *src;
+			pfree(src);
+		}
+		list_free(entries);
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	return pe;
+}
+
+void
+ProgresqlReleasePartitionCache(EState *estate)
+{
+	HASH_SEQ_STATUS scan;
+	ProgresqlPartitionCacheEntry *pe;
+
+	if (estate->es_progresql_partition_cache == NULL)
+		return;
+
+	hash_seq_init(&scan, estate->es_progresql_partition_cache);
+	while ((pe = hash_seq_search(&scan)) != NULL)
+	{
+		for (int i = 0; i < pe->nEntries; i++)
+		{
+			ProgresqlSpanningEntry *se = &pe->entries[i];
+
+			if (se->indexRel)
+				index_close(se->indexRel, RowExclusiveLock);
+			if (se->parentRel)
+				table_close(se->parentRel, AccessShareLock);
+		}
+	}
+
+	hash_destroy(estate->es_progresql_partition_cache);
+}
+
+/*
+ * spanning_unique_unchanged
+ *
+ * Returns true if none of the spanning index's "unique" key columns (i.e.
+ * all key columns except the trailing tableoid disambiguator) overlap with
+ * the set of columns updated by the current statement.  Used to skip
+ * spanning index work for in-partition UPDATEs that don't touch the
+ * unique key, where the existing index entry continues to be valid via
+ * the heap HOT chain.
+ */
+static bool
+spanning_unique_unchanged(IndexInfo *indexInfo, ResultRelInfo *resultRelInfo,
+						  EState *estate)
+{
+	Bitmapset  *updatedCols;
+	Bitmapset  *extraUpdatedCols;
+	int			ncheck = indexInfo->ii_NumIndexKeyAttrs - 1;	/* skip tableoid */
+
+	if (ncheck <= 0)
+		return false;			/* defensive: nothing to compare */
+
+	updatedCols = ExecGetUpdatedCols(resultRelInfo, estate);
+	extraUpdatedCols = ExecGetExtraUpdatedCols(resultRelInfo, estate);
+
+	for (int attr = 0; attr < ncheck; attr++)
+	{
+		int			keycol = indexInfo->ii_IndexAttrNumbers[attr];
+
+		if (keycol <= 0)
+			return false;		/* expression - assume changed */
+
+		if (bms_is_member(keycol - FirstLowInvalidHeapAttributeNumber,
+						  updatedCols) ||
+			bms_is_member(keycol - FirstLowInvalidHeapAttributeNumber,
+						  extraUpdatedCols))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * ExecInsertSpanningIndexTuples
+ *
+ * After inserting (or in-place updating) a tuple in a leaf partition,
+ * update any ProgreSQL spanning indexes that exist on the partitioned
+ * root.
+ *
+ * slot           - the just-inserted/updated tuple slot (in the partition)
+ * tupleid        - the physical TID of the new tuple in the partition
+ * partition      - the leaf partition relation
+ * estate         - executor estate
+ * resultRelInfo  - if non-NULL, the leaf partition's ResultRelInfo for an
+ *                  UPDATE; spanning indexes whose unique key columns are
+ *                  unchanged by the statement will be skipped.  Pass NULL
+ *                  for INSERT (every spanning index is updated).
+ */
+void
+ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
+							   ItemPointer tupleid,
+							   Relation partition,
+							   EState *estate,
+							   ResultRelInfo *resultRelInfo)
+{
+	ProgresqlPartitionCacheEntry *pe;
+	Oid			partOid = RelationGetRelid(partition);
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+
+	pe = progresql_build_partition_cache_entry(estate, partition);
+	if (pe->nEntries == 0)
+		return;
+
+	for (int i = 0; i < pe->nEntries; i++)
+	{
+		ProgresqlSpanningEntry *se = &pe->entries[i];
+
+		/*
+		 * For in-partition UPDATEs whose unique key columns didn't change,
+		 * the existing spanning index entry continues to point to the
+		 * (possibly updated) heap chain via t_ctid.  Inserting a new entry
+		 * with the same key would self-conflict.
+		 */
+		if (resultRelInfo != NULL &&
+			spanning_unique_unchanged(se->indexInfo, resultRelInfo, estate))
+			continue;
+
+		FormIndexDatum(se->indexInfo, slot, estate, values, isnull);
+
+		/* Override the tableoid column with this partition's OID. */
+		values[se->tableoidKeyPos] = ObjectIdGetDatum(partOid);
+		isnull[se->tableoidKeyPos] = false;
+
+		index_insert(se->indexRel,
+					 values,
+					 isnull,
+					 tupleid,
+					 se->parentRel,
+					 UNIQUE_CHECK_YES,
+					 false,
+					 se->indexInfo);
+	}
 }
 
 static bool

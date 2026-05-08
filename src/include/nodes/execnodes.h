@@ -771,6 +771,16 @@ typedef struct EState
 	 */
 	List	   *es_insert_pending_result_relations;
 	List	   *es_insert_pending_modifytables;
+
+	/*
+	 * ProgreSQL spanning-index per-partition cache: hash from leaf partition
+	 * Oid to a precomputed list of spanning indexes and their parents that
+	 * must be updated for inserts into that partition.  Avoids per-row
+	 * get_partition_ancestors / table_open / index_open / BuildIndexInfo
+	 * during INSERT/UPDATE propagation.  Built lazily on first hit, released
+	 * by FreeExecutorState.
+	 */
+	HTAB	   *es_progresql_partition_cache;
 } EState;
 
 

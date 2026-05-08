@@ -1249,7 +1249,8 @@ ExecInsert(ModifyTableContext *context,
 		 */
 		if (resultRelationDesc->rd_rel->relispartition)
 			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid,
-										  resultRelationDesc, estate);
+										  resultRelationDesc, estate,
+										  NULL);
 	}
 
 	if (canSetTag)
@@ -2371,13 +2372,28 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	 */
 	if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
 	{
+		/*
+		 * Choose the TID that uniqueness checks should follow.  For HOT-style
+		 * in-place updates, heap_update keeps the chain root at the OLD TID
+		 * and a HEAP_ONLY_TUPLE at the new TID is unreachable from a fresh
+		 * heap_hot_search_buffer; storing the new TID would make the entry
+		 * appear dead.  For non-HOT updates, the new TID is the live root.
+		 *
+		 * We delegate the "did the spanning unique key actually change?"
+		 * decision to ExecInsertSpanningIndexTuples (via resultRelInfo),
+		 * because the partition's local index situation does not always
+		 * tell us: a ProgreSQL leaf partition typically has NO local
+		 * indexes, so heap_update always reports updateIndexes=TU_None
+		 * regardless of whether the spanning key columns changed.
+		 */
 		ItemPointer span_tid = (updateCxt->updateIndexes != TU_All)
-			? tupleid			/* HOT: old TID is the chain root */
-			: &slot->tts_tid;	/* non-HOT: new TID is correct */
+			? tupleid
+			: &slot->tts_tid;
 
 		ExecInsertSpanningIndexTuples(slot, span_tid,
 									  resultRelInfo->ri_RelationDesc,
-									  context->estate);
+									  context->estate,
+									  resultRelInfo);
 	}
 
 	/*

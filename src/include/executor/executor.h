@@ -745,7 +745,9 @@ extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 										   ItemPointer tupleid,
 										   Relation partition,
-										   EState *estate);
+										   EState *estate,
+										   ResultRelInfo *resultRelInfo);
+extern void ProgresqlReleasePartitionCache(EState *estate);
 extern bool ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo,
 									  TupleTableSlot *slot,
 									  EState *estate, ItemPointer conflictTid,
