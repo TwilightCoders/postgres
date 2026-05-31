@@ -97,7 +97,7 @@ make -C src/test/regress check    # 233/233, includes `progresql` + `progresql_d
 - A new `pg_index` column, **`indnuniqatts`**, marks a spanning index: a value
   `> 0` says "this index stores N+1 key columns, but uniqueness is enforced on
   only the first `indnuniqatts`." The trailing column is the row's
-  **`tableoid`** (system attno `-7`).
+  **`tableoid`** (system attno `-6`).
 - So two rows that share a user key but live in *different* partitions are
   **distinct entries** in the B-tree (different `tableoid`), yet a uniqueness
   check that compares only the leading `indnuniqatts` columns still catches the
