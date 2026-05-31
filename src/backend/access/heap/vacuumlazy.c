@@ -2486,7 +2486,7 @@ progresql_vacuum_spanning_indexes(LVRelState *vacrel)
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
 			/* Only spanning indexes. */
-			if (idxRel->rd_index->indnuniqatts == 0)
+			if (!RelationIsSpanning(idxRel))
 			{
 				index_close(idxRel, RowExclusiveLock);
 				continue;

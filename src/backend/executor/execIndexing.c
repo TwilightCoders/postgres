@@ -1211,7 +1211,7 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 			ProgresqlSpanningEntry *se;
 
 			indexRel = index_open(indexOid, RowExclusiveLock);
-			if (indexRel->rd_index->indnuniqatts == 0)
+			if (!RelationIsSpanning(indexRel))
 			{
 				index_close(indexRel, RowExclusiveLock);
 				continue;

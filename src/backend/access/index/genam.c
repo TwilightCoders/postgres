@@ -246,7 +246,7 @@ BuildIndexValueDescription(Relation indexRelation,
 	 * column names suffices.  For ordinary indexes we fall back to
 	 * pg_get_indexdef_columns to preserve full expression rendering.
 	 */
-	if (idxrec->indnuniqatts > 0)
+	if (IndexFormIsSpanning(idxrec))
 	{
 		appendStringInfoChar(&buf, '(');
 		for (i = 0; i < indnkeyatts; i++)

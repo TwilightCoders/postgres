@@ -3848,7 +3848,7 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 	 * spanning index by indnuniqatts > 0.  Must run after
 	 * ResetReindexProcessing so the index is openable again.
 	 */
-	if (iRel->rd_index->indnuniqatts > 0 &&
+	if (RelationIsSpanning(iRel) &&
 		heapRelation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		BuildSpanningIndexFromPartitions(heapRelation, indexId);
 

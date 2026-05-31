@@ -98,4 +98,17 @@ DECLARE_ARRAY_FOREIGN_KEY_OPT((indrelid, indkey), pg_attribute, (attrelid, attnu
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 
+/*
+ * IndexFormIsSpanning
+ *		True if a pg_index Form describes a ProgreSQL spanning index --- a
+ *		btree on a partitioned root that enforces cross-partition uniqueness.
+ *		The persistent marker is indnuniqatts > 0 (the trailing key column is
+ *		the partition discriminator, excluded from the unique key).  This is
+ *		the single source of truth for "is this index spanning"; prefer it
+ *		(or RelationIsSpanning, its Relation-level wrapper in rel.h) over open-
+ *		coding the indnuniqatts test.
+ */
+#define IndexFormIsSpanning(pgindex) \
+	((pgindex)->indnuniqatts > 0)
+
 #endif							/* PG_INDEX_H */

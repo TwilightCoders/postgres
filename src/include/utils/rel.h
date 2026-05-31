@@ -547,6 +547,19 @@ typedef struct ViewOptions
 	 IndexRelationGetNumberOfKeyAttributes(indexrelation))
 
 /*
+ * RelationIsSpanning
+ *		True if the relation is a ProgreSQL spanning index (a btree on a
+ *		partitioned root enforcing cross-partition uniqueness).  Total over
+ *		any relation: a non-index relation has rd_index == NULL and is not
+ *		spanning.  This is the Relation-level wrapper around the persistent
+ *		marker IndexFormIsSpanning (pg_index.h); prefer it over open-coding
+ *		the indnuniqatts test at index-relation sites.
+ */
+#define RelationIsSpanning(relation) \
+	((relation)->rd_index != NULL && \
+	 IndexFormIsSpanning((relation)->rd_index))
+
+/*
  * RelationGetDescr
  *		Returns tuple descriptor for a relation.
  */

@@ -291,7 +291,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * and the appended tableoid column makes the key shape useless
 			 * for query optimization, so they are invisible to plan time.
 			 */
-			if (index->indnuniqatts > 0)
+			if (IndexFormIsSpanning(index))
 			{
 				index_close(indexRelation, NoLock);
 				continue;

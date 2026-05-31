@@ -1284,7 +1284,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			 * partitions.  Cloning would fail the system-column check
 			 * because the spanning key includes tableoid (a system column).
 			 */
-			if (idxRel->rd_index->indnuniqatts > 0)
+			if (RelationIsSpanning(idxRel))
 			{
 				index_close(idxRel, AccessShareLock);
 				continue;
@@ -2035,7 +2035,7 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
 			/* Only spanning indexes. */
-			if (idxRel->rd_index->indnuniqatts == 0)
+			if (!RelationIsSpanning(idxRel))
 			{
 				index_close(idxRel, RowExclusiveLock);
 				continue;
@@ -2151,7 +2151,7 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
-			if (idxRel->rd_index->indnuniqatts == 0)
+			if (!RelationIsSpanning(idxRel))
 			{
 				index_close(idxRel, RowExclusiveLock);
 				continue;
