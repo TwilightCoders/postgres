@@ -26,6 +26,7 @@ CATALOG_HEADERS := \
 	pg_constraint.h \
 	pg_inherits.h \
 	pg_index.h \
+	pg_index_partition.h \
 	pg_operator.h \
 	pg_opfamily.h \
 	pg_opclass.h \
