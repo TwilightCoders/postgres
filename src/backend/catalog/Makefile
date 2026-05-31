@@ -34,6 +34,7 @@ OBJS = \
 	pg_db_role_setting.o \
 	pg_depend.o \
 	pg_enum.o \
+	pg_index_partition.o \
 	pg_inherits.o \
 	pg_largeobject.o \
 	pg_namespace.o \

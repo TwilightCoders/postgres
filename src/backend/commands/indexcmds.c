@@ -32,6 +32,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_index_partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
@@ -2932,6 +2933,15 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 			table_close(partRel, AccessShareLock);
 			continue;
 		}
+
+		/*
+		 * ProgreSQL C1: record this partition's index-local partseq in
+		 * pg_index_partition (get-or-allocate; stable across rebuilds).  The
+		 * index entries still store the partition tableoid as the trailing key
+		 * for now (dual-tracked); increment D switches the stored discriminator
+		 * to this partseq.
+		 */
+		(void) SpanningGetOrAllocPartseq(idxRel, partOid);
 
 		slot = table_slot_create(partRel, NULL);
 		scan = table_beginscan(partRel, GetActiveSnapshot(), 0, NULL);

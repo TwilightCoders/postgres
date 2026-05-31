@@ -113,6 +113,7 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/partition.h"
+#include "catalog/pg_index_partition.h"
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
@@ -1149,6 +1150,10 @@ typedef struct ProgresqlSpanningEntry
 	IndexInfo  *indexInfo;
 	int			tableoidKeyPos; /* 0-based position of the tableoid column
 								 * in indexInfo->ii_IndexAttrNumbers */
+	int32		partseq;		/* this partition's index-local partseq from
+								 * pg_index_partition; -1 if unmapped.  C1
+								 * populates it here; increment D stores it as
+								 * the trailing key instead of the tableoid. */
 } ProgresqlSpanningEntry;
 
 typedef struct ProgresqlPartitionCacheEntry
@@ -1222,6 +1227,14 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 			se->indexRel = indexRel;
 			se->indexInfo = BuildIndexInfo(indexRel);
 			se->tableoidKeyPos = se->indexInfo->ii_NumIndexKeyAttrs - 1;
+			/*
+			 * C1: stamp the entry with this partition's index-local partseq.
+			 * Populated but not yet consumed --- the write path below still
+			 * stores the partition tableoid.  Increment D switches the stored
+			 * discriminator to this partseq.
+			 */
+			se->partseq = SpanningLookupPartseqByRelid(indexRel,
+													  RelationGetRelid(partition));
 			/*
 			 * Take an independent table_open for each entry so cleanup can
 			 * pair each open with a close.  Lock-manager fast path makes

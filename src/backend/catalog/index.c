@@ -44,6 +44,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_description.h"
+#include "catalog/pg_index_partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
@@ -2391,6 +2392,14 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	 * fix RELATION relation
 	 */
 	DeleteRelationTuple(indexId);
+
+	/*
+	 * ProgreSQL: drop this index's partseq map rows so they do not dangle.
+	 * A recycled pg_class OID could otherwise alias a stale indpartidxid ---
+	 * the very failure mode partseq exists to avoid.  No-op for ordinary
+	 * indexes, which have no pg_index_partition rows.
+	 */
+	RemoveSpanningPartitionMapForIndex(indexId);
 
 	/*
 	 * fix INHERITS relation

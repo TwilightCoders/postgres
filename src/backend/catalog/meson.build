@@ -21,6 +21,7 @@ backend_sources += files(
   'pg_db_role_setting.c',
   'pg_depend.c',
   'pg_enum.c',
+  'pg_index_partition.c',
   'pg_inherits.c',
   'pg_largeobject.c',
   'pg_namespace.c',

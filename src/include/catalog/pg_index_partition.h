@@ -59,4 +59,10 @@ DECLARE_UNIQUE_INDEX(pg_index_partition_idxid_relid_index, 562, IndexPartitionId
 MAKE_SYSCACHE(INDEXPARTITIONSEQ, pg_index_partition_idxid_seq_index, 16);
 MAKE_SYSCACHE(INDEXPARTITIONREL, pg_index_partition_idxid_relid_index, 16);
 
+extern int32 SpanningGetOrAllocPartseq(Relation spanningIndex, Oid partitionOid);
+extern int32 SpanningLookupPartseqByRelid(Relation spanningIndex, Oid partitionOid);
+extern Oid	SpanningResolvePartseqRelid(Relation spanningIndex, int32 partseq);
+extern void RemoveSpanningPartitionMapForIndex(Oid spanningIndexOid);
+extern void RemoveSpanningPartitionMapForPartition(Oid partitionOid);
+
 #endif							/* PG_INDEX_PARTITION_H */

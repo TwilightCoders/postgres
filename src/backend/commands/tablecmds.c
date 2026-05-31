@@ -41,6 +41,7 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/pg_index_partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
@@ -1283,9 +1284,15 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			 * directly on the partitioned root and are NOT propagated to
 			 * partitions.  Cloning would fail the system-column check
 			 * because the spanning key includes tableoid (a system column).
+			 *
+			 * C1: still record this new partition's index-local partseq in
+			 * pg_index_partition (get-or-allocate).  CREATE TABLE ... PARTITION
+			 * OF reaches here (not the ATTACH backfill path), so this is where
+			 * a freshly-created partition joins the spanning index's domain.
 			 */
 			if (RelationIsSpanning(idxRel))
 			{
+				(void) SpanningGetOrAllocPartseq(idxRel, RelationGetRelid(rel));
 				index_close(idxRel, AccessShareLock);
 				continue;
 			}
@@ -2013,6 +2020,13 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 	if (!partRel->rd_rel->relispartition)
 		return;
 
+	/*
+	 * C1: drop this partition's partseq map rows so indpartrelid does not
+	 * dangle (and cannot alias a future relation that reuses the OID) once the
+	 * partition is gone.
+	 */
+	RemoveSpanningPartitionMapForPartition(partOid);
+
 	ancestors = get_partition_ancestors(partOid);
 
 	foreach(lc, ancestors)
@@ -2158,6 +2172,14 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			}
 
 			idxInfo = BuildIndexInfo(idxRel);
+
+			/*
+			 * ProgreSQL C1: record the attaching partition's index-local
+			 * partseq in pg_index_partition (get-or-allocate).  Backfilled
+			 * entries still store the partition tableoid as the trailing key
+			 * for now (dual-tracked); increment D switches to this partseq.
+			 */
+			(void) SpanningGetOrAllocPartseq(idxRel, attachOid);
 
 			snapshot = GetTransactionSnapshot();
 			PushActiveSnapshot(snapshot);
