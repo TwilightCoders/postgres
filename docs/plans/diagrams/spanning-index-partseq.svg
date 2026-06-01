@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 760" font-family="-apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="ah2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#5f6368"/>
+    </marker>
+    <marker id="ahG" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#137333"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="760" fill="#ffffff"/>
+  <text x="40" y="44" font-size="23" font-weight="700" fill="#202124">The fix — key on <tspan fill="#137333">partseq</tspan>, an index-local id that's never reused</text>
+  <text x="40" y="70" font-size="14" fill="#5f6368">Same B-tree shape. The trailing discriminator becomes a small per-index integer; a catalog maps it back to the partition.</text>
+
+  <!-- ===== Index block ===== -->
+  <rect x="40" y="92" width="540" height="208" rx="10" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.5"/>
+  <text x="58" y="118" font-size="15" font-weight="700" fill="#1a56c4">Spanning B-tree · events_pkey</text>
+  <text x="58" y="138" font-size="12" fill="#5f6368">each entry:  [ user key ] [ discriminator ] → heap pointer</text>
+
+  <rect x="58" y="152" width="84" height="34" rx="5" fill="#ffffff" stroke="#4285f4"/>
+  <text x="100" y="174" font-size="13" fill="#202124" text-anchor="middle">id = 1</text>
+  <rect x="150" y="152" width="168" height="34" rx="5" fill="#e6f4ea" stroke="#34a853"/>
+  <text x="234" y="174" font-size="13" fill="#137333" text-anchor="middle">partseq = 1</text>
+  <text x="332" y="174" font-size="13" fill="#202124">→ TID (0,1)</text>
+
+  <rect x="58" y="200" width="84" height="34" rx="5" fill="#ffffff" stroke="#4285f4"/>
+  <text x="100" y="222" font-size="13" fill="#202124" text-anchor="middle">id = 2</text>
+  <rect x="150" y="200" width="168" height="34" rx="5" fill="#e6f4ea" stroke="#34a853"/>
+  <text x="234" y="222" font-size="13" fill="#137333" text-anchor="middle">partseq = 2</text>
+  <text x="332" y="222" font-size="13" fill="#202124">→ TID (0,1)</text>
+
+  <text x="58" y="266" font-size="12" fill="#5f6368">partseq is assigned 1, 2, 3 … as partitions join <tspan font-weight="700">this index</tspan>. It is small, stable for the life of</text>
+  <text x="58" y="284" font-size="12" fill="#5f6368">the membership, and <tspan fill="#137333" font-weight="700">never handed out twice</tspan> — even after a partition is dropped.</text>
+
+  <!-- ===== Catalog map ===== -->
+  <rect x="600" y="92" width="360" height="208" rx="10" fill="#fff8e1" stroke="#f9ab00" stroke-width="1.5"/>
+  <text x="620" y="118" font-size="15" font-weight="700" fill="#b06000">catalog  pg_index_partition</text>
+  <text x="620" y="138" font-size="12" fill="#7a5200">the only place partseq → partition is resolved</text>
+
+  <!-- table header -->
+  <rect x="620" y="150" width="320" height="28" fill="#fde9b5"/>
+  <text x="636" y="169" font-size="12" font-weight="700" fill="#7a5200">index</text>
+  <text x="760" y="169" font-size="12" font-weight="700" fill="#7a5200">partseq</text>
+  <text x="850" y="169" font-size="12" font-weight="700" fill="#7a5200">partition</text>
+  <line x1="620" y1="178" x2="940" y2="178" stroke="#f9ab00"/>
+  <text x="636" y="200" font-size="12" fill="#3c4043">events_pkey</text>
+  <text x="775" y="200" font-size="12" fill="#137333" font-weight="700">1</text>
+  <text x="850" y="200" font-size="12" fill="#3c4043">events_2024</text>
+  <line x1="620" y1="212" x2="940" y2="212" stroke="#fde9b5"/>
+  <text x="636" y="232" font-size="12" fill="#3c4043">events_pkey</text>
+  <text x="775" y="232" font-size="12" fill="#137333" font-weight="700">2</text>
+  <text x="850" y="232" font-size="12" fill="#3c4043">events_2025</text>
+
+  <text x="620" y="268" font-size="12" fill="#7a5200">Rows are deleted when a partition or the</text>
+  <text x="620" y="285" font-size="12" fill="#7a5200">index is dropped — so nothing dangles.</text>
+
+  <!-- ===== Why the failure is gone ===== -->
+  <rect x="40" y="320" width="920" height="92" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.5"/>
+  <text x="60" y="348" font-size="15" font-weight="700" fill="#137333">Why OID reuse and pg_upgrade can no longer corrupt it</text>
+  <text x="60" y="372" font-size="12.5" fill="#3c4043">•  partseq is <tspan font-weight="700">not</tspan> an OID — recycling a pg_class OID can never alias an entry, because the entry doesn't name an OID.</text>
+  <text x="60" y="392" font-size="12.5" fill="#3c4043">•  partseq lives in a catalog that is dumped &amp; restored as data, so the mapping survives pg_upgrade intact (no OID-stability dependency).</text>
+
+  <!-- ===== Resolution path ===== -->
+  <text x="40" y="452" font-size="14" font-weight="700" fill="#202124">Resolving an entry at probe / vacuum time</text>
+  <text x="40" y="474" font-size="12.5" fill="#5f6368">read trailing partseq  →  look it up in the catalog  →  open that partition  →  follow the TID there</text>
+
+  <!-- heaps -->
+  <rect x="60" y="500" width="300" height="150" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.5"/>
+  <text x="78" y="526" font-size="14" font-weight="700" fill="#137333">partition  events_2024</text>
+  <text x="78" y="545" font-size="12" fill="#5f6368">partseq 1  ·  own TID space</text>
+  <rect x="78" y="558" width="264" height="34" rx="5" fill="#ffffff" stroke="#34a853"/>
+  <text x="90" y="580" font-size="12.5" fill="#202124">slot (0,1):  id = 1,  ts = 2024-06-01</text>
+
+  <rect x="620" y="500" width="300" height="150" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.5"/>
+  <text x="638" y="526" font-size="14" font-weight="700" fill="#137333">partition  events_2025</text>
+  <text x="638" y="545" font-size="12" fill="#5f6368">partseq 2  ·  own TID space</text>
+  <rect x="638" y="558" width="264" height="34" rx="5" fill="#ffffff" stroke="#34a853"/>
+  <text x="650" y="580" font-size="12.5" fill="#202124">slot (0,1):  id = 2,  ts = 2025-06-01</text>
+
+  <text x="490" y="586" font-size="12" fill="#5f6368" text-anchor="middle">(0,1) in each —</text>
+  <text x="490" y="604" font-size="12" fill="#5f6368" text-anchor="middle">now disambiguated</text>
+  <text x="490" y="622" font-size="11.5" font-style="italic" fill="#137333" text-anchor="middle">by stable partseq,</text>
+  <text x="490" y="638" font-size="11.5" font-style="italic" fill="#137333" text-anchor="middle">not a reusable OID</text>
+
+  <!-- entry -> catalog -> heap arrows -->
+  <path d="M318,169 C 460,150 540,150 600,165" fill="none" stroke="#f9ab00" stroke-width="1.6" marker-end="url(#ah2)"/>
+  <text x="430" y="142" font-size="11" fill="#b06000">partseq 1 →</text>
+  <path d="M700,240 C 560,360 320,430 210,500" fill="none" stroke="#137333" stroke-width="1.6" marker-end="url(#ahG)"/>
+  <path d="M820,240 C 840,360 790,440 770,500" fill="none" stroke="#137333" stroke-width="1.6" marker-end="url(#ahG)"/>
+  <text x="360" y="452" font-size="11" fill="#137333">→ open events_2024</text>
+  <text x="800" y="452" font-size="11" fill="#137333">→ open events_2025</text>
+
+  <!-- VACUUM fix note -->
+  <rect x="40" y="672" width="920" height="64" rx="10" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.2"/>
+  <text x="60" y="697" font-size="13" font-weight="700" fill="#1a56c4">Bonus: the VACUUM collision (P0-5) also closes</text>
+  <text x="60" y="719" font-size="12.5" fill="#3c4043">Cleanup now deletes an entry only when its <tspan font-weight="700">partseq matches the vacuumed partition</tspan> AND its TID is dead — so vacuuming events_2024's dead (0,1) can no longer reap events_2025's live (0,1).</text>
+</svg>

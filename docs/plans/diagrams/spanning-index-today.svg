@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 720" font-family="-apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#5f6368"/>
+    </marker>
+    <marker id="ahRed" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#ea4335"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="720" fill="#ffffff"/>
+  <text x="40" y="44" font-size="23" font-weight="700" fill="#202124">Spanning index today — keyed on <tspan fill="#ea4335">tableoid</tspan> (and why it breaks)</text>
+  <text x="40" y="70" font-size="14" fill="#5f6368">One real B-tree on the partitioned root holds one entry per live row across every partition, unique on the user key.</text>
+
+  <!-- ===== Index block ===== -->
+  <rect x="40" y="92" width="540" height="200" rx="10" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.5"/>
+  <text x="58" y="118" font-size="15" font-weight="700" fill="#1a56c4">Spanning B-tree · events_pkey</text>
+  <text x="58" y="138" font-size="12" fill="#5f6368">each entry:  [ user key ] [ discriminator ] → heap pointer</text>
+
+  <!-- entry 1 -->
+  <rect x="58" y="152" width="84" height="34" rx="5" fill="#ffffff" stroke="#4285f4"/>
+  <text x="100" y="174" font-size="13" fill="#202124" text-anchor="middle">id = 1</text>
+  <rect x="150" y="152" width="168" height="34" rx="5" fill="#fce8e6" stroke="#ea4335"/>
+  <text x="234" y="174" font-size="13" fill="#c5221f" text-anchor="middle">tableoid = 16403</text>
+  <text x="332" y="174" font-size="13" fill="#202124">→ TID (0,1)</text>
+
+  <!-- entry 2 -->
+  <rect x="58" y="200" width="84" height="34" rx="5" fill="#ffffff" stroke="#4285f4"/>
+  <text x="100" y="222" font-size="13" fill="#202124" text-anchor="middle">id = 2</text>
+  <rect x="150" y="200" width="168" height="34" rx="5" fill="#fce8e6" stroke="#ea4335"/>
+  <text x="234" y="222" font-size="13" fill="#c5221f" text-anchor="middle">tableoid = 16404</text>
+  <text x="332" y="222" font-size="13" fill="#202124">→ TID (0,1)</text>
+
+  <text x="58" y="262" font-size="12" fill="#5f6368">The pointer is only "block 0, slot 1" — relation-local. It cannot say <tspan font-style="italic">which</tspan> heap on its own,</text>
+  <text x="58" y="280" font-size="12" fill="#5f6368">so the trailing <tspan fill="#c5221f" font-weight="700">tableoid</tspan> column is what disambiguates: "(0,1) of the table with this OID."</text>
+
+  <!-- ===== Problem callout ===== -->
+  <rect x="600" y="92" width="360" height="320" rx="10" fill="#fef7f6" stroke="#ea4335" stroke-width="1.5"/>
+  <text x="620" y="120" font-size="16" font-weight="700" fill="#c5221f">The flaw: an OID is not a stable name</text>
+  <text x="620" y="150" font-size="13" fill="#3c4043">1.  tableoid is a database-wide, recyclable OID.</text>
+  <text x="620" y="178" font-size="13" fill="#3c4043">2.  DROP events_2025  →  OID 16404 is freed.</text>
+  <text x="620" y="206" font-size="13" fill="#3c4043">3.  Later, a brand-new table reuses OID 16404.</text>
+  <text x="620" y="234" font-size="13" fill="#3c4043">4.  The stored entry (id = 2 | 16404) now points</text>
+  <text x="638" y="252" font-size="13" fill="#3c4043">at an <tspan font-weight="700" fill="#c5221f">unrelated table</tspan> — a dangling / aliased ref.</text>
+  <text x="620" y="284" font-size="13" fill="#3c4043">5.  Cross-partition uniqueness can silently break.</text>
+  <text x="620" y="318" font-size="13" fill="#3c4043">Also: pg_upgrade does not preserve these OIDs,</text>
+  <text x="638" y="336" font-size="13" fill="#3c4043">so dump/restore corrupts the discriminator too.</text>
+  <rect x="620" y="356" width="320" height="40" rx="6" fill="#fce8e6" stroke="#ea4335" stroke-dasharray="4 3"/>
+  <text x="780" y="381" font-size="12.5" font-weight="700" fill="#c5221f" text-anchor="middle">root cause: identity baked into a reusable OID</text>
+
+  <!-- ===== Heaps ===== -->
+  <rect x="60" y="470" width="300" height="150" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.5"/>
+  <text x="78" y="496" font-size="14" font-weight="700" fill="#137333">partition  events_2024</text>
+  <text x="78" y="515" font-size="12" fill="#5f6368">pg_class OID 16403  ·  own TID space</text>
+  <rect x="78" y="528" width="264" height="34" rx="5" fill="#ffffff" stroke="#34a853"/>
+  <text x="90" y="550" font-size="12.5" fill="#202124">slot (0,1):  id = 1,  ts = 2024-06-01</text>
+
+  <rect x="620" y="470" width="300" height="150" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.5"/>
+  <text x="638" y="496" font-size="14" font-weight="700" fill="#137333">partition  events_2025</text>
+  <text x="638" y="515" font-size="12" fill="#5f6368">pg_class OID 16404  ·  own TID space</text>
+  <rect x="638" y="528" width="264" height="34" rx="5" fill="#ffffff" stroke="#34a853"/>
+  <text x="650" y="550" font-size="12.5" fill="#202124">slot (0,1):  id = 2,  ts = 2025-06-01</text>
+
+  <!-- collision caption -->
+  <text x="490" y="556" font-size="12" fill="#5f6368" text-anchor="middle">both heaps</text>
+  <text x="490" y="574" font-size="12" fill="#5f6368" text-anchor="middle">have a (0,1)</text>
+  <text x="490" y="596" font-size="11.5" font-style="italic" fill="#9aa0a6" text-anchor="middle">— TID alone is</text>
+  <text x="490" y="612" font-size="11.5" font-style="italic" fill="#9aa0a6" text-anchor="middle">ambiguous</text>
+
+  <!-- resolution arrows: entry -> heap via tableoid -->
+  <path d="M150,169 C 90,300 120,420 150,470" fill="none" stroke="#5f6368" stroke-width="1.6" marker-end="url(#ah)"/>
+  <path d="M318,217 C 470,330 600,420 700,470" fill="none" stroke="#5f6368" stroke-width="1.6" marker-end="url(#ah)"/>
+  <text x="86" y="400" font-size="11" fill="#5f6368">16403 →</text>
+  <text x="556" y="430" font-size="11" fill="#5f6368">16404 →</text>
+</svg>

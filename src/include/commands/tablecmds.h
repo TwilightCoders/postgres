@@ -35,8 +35,14 @@ extern void RemoveRelations(DropStmt *drop);
  * ProgreSQL: clean any spanning-index entries that reference partRel.
  * Called during DROP, DETACH, and TRUNCATE of a partition so the root
  * spanning index does not retain stale references.
+ *
+ * drop_map controls whether the partition's partseq map rows are also removed:
+ * true for DROP/DETACH (the partition leaves the family, so its partseq is
+ * retired), false for TRUNCATE (the partition stays attached and must keep its
+ * partseq so subsequent inserts can be discriminated).
  */
-extern void progresql_clean_spanning_indexes_for_partition(Relation partRel);
+extern void progresql_clean_spanning_indexes_for_partition(Relation partRel,
+														   bool drop_map);
 
 extern Oid	AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode);
 

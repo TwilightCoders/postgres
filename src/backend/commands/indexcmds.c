@@ -2921,6 +2921,7 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 		TableScanDesc scan;
 		Datum		values[INDEX_MAX_KEYS];
 		bool		isnull[INDEX_MAX_KEYS];
+		int32		partseq;
 
 		partRel = table_open(partOid, AccessShareLock);
 
@@ -2935,13 +2936,11 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 		}
 
 		/*
-		 * ProgreSQL C1: record this partition's index-local partseq in
-		 * pg_index_partition (get-or-allocate; stable across rebuilds).  The
-		 * index entries still store the partition tableoid as the trailing key
-		 * for now (dual-tracked); increment D switches the stored discriminator
-		 * to this partseq.
+		 * ProgreSQL C1: this partition's index-local partseq (get-or-allocate;
+		 * stable across rebuilds).  It is the trailing discriminator stored in
+		 * each spanning index entry below.
 		 */
-		(void) SpanningGetOrAllocPartseq(idxRel, partOid);
+		partseq = SpanningGetOrAllocPartseq(idxRel, partOid);
 
 		slot = table_slot_create(partRel, NULL);
 		scan = table_beginscan(partRel, GetActiveSnapshot(), 0, NULL);
@@ -2953,12 +2952,12 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 			FormIndexDatum(idxInfo, slot, NULL, values, isnull);
 
 			/*
-			 * The trailing key column is the partition's OID.  slot's
-			 * tts_tableOid is set by the heap scan to partRel's OID, but be
-			 * explicit in case any code path does not set it.
+			 * The trailing key column is this partition's index-local
+			 * partseq, the stable discriminator that resolves back to the
+			 * partition via pg_index_partition.
 			 */
 			k = idxInfo->ii_NumIndexKeyAttrs - 1;
-			values[k] = ObjectIdGetDatum(RelationGetRelid(partRel));
+			values[k] = Int32GetDatum(partseq);
 			isnull[k] = false;
 
 			/*

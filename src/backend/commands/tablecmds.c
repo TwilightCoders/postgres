@@ -2006,11 +2006,15 @@ ExecuteTruncate(TruncateStmt *stmt)
  * This is the BUG-A-safe replacement for the prior bulk_delete-based
  * cleanup, which collided across partitions whenever heap TIDs (e.g.
  * (0,1), the first row of every partition) were shared.  Filtering by
- * (key, tableoid) via the index scan key is exact: no false positives,
+ * (key, partseq) via the index scan key is exact: no false positives,
  * no false negatives.
+ *
+ * drop_map: see the prototype in tablecmds.h.  DROP/DETACH pass true (retire
+ * the partseq mapping); TRUNCATE passes false (the partition stays attached
+ * and must keep its partseq).
  */
 void
-progresql_clean_spanning_indexes_for_partition(Relation partRel)
+progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 {
 	List	   *ancestors;
 	ListCell   *lc;
@@ -2019,13 +2023,6 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 	/* Only leaf partitions that are also inheritance children need cleaning. */
 	if (!partRel->rd_rel->relispartition)
 		return;
-
-	/*
-	 * C1: drop this partition's partseq map rows so indpartrelid does not
-	 * dangle (and cannot alias a future relation that reuses the OID) once the
-	 * partition is gone.
-	 */
-	RemoveSpanningPartitionMapForPartition(partOid);
 
 	ancestors = get_partition_ancestors(partOid);
 
@@ -2045,6 +2042,7 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 			Relation		idxRel;
 			IndexScanDesc	scan;
 			ScanKeyData		skey;
+			int32			partseq;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
@@ -2055,12 +2053,25 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 				continue;
 			}
 
-			/* Scan for entries where the last key column equals partOid. */
+			/*
+			 * Resolve this partition's index-local partseq while its map row
+			 * still exists (we delete the map rows only after this loop).  If
+			 * the partition was never mapped to this index there is nothing to
+			 * clean.
+			 */
+			partseq = SpanningLookupPartseqByRelid(idxRel, partOid);
+			if (partseq < 0)
+			{
+				index_close(idxRel, RowExclusiveLock);
+				continue;
+			}
+
+			/* Scan for entries whose trailing partseq matches this partition. */
 			ScanKeyInit(&skey,
 						idxRel->rd_index->indnkeyatts,
 						BTEqualStrategyNumber,
-						F_OIDEQ,
-						ObjectIdGetDatum(partOid));
+						F_INT4EQ,
+						Int32GetDatum(partseq));
 
 			/*
 			 * Pass parentRel as heapRelation.  The partitioned root has no
@@ -2094,6 +2105,20 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel)
 	}
 
 	list_free(ancestors);
+
+	/*
+	 * C1: for DROP/DETACH, now that every spanning index's entries for this
+	 * partition have been retired, drop the partition's partseq map rows.  This
+	 * runs LAST so the per-index partseq lookups above still see the map;
+	 * deleting it earlier would leave the entry scans unable to find the
+	 * partseq.  Removing the rows keeps indpartrelid from dangling (or aliasing
+	 * a future OID reuse).
+	 *
+	 * TRUNCATE passes drop_map=false: the partition stays attached, so its
+	 * partseq must persist for subsequent inserts to be discriminated.
+	 */
+	if (drop_map)
+		RemoveSpanningPartitionMapForPartition(partOid);
 }
 
 /*
@@ -2162,6 +2187,7 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			Datum		values[INDEX_MAX_KEYS];
 			bool		isnull[INDEX_MAX_KEYS];
 			Snapshot	snapshot;
+			int32		partseq;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
@@ -2174,12 +2200,11 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			idxInfo = BuildIndexInfo(idxRel);
 
 			/*
-			 * ProgreSQL C1: record the attaching partition's index-local
-			 * partseq in pg_index_partition (get-or-allocate).  Backfilled
-			 * entries still store the partition tableoid as the trailing key
-			 * for now (dual-tracked); increment D switches to this partseq.
+			 * ProgreSQL C1: the attaching partition's index-local partseq
+			 * (get-or-allocate).  It is the trailing discriminator stored in
+			 * each backfilled spanning index entry below.
 			 */
-			(void) SpanningGetOrAllocPartseq(idxRel, attachOid);
+			partseq = SpanningGetOrAllocPartseq(idxRel, attachOid);
 
 			snapshot = GetTransactionSnapshot();
 			PushActiveSnapshot(snapshot);
@@ -2193,9 +2218,9 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 
 				FormIndexDatum(idxInfo, slot, NULL, values, isnull);
 
-				/* Trailing key column: the attaching partition's OID. */
+				/* Trailing key column: the attaching partition's partseq. */
 				k = idxInfo->ii_NumIndexKeyAttrs - 1;
-				values[k] = ObjectIdGetDatum(attachOid);
+				values[k] = Int32GetDatum(partseq);
 				isnull[k] = false;
 
 				/*
@@ -2493,9 +2518,13 @@ ExecuteTruncateGuts(List *explicit_rels,
 
 		pgstat_count_truncate(rel);
 
-		/* Clean any ProgreSQL spanning index entries that pointed into this partition. */
+		/*
+		 * Clean any ProgreSQL spanning index entries that pointed into this
+		 * partition.  TRUNCATE keeps the partition attached, so drop_map=false:
+		 * the partseq mapping must survive for future inserts.
+		 */
 		if (rel->rd_rel->relispartition)
-			progresql_clean_spanning_indexes_for_partition(rel);
+			progresql_clean_spanning_indexes_for_partition(rel, false);
 	}
 
 	/* Now go through the hash table, and truncate foreign tables */
@@ -21221,7 +21250,7 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		 * ProgreSQL: clean spanning index entries before pg_inherits is
 		 * updated.  get_partition_ancestors needs the row to find the root.
 		 */
-		progresql_clean_spanning_indexes_for_partition(partRel);
+		progresql_clean_spanning_indexes_for_partition(partRel, true);
 		RemoveInheritance(partRel, rel, false);
 	}
 	else
@@ -21379,7 +21408,7 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 		 * the parent root.  In non-concurrent detach, ATExecDetachPartition
 		 * cleans before calling RemoveInheritance().
 		 */
-		progresql_clean_spanning_indexes_for_partition(partRel);
+		progresql_clean_spanning_indexes_for_partition(partRel, true);
 
 		/*
 		 * We can remove the pg_inherits row now. (In the non-concurrent case,

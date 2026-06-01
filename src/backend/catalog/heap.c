@@ -1897,7 +1897,7 @@ heap_drop_with_catalog(Oid relid)
 	 * INHERITS + PARTITION BY, so the cleanup is a no-op for ordinary tables.
 	 */
 	if (rel->rd_rel->relispartition)
-		progresql_clean_spanning_indexes_for_partition(rel);
+		progresql_clean_spanning_indexes_for_partition(rel, true);
 
 	/*
 	 * Schedule unlinking of the relation's physical files at commit.

@@ -1148,12 +1148,11 @@ typedef struct ProgresqlSpanningEntry
 								 * (AccessShareLock held) */
 	Relation	indexRel;		/* the spanning index (RowExclusiveLock) */
 	IndexInfo  *indexInfo;
-	int			tableoidKeyPos; /* 0-based position of the tableoid column
-								 * in indexInfo->ii_IndexAttrNumbers */
+	int			discrimKeyPos;	/* 0-based position of the trailing discriminator
+								 * column in indexInfo->ii_IndexAttrNumbers */
 	int32		partseq;		/* this partition's index-local partseq from
-								 * pg_index_partition; -1 if unmapped.  C1
-								 * populates it here; increment D stores it as
-								 * the trailing key instead of the tableoid. */
+								 * pg_index_partition; -1 if unmapped.  Stored as
+								 * the trailing discriminator key on write. */
 } ProgresqlSpanningEntry;
 
 typedef struct ProgresqlPartitionCacheEntry
@@ -1226,12 +1225,10 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 				palloc(sizeof(ProgresqlSpanningEntry));
 			se->indexRel = indexRel;
 			se->indexInfo = BuildIndexInfo(indexRel);
-			se->tableoidKeyPos = se->indexInfo->ii_NumIndexKeyAttrs - 1;
+			se->discrimKeyPos = se->indexInfo->ii_NumIndexKeyAttrs - 1;
 			/*
-			 * C1: stamp the entry with this partition's index-local partseq.
-			 * Populated but not yet consumed --- the write path below still
-			 * stores the partition tableoid.  Increment D switches the stored
-			 * discriminator to this partseq.
+			 * Stamp the entry with this partition's index-local partseq; the
+			 * write path below stores it as the trailing discriminator key.
 			 */
 			se->partseq = SpanningLookupPartseqByRelid(indexRel,
 													  RelationGetRelid(partition));
@@ -1301,7 +1298,7 @@ ProgresqlReleasePartitionCache(EState *estate)
  * spanning_unique_unchanged
  *
  * Returns true if none of the spanning index's "unique" key columns (i.e.
- * all key columns except the trailing tableoid disambiguator) overlap with
+ * all key columns except the trailing partseq disambiguator) overlap with
  * the set of columns updated by the current statement.  Used to skip
  * spanning index work for in-partition UPDATEs that don't touch the
  * unique key, where the existing index entry continues to be valid via
@@ -1313,7 +1310,7 @@ spanning_unique_unchanged(IndexInfo *indexInfo, ResultRelInfo *resultRelInfo,
 {
 	Bitmapset  *updatedCols;
 	Bitmapset  *extraUpdatedCols;
-	int			ncheck = indexInfo->ii_NumIndexKeyAttrs - 1;	/* skip tableoid */
+	int			ncheck = indexInfo->ii_NumIndexKeyAttrs - 1;	/* skip partseq */
 
 	if (ncheck <= 0)
 		return false;			/* defensive: nothing to compare */
@@ -1386,9 +1383,17 @@ ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 
 		FormIndexDatum(se->indexInfo, slot, estate, values, isnull);
 
-		/* Override the tableoid column with this partition's OID. */
-		values[se->tableoidKeyPos] = ObjectIdGetDatum(partOid);
-		isnull[se->tableoidKeyPos] = false;
+		/*
+		 * Override the trailing discriminator column with this partition's
+		 * index-local partseq (resolved when the cache entry was built).  A
+		 * negative value means the partition was never mapped, which should be
+		 * impossible once the spanning index is built/backfilled.
+		 */
+		if (se->partseq < 0)
+			elog(ERROR, "spanning index \"%s\" has no partseq for partition %u",
+				 RelationGetRelationName(se->indexRel), partOid);
+		values[se->discrimKeyPos] = Int32GetDatum(se->partseq);
+		isnull[se->discrimKeyPos] = false;
 
 		index_insert(se->indexRel,
 					 values,

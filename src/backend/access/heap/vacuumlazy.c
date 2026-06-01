@@ -142,6 +142,7 @@
 #include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/partition.h"
+#include "catalog/pg_index_partition.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
@@ -157,6 +158,7 @@
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/read_stream.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_rusage.h"
 #include "utils/rel.h"
@@ -2458,6 +2460,16 @@ lazy_scan_noprune(LVRelState *vacrel,
  * After vacuuming the indexes of a leaf partition, clean any dead entries
  * from ProgreSQL spanning indexes on ancestor (root) relations.  Called
  * only when vacrel->rel->rd_rel->relispartition is true.
+ *
+ * KNOWN LIMITATION (P0-5 remainder, tracked in PRODUCTION_READINESS.md):
+ * This is reachable only via lazy_vacuum(), which requires the leaf to have at
+ * least one *local* index (nindexes > 0).  A leaf partition with zero local
+ * indexes takes the no-index heap path (HEAP_PAGE_PRUNE_MARK_UNUSED_NOW): its
+ * dead line pointers are set LP_UNUSED inline during the first heap pass and
+ * never collected into vacrel->dead_items, so this cleanup never runs and the
+ * spanning entry leaks (surfacing later as a false cross-partition uniqueness
+ * conflict on TID reuse).  Closing that case requires collecting dead heap TIDs
+ * for spanning cleanup even on the no-index path -- a separate increment.
  */
 static void
 progresql_vacuum_spanning_indexes(LVRelState *vacrel)
@@ -2480,8 +2492,9 @@ progresql_vacuum_spanning_indexes(LVRelState *vacrel)
 		{
 			Oid				indexOid = lfirst_oid(il);
 			Relation		idxRel;
-			IndexVacuumInfo	ivinfo;
-			IndexBulkDeleteResult *istat;
+			IndexScanDesc	scan;
+			ScanKeyData		skey;
+			int32			partseq;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
@@ -2492,21 +2505,52 @@ progresql_vacuum_spanning_indexes(LVRelState *vacrel)
 				continue;
 			}
 
-			ivinfo.index = idxRel;
-			ivinfo.heaprel = parentRel;
-			ivinfo.analyze_only = false;
-			ivinfo.report_progress = false;
-			ivinfo.estimated_count = true;
-			ivinfo.message_level = DEBUG2;
-			ivinfo.num_heap_tuples = vacrel->rel->rd_rel->reltuples;
-			ivinfo.strategy = vacrel->bstrategy;
+			/*
+			 * Resolve the vacuumed partition's index-local partseq.  We scan
+			 * the spanning index for entries carrying *this* partseq and retire
+			 * only those whose heap TID is in the dead set.
+			 *
+			 * Filtering by partseq is essential: heap TIDs are partition-local,
+			 * so a dead TID in this partition can equal a *live* TID in a
+			 * sibling partition.  The stock TID-only bulk-delete callback cannot
+			 * see the trailing partseq and would collaterally retire the
+			 * sibling's live entry (the historical P0-5 collision).
+			 */
+			partseq = SpanningLookupPartseqByRelid(idxRel, partOid);
+			if (partseq < 0)
+			{
+				index_close(idxRel, RowExclusiveLock);
+				continue;
+			}
 
-			istat = vac_bulkdel_one_index(&ivinfo, NULL,
-										  vacrel->dead_items,
-										  vacrel->dead_items_info);
-			if (istat)
-				pfree(istat);
+			/* Scan entries whose trailing partseq matches this partition. */
+			ScanKeyInit(&skey,
+						idxRel->rd_index->indnkeyatts,
+						BTEqualStrategyNumber,
+						F_INT4EQ,
+						Int32GetDatum(partseq));
 
+			/*
+			 * Pass parentRel as heapRelation.  The partitioned root has no table
+			 * AM (rd_tableam == NULL); index_beginscan skips
+			 * table_index_fetch_begin in that case.  We only call
+			 * index_getnext_tid (TID-only), never index_getnext (heap fetch).
+			 */
+			scan = index_beginscan(parentRel, idxRel, SnapshotAny, NULL, 1, 0);
+			index_rescan(scan, &skey, 1, NULL, 0);
+
+			while (index_getnext_tid(scan, ForwardScanDirection) != NULL)
+			{
+				/*
+				 * The entry belongs to the vacuumed partition (partseq match).
+				 * Retire it iff its heap TID is one we are reaping in this
+				 * partition.  xs_heaptid is the partition-local TID.
+				 */
+				if (TidStoreIsMember(vacrel->dead_items, &scan->xs_heaptid))
+					scan->kill_prior_tuple = true;
+			}
+
+			index_endscan(scan);
 			index_close(idxRel, RowExclusiveLock);
 		}
 
@@ -2602,6 +2646,17 @@ lazy_vacuum(LVRelState *vacrel)
 		 * calls.)
 		 */
 		vacrel->do_index_vacuuming = false;
+
+		/*
+		 * The bypass optimization reasons about *this relation's own* indexes.
+		 * A ProgreSQL leaf partition's dead entries also live in the spanning
+		 * index on the root --- a different relation --- and leaving them there
+		 * causes false cross-partition uniqueness conflicts.  So clean the
+		 * spanning entries even when we bypass the leaf's local index
+		 * vacuuming.  dead_items is still populated here.
+		 */
+		if (vacrel->rel->rd_rel->relispartition)
+			progresql_vacuum_spanning_indexes(vacrel);
 	}
 	else if (lazy_vacuum_all_indexes(vacrel))
 	{

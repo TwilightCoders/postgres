@@ -21,6 +21,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xloginsert.h"
+#include "catalog/pg_index_partition.h"
 #include "common/int.h"
 #include "common/pg_prng.h"
 #include "lib/qunique.h"
@@ -585,17 +586,28 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 
 					if (nuniqs < saved_keysz)
 					{
-						bool		oidnull;
-						Datum		oidval;
+						bool		seqnull;
+						Datum		seqval;
 
-						oidval = index_getattr(curitup, saved_keysz,
-											   RelationGetDescr(rel), &oidnull);
-						if (!oidnull)
+						seqval = index_getattr(curitup, saved_keysz,
+											   RelationGetDescr(rel), &seqnull);
+						if (!seqnull)
 						{
-							Oid		child_relid = DatumGetObjectId(oidval);
+							int32		partseq = DatumGetInt32(seqval);
+							Oid		child_relid =
+								SpanningResolvePartseqRelid(rel, partseq);
 
-							spanChildRel = table_open(child_relid, AccessShareLock);
-							checkRel = spanChildRel;
+							/*
+							 * A partseq that no longer resolves belongs to a
+							 * detached/dropped partition whose entry is not yet
+							 * vacuumed.  Leave checkRel as the storage-less root
+							 * so the probe finds nothing (not a conflict).
+							 */
+							if (OidIsValid(child_relid))
+							{
+								spanChildRel = table_open(child_relid, AccessShareLock);
+								checkRel = spanChildRel;
+							}
 						}
 					}
 
@@ -663,7 +675,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						 * entry.
 						 *
 						 * For spanning indexes, use the partition that owns the
-						 * new tuple (last key column of itup carries its tableoid).
+						 * new tuple (last key column of itup carries its partseq).
 						 */
 						{
 							Relation	selfCheckRel = heapRel;
@@ -671,18 +683,23 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 
 							if (nuniqs < saved_keysz)
 							{
-								bool		soidnull;
-								Datum		soidval;
+								bool		seqnull;
+								Datum		seqval;
 
-								soidval = index_getattr(itup, saved_keysz,
+								seqval = index_getattr(itup, saved_keysz,
 													   RelationGetDescr(rel),
-													   &soidnull);
-								if (!soidnull)
+													   &seqnull);
+								if (!seqnull)
 								{
-									Oid		self_relid = DatumGetObjectId(soidval);
+									int32	partseq = DatumGetInt32(seqval);
+									Oid		self_relid =
+										SpanningResolvePartseqRelid(rel, partseq);
 
-									selfChildRel = table_open(self_relid, AccessShareLock);
-									selfCheckRel = selfChildRel;
+									if (OidIsValid(self_relid))
+									{
+										selfChildRel = table_open(self_relid, AccessShareLock);
+										selfCheckRel = selfChildRel;
+									}
 								}
 							}
 
