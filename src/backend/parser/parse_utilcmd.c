@@ -2367,6 +2367,8 @@ transformIndexConstraint(Constraint *constraint, CreateStmtContext *cxt)
 	}
 	index->nulls_not_distinct = constraint->nulls_not_distinct;
 	index->isconstraint = true;
+	/* ProgreSQL: carry the GLOBAL (cross-partition spanning) flag through. */
+	index->isglobal = constraint->isglobal;
 	index->iswithoutoverlaps = constraint->without_overlaps;
 	index->deferrable = constraint->deferrable;
 	index->initdeferred = constraint->initdeferred;

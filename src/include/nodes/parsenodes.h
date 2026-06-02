@@ -2869,6 +2869,13 @@ typedef struct Constraint
 									 * self */
 
 	ParseLoc	location;		/* token location, or -1 if unknown */
+
+	/*
+	 * ProgreSQL: GLOBAL cross-partition spanning UNIQUE/PRIMARY KEY on a
+	 * partitioned root.  Appended at the END so adding it never shifts the
+	 * offsets of existing fields (avoids stale-object-file offset skew).
+	 */
+	bool		isglobal;
 } Constraint;
 
 /* ----------------------
@@ -3475,6 +3482,12 @@ typedef struct IndexStmt
 	bool		if_not_exists;	/* just do nothing if index already exists? */
 	bool		reset_default_tblspc;	/* reset default_tablespace prior to
 										 * executing */
+	/*
+	 * ProgreSQL: GLOBAL (cross-partition spanning) index on a partitioned root.
+	 * Appended at the END of the struct on purpose so adding it never shifts the
+	 * offsets of the existing fields (avoids stale-object-file offset skew).
+	 */
+	bool		isglobal;
 } IndexStmt;
 
 /* ----------------------

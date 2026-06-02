@@ -317,6 +317,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <str>			opt_single_name
 %type <list>		opt_qualified_name
 %type <boolean>		opt_concurrently
+%type <boolean>		opt_global
 %type <dbehavior>	opt_drop_behavior
 
 %type <node>	alter_column_default opclass_item opclass_drop alter_using
@@ -1132,6 +1133,17 @@ opt_qualified_name:
 
 opt_concurrently:
 			CONCURRENTLY					{ $$ = true; }
+			| /*EMPTY*/						{ $$ = false; }
+		;
+
+/*
+ * ProgreSQL: GLOBAL marks a cross-partition (spanning) UNIQUE/PRIMARY KEY or
+ * index on a partitioned root -- uniqueness is enforced across all partitions
+ * without requiring the partition key in the constraint.  GLOBAL is an existing
+ * unreserved keyword, so this adds no keyword cost.
+ */
+opt_global:
+			GLOBAL							{ $$ = true; }
 			| /*EMPTY*/						{ $$ = false; }
 		;
 
@@ -4228,7 +4240,7 @@ ConstraintElem:
 					$$ = (Node *) n;
 				}
 			| UNIQUE opt_unique_null_treatment '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
-				ConstraintAttributeSpec
+				ConstraintAttributeSpec opt_global
 				{
 					Constraint *n = makeNode(Constraint);
 
@@ -4241,6 +4253,7 @@ ConstraintElem:
 					n->options = $8;
 					n->indexname = NULL;
 					n->indexspace = $9;
+					n->isglobal = $11;
 					processCASbits($10, @10, "UNIQUE",
 								   &n->deferrable, &n->initdeferred, NULL,
 								   NULL, NULL, yyscanner);
@@ -4263,7 +4276,7 @@ ConstraintElem:
 					$$ = (Node *) n;
 				}
 			| PRIMARY KEY '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
-				ConstraintAttributeSpec
+				ConstraintAttributeSpec opt_global
 				{
 					Constraint *n = makeNode(Constraint);
 
@@ -4275,6 +4288,7 @@ ConstraintElem:
 					n->options = $8;
 					n->indexname = NULL;
 					n->indexspace = $9;
+					n->isglobal = $11;
 					processCASbits($10, @10, "PRIMARY KEY",
 								   &n->deferrable, &n->initdeferred, NULL,
 								   NULL, NULL, yyscanner);
@@ -8194,7 +8208,7 @@ defacl_privilege_target:
 
 IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 			ON relation_expr access_method_clause '(' index_params ')'
-			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause opt_global
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8209,6 +8223,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->options = $14;
 					n->tableSpace = $15;
 					n->whereClause = $16;
+					n->isglobal = $17;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;
@@ -8226,7 +8241,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 				}
 			| CREATE opt_unique INDEX opt_concurrently IF_P NOT EXISTS name
 			ON relation_expr access_method_clause '(' index_params ')'
-			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause opt_global
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8241,6 +8256,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->options = $17;
 					n->tableSpace = $18;
 					n->whereClause = $19;
+					n->isglobal = $20;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;

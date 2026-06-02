@@ -1,0 +1,70 @@
+-- P1-1: explicit GLOBAL syntax for cross-partition (spanning) UNIQUE/PK.
+--
+-- GLOBAL is the declarative opt-in that replaces the implicit
+-- "INHERITS + PARTITION BY + PK/UNIQUE" handshake.  It is supported three ways:
+--   1. table constraint:   PRIMARY KEY (...) GLOBAL / UNIQUE (...) GLOBAL
+--   2. standalone index:   CREATE UNIQUE INDEX ... ON root (...) GLOBAL
+--   3. ALTER TABLE ADD CONSTRAINT ... {PRIMARY KEY|UNIQUE} (...) GLOBAL
+-- None of these require a base table / INHERITS.  GLOBAL is an existing
+-- unreserved keyword, so it adds no keyword cost.
+
+-- Section 1: PRIMARY KEY (...) GLOBAL in CREATE TABLE (no INHERITS)
+CREATE TABLE pg_events (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pg_events_2024 PARTITION OF pg_events
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pg_events_2025 PARTITION OF pg_events
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+-- it is a spanning index (indnuniqatts > 0)
+SELECT indnuniqatts > 0 AS is_spanning
+  FROM pg_index WHERE indexrelid = 'pg_events_pkey'::regclass;
+INSERT INTO pg_events VALUES (1, '2024-06-01');
+-- cross-partition duplicate must be rejected
+INSERT INTO pg_events VALUES (1, '2025-06-01');  -- expect ERROR
+-- distinct key in another partition is fine
+INSERT INTO pg_events VALUES (2, '2025-06-01');
+SELECT id FROM pg_events ORDER BY id;
+
+-- Section 2: standalone CREATE UNIQUE INDEX ... GLOBAL
+CREATE TABLE pg_codes (id bigint NOT NULL, code text, ts timestamptz NOT NULL)
+    PARTITION BY RANGE (ts);
+CREATE TABLE pg_codes_2024 PARTITION OF pg_codes
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pg_codes_2025 PARTITION OF pg_codes
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE UNIQUE INDEX pg_codes_gx ON pg_codes (code) GLOBAL;
+SELECT indnuniqatts > 0 AS is_spanning
+  FROM pg_index WHERE indexrelid = 'pg_codes_gx'::regclass;
+INSERT INTO pg_codes VALUES (1, 'abc', '2024-06-01');
+INSERT INTO pg_codes VALUES (2, 'abc', '2025-06-01');  -- expect ERROR (cross-part dup)
+-- NULLs are distinct across partitions (standard UNIQUE semantics)
+INSERT INTO pg_codes VALUES (3, NULL, '2024-07-01');
+INSERT INTO pg_codes VALUES (4, NULL, '2025-07-01');
+SELECT count(*) AS null_codes FROM pg_codes WHERE code IS NULL;
+
+-- Section 3: UNIQUE (...) GLOBAL table constraint
+CREATE TABLE pg_sku (id bigint, sku text NOT NULL, ts timestamptz NOT NULL,
+    UNIQUE (sku) GLOBAL) PARTITION BY RANGE (ts);
+SELECT count(*) AS spanning_indexes
+  FROM pg_index WHERE indrelid = 'pg_sku'::regclass AND indnuniqatts > 0;
+
+-- Section 4: ALTER TABLE ADD CONSTRAINT ... PRIMARY KEY (...) GLOBAL
+CREATE TABLE pg_alt (id bigint NOT NULL, ts timestamptz NOT NULL)
+    PARTITION BY RANGE (ts);
+CREATE TABLE pg_alt_2024 PARTITION OF pg_alt
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+ALTER TABLE pg_alt ADD CONSTRAINT pg_alt_pk PRIMARY KEY (id) GLOBAL;
+SELECT indnuniqatts > 0 AS is_spanning
+  FROM pg_index WHERE indexrelid = 'pg_alt_pk'::regclass;
+
+-- Section 5: negative cases -- GLOBAL is rejected where it cannot apply
+CREATE TABLE pg_plain (id bigint NOT NULL, PRIMARY KEY (id) GLOBAL);  -- ERROR: not partitioned
+CREATE TABLE pg_plain2 (id bigint);
+CREATE UNIQUE INDEX ON pg_plain2 (id) GLOBAL;                          -- ERROR: not partitioned
+
+-- Cleanup
+DROP TABLE pg_events;
+DROP TABLE pg_codes;
+DROP TABLE pg_sku;
+DROP TABLE pg_alt;
+DROP TABLE pg_plain2;

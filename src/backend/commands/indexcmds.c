@@ -752,11 +752,43 @@ DefineIndex(Oid tableId,
 	 * (explicit INHERITS and partition membership), so we additionally
 	 * exclude sub-partitions via !relispartition.
 	 */
-	progresql_bypass = partitioned &&
-		(stmt->unique || stmt->primary) &&
-		!exclusion &&
-		!rel->rd_rel->relispartition &&
-		has_superclass(tableId);
+	/*
+	 * ProgreSQL: an index becomes a spanning (cross-partition) index either via
+	 * the explicit GLOBAL keyword (stmt->isglobal, the supported opt-in) or via
+	 * the legacy implicit handshake (a partitioned root that also INHERITS a
+	 * base table and declares PK/UNIQUE).  The implicit form is retained for
+	 * backward compatibility and is slated for removal; new DDL should use
+	 * GLOBAL.
+	 *
+	 * When GLOBAL is requested explicitly, validate the target up front so the
+	 * user gets a clear error rather than a confusing downstream failure.
+	 */
+	if (stmt->isglobal)
+	{
+		if (!partitioned)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("GLOBAL index is only supported on partitioned tables")));
+		if (rel->rd_rel->relispartition)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("GLOBAL index must be created on the partitioned root, not on a partition")));
+		if (exclusion)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("GLOBAL is not supported for exclusion constraints")));
+		if (!stmt->unique && !stmt->primary)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("GLOBAL is only supported for UNIQUE or PRIMARY KEY indexes")));
+	}
+
+	progresql_bypass = stmt->isglobal ||
+		(partitioned &&
+		 (stmt->unique || stmt->primary) &&
+		 !exclusion &&
+		 !rel->rd_rel->relispartition &&
+		 has_superclass(tableId));
 
 	/*
 	 * Don't try to CREATE INDEX on temp tables of other backends.
