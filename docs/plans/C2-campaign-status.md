@@ -97,11 +97,48 @@ Full design: `docs/plans/C2-deferred-vacuum-DHR-design.md`. 5 increments.
   treats a stale-over-dead entry as non-conflict); the drain's job is to retire
   the entry before its held slot can be reused. Remaining inc5 hardening
   (isolation specs + TAP crash test) tracked separately (task #27, deferred).
-- **inc4 IN PROGRESS** — make the drain automatic: autovacuum
-  `AVW_SpanningIndexDrain` work-item + handler; request from a leaf vacuum that
-  enqueued; `VACUUM <root>` end-of-command drain hook; launcher periodic sweep
-  (robust durability). Failsafe already skips enqueue (the failsafe lazy_vacuum
-  branch does no spanning work); M3 done in inc2.
+- **inc4 DONE** `e89632ba7b` — autovacuum autonomy: `AVW_SpanningIndexDrain`
+  work-item + `perform_work_item` handler + label; leaf vacuum nudges via
+  `AutoVacuumRequestWork` (now deduped so the per-leaf re-request can't exhaust
+  the work-item array). Verified: a deferred VACUUM's queue auto-drains within
+  ~2s with autovacuum on. (`VACUUM <root>` end-of-command hook + launcher
+  periodic sweep deferred as robustness follow-ups; the work-item nudge + leaf
+  re-request give autonomy.)
+
+## E5 / DHR — COMPLETE (all increments committed, 239/239 green)
+The user's #1 (kill the O(N²) spanning-VACUUM sweep) is DONE and proven
+(~10× at N=64, widening). DHR is behind GUC `spanning_defer_vacuum` (default
+off), restricted to **no-local-index spanning leaves** (the common
+cross-partition-PK case) — see BLK-2 below.
+
+### Adversarial review of the drain found + fixed TWO real blockers (live repros)
+- **BLK-1 (pre-existing C1 crash, not E5)** `d713843145` — duplicate-key churn
+  against ANY spanning index SIGSEGV'd: the pre-split LP_DEAD cleanup
+  (`_bt_delete_or_dedup_one_page`) ran heap-probing simple/bottom-up deletion
+  passing the AM-less partitioned ROOT as heapRel. Fix: skip that whole
+  optimization for spanning indexes (leaf just splits; VACUUM/drain retire dead
+  entries). Build-time dedup already off for unique indexes, so no posting lists
+  ever form for spanning indexes.
+- **BLK-2 (E5 corruption)** fixed in `e89632ba7b` — the drain reaped EVERY
+  LP_DEAD slot, orphaning a live LOCAL-index entry for a slot pruned on-access
+  after the leaf's index vacuum (verified: index scan 426 vs seq 0). Fix:
+  restrict DHR deferral to `nindexes==0` leaves; local-index leaves use the
+  eager path so the drain never reaps their slots.
+- MAJ-2 (ownership check on `pg_drain_spanning_index`), MAJ-1 (removed dead
+  `SpanningDrainqHasPending`), MIN-6 (reap bound assert) — all fixed. Review
+  verified SAFE: WAL index-before-heap ordering, crash re-runnability,
+  PageAddItemExtended reuse-only-LP_UNUSED, `_bt_check_unique` heap probe.
+
+### Remaining DHR follow-ups (non-blocking, deferred)
+- inc5b (task #27): isolation specs (drain∥DML, drain∥eager-VACUUM = B1 guard) +
+  TAP crash test.
+- `VACUUM <root>` end-of-command drain hook; launcher periodic sweep.
+- Extend deferral to local-index leaves (needs the reap to only retire slots
+  whose local entries are also gone — e.g. drain vacuums local indexes too, or a
+  wired per-(idxid,partseq) reap gate). Today they correctly fall back to eager.
+- MAJ-3 (peak memory = Σ dirty-partition dead TIDs; bounded like a vacuum but
+  could batch); MIN-2 (proactively clear drainq on partition DROP/DETACH);
+  MIN-4 (drain skips pending-FSM page recycle); MIN-5 (`retired` counts TIDs).
 
 ## NEXT after E5 (priority order)
 2. **E2 / P0-2 — dump + `pg_upgrade`.** The ONE real silent-data-loss path:
