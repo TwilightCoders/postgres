@@ -21,6 +21,7 @@
 #include "access/nbtree.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
+#include "access/tidstore.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "nodes/execnodes.h"
@@ -99,7 +100,8 @@ static void _bt_parallel_restore_arrays(Relation rel, BTParallelScanDesc btscan,
 										BTScanOpaque so);
 static void btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 						 IndexBulkDeleteCallback callback, void *callback_state,
-						 BTCycleId cycleid, bool spanning, int32 spanning_partseq);
+						 BTCycleId cycleid, bool spanning, int32 spanning_partseq,
+						 BTSpanningDrainKill *drainkill);
 static BlockNumber btvacuumpage(BTVacState *vstate, Buffer buf);
 static BTVacuumPosting btreevacuumposting(BTVacState *vstate,
 										  IndexTuple posting,
@@ -1082,7 +1084,7 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		cycleid = _bt_start_vacuum(rel);
 
 		btvacuumscan(info, stats, callback, callback_state, cycleid,
-					 false, 0);
+					 false, 0, NULL);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
 	_bt_end_vacuum(rel);
@@ -1125,7 +1127,47 @@ bt_spanning_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		cycleid = _bt_start_vacuum(rel);
 
 		btvacuumscan(info, stats, callback, callback_state, cycleid,
-					 true, partseq);
+					 true, partseq, NULL);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
+	_bt_end_vacuum(rel);
+
+	return stats;
+}
+
+/*
+ * bt_spanning_drain --- coalesced, multi-partseq bulk delete for the DHR drain.
+ *
+ * Like bt_spanning_bulkdelete, but retires the dead entries of MANY partitions
+ * in a single scan of the spanning index: `kill` maps each dirty partseq to the
+ * set of heap TIDs (currently LP_DEAD in that partition) to remove.  An index
+ * entry is deleted iff its partseq has a kill set AND its TID is a member of it;
+ * entries of non-dirty partitions, and live TIDs of dirty ones, are retained.
+ * Removal flows through the same WAL-logged _bt_delitems_vacuum path, so it is
+ * crash-safe.  This is the O(N^2)->O(N) win: one tree scan per drain instead of
+ * one per leaf vacuum.
+ *
+ * Caller (progresql_drain_spanning_index) holds ShareUpdateExclusiveLock on the
+ * index, so _bt_start_vacuum's one-active-vacuum rule is respected.
+ */
+IndexBulkDeleteResult *
+bt_spanning_drain(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+				  BTSpanningDrainKill *kill)
+{
+	Relation	rel = info->index;
+	BTCycleId	cycleid;
+
+	/* allocate stats if first time through, else re-use existing struct */
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	/* The ENSURE stuff ensures we clean up shared memory on failure */
+	PG_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
+	{
+		cycleid = _bt_start_vacuum(rel);
+
+		btvacuumscan(info, stats, NULL, NULL, cycleid,
+					 true, 0, kill);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
 	_bt_end_vacuum(rel);
@@ -1179,7 +1221,7 @@ btvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		 * cleanup-only case.
 		 */
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-		btvacuumscan(info, stats, NULL, NULL, 0, false, 0);
+		btvacuumscan(info, stats, NULL, NULL, 0, false, 0, NULL);
 		stats->estimated_count = true;
 	}
 
@@ -1229,7 +1271,8 @@ btvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 static void
 btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback, void *callback_state,
-			 BTCycleId cycleid, bool spanning, int32 spanning_partseq)
+			 BTCycleId cycleid, bool spanning, int32 spanning_partseq,
+			 BTSpanningDrainKill *drainkill)
 {
 	Relation	rel = info->index;
 	BTVacState	vstate;
@@ -1266,6 +1309,8 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vstate.cycleid = cycleid;
 	vstate.spanning = spanning;
 	vstate.spanning_partseq = spanning_partseq;
+	vstate.spanning_kill = drainkill;
+	vstate.spanning_cur_kill = NULL;
 
 	/* Create a temporary memory context to run _bt_pagedel in */
 	vstate.pagedelcontext = AllocSetContextCreate(CurrentMemoryContext,
@@ -1392,6 +1437,23 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 }
 
 /*
+ * bt_spanning_tid_dead --- per-TID delete test shared by the regular-tuple and
+ * posting-list paths of btvacuumpage.
+ *
+ * In a DHR coalesced drain, spanning_cur_kill has been set (by btvacuumpage's
+ * gate) to the resolved LP_DEAD TidStore for the current entry's partseq, so the
+ * test is TID membership in that store.  Otherwise (ordinary or eager-spanning
+ * vacuum) it is the supplied bulk-delete callback.
+ */
+static inline bool
+bt_spanning_tid_dead(BTVacState *vstate, ItemPointer tid)
+{
+	if (vstate->spanning_cur_kill != NULL)
+		return TidStoreIsMember(vstate->spanning_cur_kill, tid);
+	return vstate->callback(tid, vstate->callback_state);
+}
+
+/*
  * btvacuumpage --- VACUUM one page
  *
  * This processes a single page for btvacuumscan().  In some cases we must
@@ -1409,7 +1471,6 @@ btvacuumpage(BTVacState *vstate, Buffer buf)
 	IndexVacuumInfo *info = vstate->info;
 	IndexBulkDeleteResult *stats = vstate->stats;
 	IndexBulkDeleteCallback callback = vstate->callback;
-	void	   *callback_state = vstate->callback_state;
 	Relation	rel = info->index;
 	Relation	heaprel = info->heaprel;
 	bool		attempt_pagedel;
@@ -1552,12 +1613,15 @@ backtrack:
 		maxoff = PageGetMaxOffsetNumber(page);
 		nhtidsdead = 0;
 		nhtidslive = 0;
-		if (callback)
+		if (callback || vstate->spanning_kill)
 		{
 			TupleDesc	itupdesc = RelationGetDescr(rel);
 			AttrNumber	partseq_attno = IndexRelationGetNumberOfKeyAttributes(rel);
 
-			/* btbulkdelete callback tells us what to delete (or update) */
+			/*
+			 * btbulkdelete callback (or, for a coalesced spanning drain, the
+			 * per-partseq kill set) tells us what to delete (or update)
+			 */
 			for (offnum = minoff;
 				 offnum <= maxoff;
 				 offnum = OffsetNumberNext(offnum))
@@ -1571,24 +1635,49 @@ backtrack:
 
 				/*
 				 * ProgreSQL spanning-index vacuum: an entry is eligible for the
-				 * per-TID callback only if its trailing partseq key column
-				 * matches the partition under vacuum.  Entries belonging to
-				 * other partitions are retained verbatim.  Applying the per-TID
-				 * test only after this gate is what makes the deletion exact:
-				 * heap TIDs are partition-local, so without the gate a sibling
+				 * per-TID delete test only if its trailing partseq key column
+				 * names a partition being vacuumed.  Entries belonging to other
+				 * partitions are retained verbatim.  Applying the per-TID test
+				 * only after this gate is what makes the deletion exact: heap
+				 * TIDs are partition-local, so without the gate a sibling
 				 * partition's live TID could collide with a dead TID in the
 				 * vacuumed partition.  (Posting-list tuples in a spanning index
 				 * share one key, hence one partseq, so the whole list is gated
 				 * together.)
+				 *
+				 * Two modes share this gate: the eager per-leaf bulkdelete
+				 * (spanning_partseq names the one partition, per-TID test is the
+				 * callback against its dead_items), and the DHR coalesced drain
+				 * (spanning_kill maps each dirty partseq to its own LP_DEAD
+				 * TidStore, retiring many partitions in one scan).  The drain
+				 * stashes the resolved kill set in spanning_cur_kill for the
+				 * per-TID test below (regular and posting paths).
 				 */
 				if (vstate->spanning)
 				{
 					bool		psnull;
 					Datum		psval = index_getattr(itup, partseq_attno,
 													  itupdesc, &psnull);
+					int32		ps = psnull ? -1 : DatumGetInt32(psval);
+					bool		eligible;
 
-					if (psnull ||
-						DatumGetInt32(psval) != vstate->spanning_partseq)
+					if (vstate->spanning_kill != NULL)
+					{
+						/* Drain: resolve this entry's partseq to its kill set. */
+						BTSpanningDrainKill *k = vstate->spanning_kill;
+
+						vstate->spanning_cur_kill =
+							(ps >= 0 && ps <= k->maxpartseq) ?
+							k->deadbypartseq[ps] : NULL;
+						eligible = (vstate->spanning_cur_kill != NULL);
+					}
+					else
+					{
+						/* Eager: single partition, per-TID test is the callback. */
+						eligible = (!psnull && ps == vstate->spanning_partseq);
+					}
+
+					if (!eligible)
 					{
 						if (!BTreeTupleIsPosting(itup))
 							nhtidslive++;
@@ -1601,7 +1690,7 @@ backtrack:
 				if (!BTreeTupleIsPosting(itup))
 				{
 					/* Regular tuple, standard table TID representation */
-					if (callback(&itup->t_tid, callback_state))
+					if (bt_spanning_tid_dead(vstate, &itup->t_tid))
 					{
 						deletable[ndeletable++] = offnum;
 						nhtidsdead++;
@@ -1785,7 +1874,7 @@ btreevacuumposting(BTVacState *vstate, IndexTuple posting,
 
 	for (int i = 0; i < nitem; i++)
 	{
-		if (!vstate->callback(items + i, vstate->callback_state))
+		if (!bt_spanning_tid_dead(vstate, items + i))
 		{
 			/* Live table TID */
 			live++;

@@ -153,6 +153,7 @@
 #include "common/int.h"
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
+#include "fmgr.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "portability/instr_time.h"
@@ -162,6 +163,7 @@
 #include "storage/lmgr.h"
 #include "storage/read_stream.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_rusage.h"
 #include "utils/rel.h"
@@ -2657,6 +2659,334 @@ progresql_enqueue_spanning_drain(LVRelState *vacrel)
 	}
 
 	list_free(ancestors);
+}
+
+/*
+ * One dirty partition for a coalesced spanning-index drain: its index-local
+ * partseq, the partition relation (NULL if it was dropped/detached and can no
+ * longer be resolved), and the set of its currently-LP_DEAD heap TIDs, which
+ * serves as BOTH the index-scan kill set AND the heap-reap set.
+ */
+typedef struct SpanningDrainEntry
+{
+	int32		partseq;
+	Oid			partOid;
+	Relation	partRel;
+	TidStore   *dead;
+} SpanningDrainEntry;
+
+/*
+ * Sort dirty partitions by OID so every drain acquires partition locks in the
+ * same global order, regardless of index-local partseq.  This makes drains of
+ * different spanning indexes that share partitions deadlock-free.
+ */
+static int
+spanning_drain_entry_cmp(const void *a, const void *b)
+{
+	Oid			oa = ((const SpanningDrainEntry *) a)->partOid;
+	Oid			ob = ((const SpanningDrainEntry *) b)->partOid;
+
+	if (oa < ob)
+		return -1;
+	if (oa > ob)
+		return 1;
+	return 0;
+}
+
+/*
+ * spanning_drain_build_lpdead_store
+ *		Scan a partition heap and collect every currently-LP_DEAD line pointer
+ *		into a TidStore.  Read-only (share buffer lock); reads line-pointer state
+ *		only, no tuple fetch --- LP_DEAD is the authoritative deadness proof.
+ */
+static TidStore *
+spanning_drain_build_lpdead_store(Relation rel, BufferAccessStrategy bstrategy)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	BlockNumber blkno;
+	TidStore   *store;
+	OffsetNumber offsets[MaxOffsetNumber];
+
+	store = TidStoreCreateLocal(maintenance_work_mem * (size_t) 1024, false);
+
+	for (blkno = 0; blkno < nblocks; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber off,
+					maxoff;
+		int			noff = 0;
+
+		vacuum_delay_point(false);
+
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
+		{
+			ItemId		itemid = PageGetItemId(page, off);
+
+			if (ItemIdIsDead(itemid))
+				offsets[noff++] = off;
+		}
+
+		if (noff > 0)
+			TidStoreSetBlockOffsets(store, blkno, offsets, noff);
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	return store;
+}
+
+/*
+ * spanning_drain_reap_partition
+ *		Turn the partition's now-safe LP_DEAD slots (those in `dead`, whose
+ *		spanning entries the drain has already retired) into LP_UNUSED, making
+ *		the slots reusable.  Standalone analogue of lazy_vacuum_heap_page's
+ *		second pass.  Caller holds ShareUpdateExclusiveLock on the partition, so
+ *		no concurrent vacuum can also be reaping; the defensive ItemIdIsDead
+ *		guard tolerates anything unexpected by skipping it.
+ *
+ * Must run AFTER the index entries have been removed (WAL-logged): the index
+ * delitems records precede these reap records in the WAL stream, so redo can
+ * never reap a slot before its spanning entry is gone.
+ */
+static void
+spanning_drain_reap_partition(Relation rel, TidStore *dead,
+							  BufferAccessStrategy bstrategy)
+{
+	TidStoreIter *iter = TidStoreBeginIterate(dead);
+	TidStoreIterResult *res;
+	OffsetNumber offsets[MaxOffsetNumber];
+
+	while ((res = TidStoreIterateNext(iter)) != NULL)
+	{
+		BlockNumber blkno = res->blkno;
+		int			noff = TidStoreGetBlockOffsets(res, offsets, lengthof(offsets));
+		Buffer		buf;
+		Page		page;
+		OffsetNumber unused[MaxHeapTuplesPerPage];
+		int			nunused = 0;
+		Size		freespace = 0;
+
+		vacuum_delay_point(false);
+
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+
+		START_CRIT_SECTION();
+
+		for (int k = 0; k < noff; k++)
+		{
+			ItemId		itemid = PageGetItemId(page, offsets[k]);
+
+			/* Reap only if still a storage-less LP_DEAD slot (defensive). */
+			if (ItemIdIsDead(itemid) && !ItemIdHasStorage(itemid))
+			{
+				ItemIdSetUnused(itemid);
+				unused[nunused++] = offsets[k];
+			}
+		}
+
+		if (nunused > 0)
+		{
+			PageTruncateLinePointerArray(page);
+			MarkBufferDirty(buf);
+
+			if (RelationNeedsWAL(rel))
+				log_heap_prune_and_freeze(rel, buf,
+										  InvalidTransactionId,
+										  false,	/* no cleanup lock required */
+										  PRUNE_VACUUM_CLEANUP,
+										  NULL, 0,	/* frozen */
+										  NULL, 0,	/* redirected */
+										  NULL, 0,	/* dead */
+										  unused, nunused);
+		}
+
+		END_CRIT_SECTION();
+
+		if (nunused > 0)
+			freespace = PageGetHeapFreeSpace(page);
+
+		UnlockReleaseBuffer(buf);
+
+		if (nunused > 0)
+			RecordPageWithFreeSpace(rel, blkno, freespace);
+	}
+
+	TidStoreEndIterate(iter);
+}
+
+/*
+ * progresql_drain_spanning_index
+ *
+ * The DHR coalesced drain: retire, in a SINGLE scan of the spanning index, the
+ * dead entries enqueued by every leaf-partition VACUUM since the last drain, and
+ * reap the now-safe LP_DEAD heap slots.  This is the O(N^2)->O(N) win --- N
+ * per-leaf full index scans collapse to one.
+ *
+ * Steps (index-before-heap, all in the caller's transaction):
+ *   1. ShareUpdateExclusiveLock the spanning index (serializes drains; respects
+ *      _bt_start_vacuum's one-active-vacuum rule).
+ *   2. Snapshot the dirty partseqs from pg_spanning_drainq.
+ *   3. Resolve each to its partition; sort by OID; ShareUpdateExclusiveLock each
+ *      (serializes vs that partition's VACUUM, so the reap can't double-fire and
+ *      no concurrent enqueue mutates the rows we will delete); build each
+ *      partition's LP_DEAD TidStore (kill set + reap set).
+ *   4. ONE multi-partseq btvacuumscan removes the matching index entries
+ *      (WAL-logged _bt_delitems_vacuum).
+ *   5. Reap the now-safe LP_DEAD slots in each partition (WAL-logged, AFTER the
+ *      index removals in the WAL stream).
+ *   6. Delete the drained pg_spanning_drainq rows.
+ *
+ * Returns the number of spanning index entries retired.
+ */
+int64
+progresql_drain_spanning_index(Oid spanningIndexOid)
+{
+	Relation	idxRel;
+	List	   *dirty;
+	ListCell   *lc;
+	int			ndirty;
+	int			i;
+	int32		maxpartseq = 0;
+	SpanningDrainEntry *entries;
+	BTSpanningDrainKill kill;
+	BufferAccessStrategy bstrategy;
+	Relation	heaprel = NULL;
+	IndexVacuumInfo ivinfo;
+	IndexBulkDeleteResult *istat;
+	int64		retired = 0;
+
+	/* 1. Serialize drains on this index. */
+	idxRel = index_open(spanningIndexOid, ShareUpdateExclusiveLock);
+	if (!RelationIsSpanning(idxRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a spanning index",
+						RelationGetRelationName(idxRel))));
+
+	/* 2. Snapshot the dirty partseqs. */
+	dirty = SpanningDrainqListDirty(spanningIndexOid);
+	if (dirty == NIL)
+	{
+		index_close(idxRel, ShareUpdateExclusiveLock);
+		return 0;
+	}
+
+	bstrategy = GetAccessStrategy(BAS_VACUUM);
+
+	/* 3a. Resolve partseqs -> partitions; record them. */
+	ndirty = list_length(dirty);
+	entries = (SpanningDrainEntry *) palloc0(ndirty * sizeof(SpanningDrainEntry));
+	i = 0;
+	foreach(lc, dirty)
+	{
+		int32		ps = lfirst_int(lc);
+
+		entries[i].partseq = ps;
+		entries[i].partOid = SpanningResolvePartseqRelid(idxRel, ps);
+		entries[i].partRel = NULL;
+		entries[i].dead = NULL;
+		if (ps > maxpartseq)
+			maxpartseq = ps;
+		i++;
+	}
+
+	/* 3b. Lock partitions in OID order (deadlock-free) and build kill sets. */
+	qsort(entries, ndirty, sizeof(SpanningDrainEntry), spanning_drain_entry_cmp);
+
+	kill.maxpartseq = maxpartseq;
+	kill.deadbypartseq = (struct TidStore **)
+		palloc0((maxpartseq + 1) * sizeof(struct TidStore *));
+
+	for (i = 0; i < ndirty; i++)
+	{
+		if (!OidIsValid(entries[i].partOid))
+			continue;			/* partition gone; just drop its drainq row */
+
+		entries[i].partRel = table_open(entries[i].partOid,
+										ShareUpdateExclusiveLock);
+		entries[i].dead =
+			spanning_drain_build_lpdead_store(entries[i].partRel, bstrategy);
+		kill.deadbypartseq[entries[i].partseq] = (struct TidStore *) entries[i].dead;
+
+		if (heaprel == NULL)
+			heaprel = entries[i].partRel;
+	}
+
+	/*
+	 * 4. One coalesced index scan retiring all dirty partseqs' dead entries.
+	 * heaprel is a real leaf (not the partitioned root) so BTPageIsRecyclable's
+	 * relkind assert is satisfied (see bt_spanning_bulkdelete / commit B1).  If
+	 * every dirty partition was dropped there is nothing to scan or reap.
+	 */
+	if (heaprel != NULL)
+	{
+		ivinfo.index = idxRel;
+		ivinfo.heaprel = heaprel;
+		ivinfo.analyze_only = false;
+		ivinfo.report_progress = false;
+		ivinfo.estimated_count = true;
+		ivinfo.message_level = DEBUG2;
+		ivinfo.num_heap_tuples = -1;
+		ivinfo.strategy = bstrategy;
+
+		istat = bt_spanning_drain(&ivinfo, NULL, &kill);
+		if (istat != NULL)
+		{
+			retired = istat->tuples_removed;
+			pfree(istat);
+		}
+
+		/* 5. Reap the now-safe LP_DEAD slots (index entries already gone). */
+		for (i = 0; i < ndirty; i++)
+		{
+			if (entries[i].partRel != NULL && entries[i].dead != NULL)
+				spanning_drain_reap_partition(entries[i].partRel,
+											  entries[i].dead, bstrategy);
+		}
+	}
+
+	/* 6. Drop the drained queue rows (only the partseqs we processed). */
+	SpanningDrainqDeleteList(spanningIndexOid, dirty);
+
+	/* Cleanup; keep all locks until commit (NoLock on close). */
+	for (i = 0; i < ndirty; i++)
+	{
+		if (entries[i].dead != NULL)
+			TidStoreDestroy(entries[i].dead);
+		if (entries[i].partRel != NULL)
+			table_close(entries[i].partRel, NoLock);
+	}
+	pfree(kill.deadbypartseq);
+	pfree(entries);
+	list_free(dirty);
+	FreeAccessStrategy(bstrategy);
+	index_close(idxRel, NoLock);
+
+	return retired;
+}
+
+/*
+ * pg_drain_spanning_index(regclass) -> bigint
+ *		SQL entry point to force a coalesced drain of one spanning index,
+ *		returning the number of dead entries retired.  Useful for tests and for
+ *		operators who want to reclaim deferred spanning bloat on demand.  A
+ *		core built-in: wired through the generated fmgr table from pg_proc.dat,
+ *		so it needs no PG_FUNCTION_INFO_V1.
+ */
+Datum
+pg_drain_spanning_index(PG_FUNCTION_ARGS)
+{
+	Oid			idxoid = PG_GETARG_OID(0);
+
+	PG_RETURN_INT64(progresql_drain_spanning_index(idxoid));
 }
 
 /*

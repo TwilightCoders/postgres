@@ -60,6 +60,7 @@
 /* ProgreSQL: bumped to add indnuniqatts column to pg_index (spanning indexes) */
 /* ProgreSQL: bumped to add pg_index_partition catalog (C1 partseq map) */
 /* ProgreSQL: bumped to add pg_spanning_drainq catalog (E5 deferred-vacuum queue) */
-#define CATALOG_VERSION_NO	202606011
+/* ProgreSQL: bumped to add pg_drain_spanning_index() (E5 coalesced drain) */
+#define CATALOG_VERSION_NO	202606021
 
 #endif

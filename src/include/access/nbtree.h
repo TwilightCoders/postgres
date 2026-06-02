@@ -328,6 +328,22 @@ typedef struct BTPendingFSM
 	FullTransactionId safexid;	/* Page's BTDeletedPageData.safexid */
 } BTPendingFSM;
 
+/*
+ * ProgreSQL coalesced spanning-index drain (DHR): the kill set for a single
+ * btvacuumscan that retires the dead entries of MANY partitions at once.  Unlike
+ * the eager per-leaf bt_spanning_bulkdelete (one partseq, one TID callback), the
+ * drain gates each index entry on whether its partseq is "dirty" and, if so,
+ * whether its heap TID is in that partition's set of currently-LP_DEAD TIDs.
+ * deadbypartseq is indexed by partseq (0..maxpartseq); a NULL slot means the
+ * partition is not being drained, so all its entries are retained.
+ */
+struct TidStore;				/* avoid pulling access/tidstore.h into nbtree.h */
+typedef struct BTSpanningDrainKill
+{
+	int32		maxpartseq;		/* highest partseq with a kill set */
+	struct TidStore **deadbypartseq;	/* [0..maxpartseq]; NULL if not dirty */
+} BTSpanningDrainKill;
+
 typedef struct BTVacState
 {
 	IndexVacuumInfo *info;
@@ -360,6 +376,17 @@ typedef struct BTVacState
 	 */
 	bool		spanning;
 	int32		spanning_partseq;
+
+	/*
+	 * DHR coalesced drain.  When spanning_kill is non-NULL, this scan is a
+	 * multi-partseq drain rather than an eager single-partition bulkdelete: the
+	 * gate resolves each entry's partseq to its kill set (spanning_cur_kill, set
+	 * transiently per entry) and deletes the entry iff its TID is in that set.
+	 * spanning_cur_kill is also consulted by btreevacuumposting for posting
+	 * lists.  Both are NULL for ordinary and eager-spanning vacuums.
+	 */
+	BTSpanningDrainKill *spanning_kill;
+	struct TidStore *spanning_cur_kill;
 } BTVacState;
 
 /*
@@ -1226,6 +1253,9 @@ extern IndexBulkDeleteResult *bt_spanning_bulkdelete(IndexVacuumInfo *info,
 													 int32 partseq,
 													 IndexBulkDeleteCallback callback,
 													 void *callback_state);
+extern IndexBulkDeleteResult *bt_spanning_drain(IndexVacuumInfo *info,
+												IndexBulkDeleteResult *stats,
+												BTSpanningDrainKill *kill);
 extern bool btcanreturn(Relation index, int attno);
 extern int	btgettreeheight(Relation rel);
 

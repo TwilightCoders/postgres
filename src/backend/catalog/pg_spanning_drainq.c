@@ -120,6 +120,93 @@ SpanningDrainqHasPending(Oid spanningIndexOid, int32 partseq)
 }
 
 /*
+ * SpanningDrainqListDirty
+ *		Return the list of partseqs (as a List of int) that currently have
+ *		pending un-drained rows for this spanning index.  This is the drain's
+ *		snapshot of "which partitions need draining".
+ *
+ * Scans by the leading column of the PK index.  The caller (the drain) holds
+ * ShareUpdateExclusiveLock on the spanning index, so no concurrent drain runs;
+ * vacuum only ever ADDS rows (enqueue), never removes, so every partseq in the
+ * returned snapshot remains valid for the duration of the drain.
+ */
+List *
+SpanningDrainqListDirty(Oid spanningIndexOid)
+{
+	Relation	catalog;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *result = NIL;
+
+	catalog = table_open(SpanningDrainqRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey,
+				Anum_pg_spanning_drainq_sdq_idxid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(spanningIndexOid));
+
+	scan = systable_beginscan(catalog, SpanningDrainqIdxidSeqIndexId,
+							  true, NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_spanning_drainq form = (Form_pg_spanning_drainq) GETSTRUCT(tup);
+
+		result = lappend_int(result, form->sdq_partseq);
+	}
+
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * SpanningDrainqDeleteList
+ *		Delete the (spanningIndexOid, partseq) rows for each partseq in the list.
+ *		Called by the drain after it has retired those partitions' spanning
+ *		entries and reaped their heap slots.
+ *
+ * Deletes only the listed partseqs --- never the whole index's rows --- so a
+ * partition that enqueued during this drain (a partseq not in the snapshot) is
+ * left for the next drain.  Each listed partseq's row is stable because the
+ * drain holds that partition's lock, blocking the only writer (vacuum enqueue).
+ */
+void
+SpanningDrainqDeleteList(Oid spanningIndexOid, List *partseqs)
+{
+	Relation	catalog;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	if (partseqs == NIL)
+		return;
+
+	catalog = table_open(SpanningDrainqRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&skey,
+				Anum_pg_spanning_drainq_sdq_idxid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(spanningIndexOid));
+
+	scan = systable_beginscan(catalog, SpanningDrainqIdxidSeqIndexId,
+							  true, NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_spanning_drainq form = (Form_pg_spanning_drainq) GETSTRUCT(tup);
+
+		if (list_member_int(partseqs, form->sdq_partseq))
+			CatalogTupleDelete(catalog, &tup->t_self);
+	}
+
+	systable_endscan(scan);
+	table_close(catalog, RowExclusiveLock);
+}
+
+/*
  * RemoveSpanningDrainqForIndex
  *		Drop all pg_spanning_drainq rows belonging to a spanning index.  Called
  *		from index_drop so the drain queue does not outlive the index it

@@ -943,6 +943,13 @@
   proname => 'brin_summarize_range', provolatile => 'v', proparallel => 'u',
   prorettype => 'int4', proargtypes => 'regclass int8',
   prosrc => 'brin_summarize_range' },
+
+# ProgreSQL: force a coalesced drain of a cross-partition spanning index
+{ oid => '8473',
+  descr => 'drain a spanning index\'s deferred dead entries',
+  proname => 'pg_drain_spanning_index', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => 'regclass',
+  prosrc => 'pg_drain_spanning_index' },
 { oid => '4014', descr => 'brin: desummarize page range',
   proname => 'brin_desummarize_range', provolatile => 'v', proparallel => 'u',
   prorettype => 'void', proargtypes => 'regclass int8',
