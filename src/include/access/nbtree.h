@@ -344,6 +344,22 @@ typedef struct BTVacState
 	int			maxbufsize;		/* max bufsize that respects work_mem */
 	BTPendingFSM *pendingpages; /* One entry per newly deleted page */
 	int			npendingpages;	/* current # valid pendingpages */
+
+	/*
+	 * ProgreSQL spanning-index vacuum.  When spanning is true, an index tuple
+	 * is eligible for the callback's per-TID delete test only if its trailing
+	 * partseq key column equals spanning_partseq.  Reading the partseq from the
+	 * tuple key (which a TID-only callback cannot do) makes spanning-index
+	 * VACUUM exact: heap TIDs are partition-local and collide across
+	 * partitions, so the partseq gate is what prevents collaterally deleting a
+	 * sibling partition's live entry.  Deletion still flows through the
+	 * WAL-logged _bt_delitems_vacuum path, so it is crash-safe.
+	 *
+	 * Kept at the end of the struct so the offsets of the fields above stay
+	 * stable for the rest of nbtree.
+	 */
+	bool		spanning;
+	int32		spanning_partseq;
 } BTVacState;
 
 /*
@@ -1205,6 +1221,11 @@ extern IndexBulkDeleteResult *btbulkdelete(IndexVacuumInfo *info,
 										   void *callback_state);
 extern IndexBulkDeleteResult *btvacuumcleanup(IndexVacuumInfo *info,
 											  IndexBulkDeleteResult *stats);
+extern IndexBulkDeleteResult *bt_spanning_bulkdelete(IndexVacuumInfo *info,
+													 IndexBulkDeleteResult *stats,
+													 int32 partseq,
+													 IndexBulkDeleteCallback callback,
+													 void *callback_state);
 extern bool btcanreturn(Relation index, int attno);
 extern int	btgettreeheight(Relation rel);
 

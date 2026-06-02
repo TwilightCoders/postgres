@@ -123,7 +123,7 @@ test: plancache limit plpgsql copy2 temp domain rangefuncs prepare conversion tr
 # The stats test resets stats, so nothing else needing stats access can be in
 # this group.
 # ----------
-test: partition_join partition_prune reloptions hash_part indexing partition_aggregate partition_info tuplesort explain memoize stats predicate numa progresql progresql_ddl progresql_partseq
+test: partition_join partition_prune reloptions hash_part indexing partition_aggregate partition_info tuplesort explain memoize stats predicate numa progresql progresql_ddl progresql_partseq progresql_vacuum_collision progresql_oid_reuse
 
 # ----------
 # Another group of parallel tests (compression)

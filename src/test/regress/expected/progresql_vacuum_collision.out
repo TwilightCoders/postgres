@@ -1,1 +1,33 @@
--- placeholder expected output; populated when C1-D registers this test
+-- C1-D will add this to parallel_schedule; RED until the discriminator flip.
+--
+-- Demonstrates the VACUUM TID-collision the partseq discriminator fixes.
+-- The spanning-index vacuum (vacuumlazy.c) deletes entries by heap TID alone.
+-- Because every partition has its own TID address space, a dead TID in one
+-- partition can equal a LIVE TID in a sibling partition, so vacuuming the first
+-- partition can wrongly delete the sibling's still-live spanning entry --
+-- silently losing cross-partition uniqueness enforcement.  Under C1-D the
+-- bulkdelete is filtered by partseq, so only the vacuumed partition's entries
+-- are eligible.  This test asserts the sibling's uniqueness entry survives.
+--
+-- It is intentionally NOT in parallel_schedule until C1-D makes it pass.
+CREATE TABLE vc_base (id bigint NOT NULL, ts timestamptz NOT NULL);
+CREATE TABLE vc (PRIMARY KEY (id)) INHERITS (vc_base) PARTITION BY RANGE (ts);
+CREATE TABLE vc_2024 PARTITION OF vc FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE vc_2025 PARTITION OF vc FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+-- Make each partition's first live row share heap TID (0,1): a single insert
+-- into each, no prior dead tuples, so both live rows are at block 0 offset 1.
+INSERT INTO vc VALUES (10, '2024-06-01');   -- vc_2024 (0,1)
+INSERT INTO vc VALUES (20, '2025-06-01');   -- vc_2025 (0,1)
+-- Create a dead tuple in vc_2024 at a TID that also names a live row of vc_2025.
+DELETE FROM vc WHERE id = 10;               -- vc_2024 (0,1) now dead
+INSERT INTO vc VALUES (11, '2024-07-01');   -- vc_2024 (0,2) live
+-- Vacuum only vc_2024.  A TID-only spanning delete would reap (0,1) from the
+-- root, collaterally killing vc_2025's live entry for id=20.
+VACUUM vc_2024;
+-- vc_2025's uniqueness for id=20 must still be enforced: this duplicate must
+-- be rejected.  If the entry was wrongly vacuumed, the insert would succeed.
+INSERT INTO vc VALUES (20, '2025-08-01');   -- expect ERROR: duplicate key (id)=(20)
+ERROR:  duplicate key value violates unique constraint "vc_pkey"
+DETAIL:  Key (id)=(20) already exists.
+DROP TABLE vc CASCADE;
+DROP TABLE vc_base;
