@@ -165,32 +165,29 @@ col == attno -6, so normal indexes untouched); genam comment. Verified: column i
 int4/int4_ops/"partseq", uniqueness + VACUUM work, 240 green. No catversion bump
 (runtime-only; old oid_ops indexes still function, REINDEX relabels — optional).
 
+## E1b — DONE (`6cacae7351` migrate tests, `f152021e4e` remove handshake)
+GLOBAL is now the SOLE spanning opt-in. `progresql_bypass = stmt->isglobal`
+(dropped the `has_superclass` term); restored stock PG's parse_utilcmd guard
+(INHERITS+PARTITION BY → "cannot create partitioned table as inheritance child");
+all `progresql*` tests migrated to inline `GLOBAL`; `progresql.sql` rewritten +
+Section 13 asserts the retired handshake errors; `create_table.out` restored to
+the vanilla error. README updated. 240 green.
+
+## ALL LETTERED PRIORITIES DONE (E1, E2, E5, E6, E7, E1b). Remaining = polish.
 ## NEXT (priority order)
-1. **E1b — retire implicit INHERITS handshake** (PARTLY DONE). README migrated to
-   `GLOBAL` (`9cd50d8d00`). REMAINING (the code part, LARGE/mechanical — do with
-   fresh capacity, incrementally, green per commit):
-   - Migrate each `progresql*.sql` test from `CREATE TABLE x (PRIMARY KEY(k))
-     INHERITS (x_base) PARTITION BY …` to the inline `CREATE TABLE x (cols…,
-     PRIMARY KEY (k) GLOBAL) PARTITION BY …` form (drop the base table, inline
-     columns, add `GLOBAL`). All `progresql_*` tests + `progresql.sql` +
-     `progresql_drain`/`progresql_dumpdef` (the latter two I wrote also use
-     INHERITS). Regenerate each expected output, keep `make check` green.
-   - THEN remove the `has_superclass(tableId)` term from the opt-in in
-     `indexcmds.c` (~line 786-791, the `progresql_bypass` expr) + the matching
-     `parse_utilcmd.c` allowance, so `stmt->isglobal` is the SOLE opt-in. Verify
-     240 green. The inline `PRIMARY KEY (k) GLOBAL` form (PK excludes the
-     partition key) is already proven by `progresql_global`.
-   - Safe-incremental: migrating tests to GLOBAL while keeping the handshake is
-     green at every step (GLOBAL is additive); only the final handshake removal
-     requires all tests migrated first.
-2. **E2 follow-ups (NOT data-loss):** pg_dump|psql TAP test, pg_upgrade TAP test
-   (binary upgrade — should be covered by the dumpConstraint fix but unverified),
-   psql `\d` spanning annotation (P2-2).
+1. **E2 follow-ups (NOT data-loss):** pg_dump|psql TAP + pg_upgrade TAP (binary
+   upgrade — covered by the dumpConstraint fix by construction, but unverified;
+   **needs `./configure --enable-tap-tests`, NOT currently set** → can't run via
+   `make check` here); psql `\d` spanning annotation (P2-2, small/additive).
+2. **Sub-partition DDL hard-error:** multi-level partitioning is fail-closed at
+   INSERT (verified, not a P0); a DDL-time rejection (at `CREATE TABLE … PARTITION
+   OF <spanning-child> … PARTITION BY …`) is cleaner UX. Self-contained.
 3. **E5 inc5b (task #27):** isolation specs (drain∥DML, drain∥eager-VACUUM) +
-   TAP crash test (drainq durable across crash).
+   TAP crash test — isolation needs `make -C src/test/isolation check`; TAP needs
+   `--enable-tap-tests`.
 4. **DHR follow-ups:** `VACUUM <root>` end-of-command drain hook; launcher
    periodic sweep; extend deferral to local-index leaves; antagonist standalone
-   TODOs (B3 lock protocol, M4 memoize has-spanning-ancestor).
+   TODOs (B3 lock protocol, M4 memoize has-spanning-ancestor, m1 comment).
 
 ## VERIFIED findings (live repros, not assumptions)
 - **HOT key-change = P0** (fixed, E7). Repro is `progresql_hot`.
