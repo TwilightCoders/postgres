@@ -186,9 +186,13 @@ the vanilla error. README updated. 240 green.
    discriminator from describe.c's index-column query, but that needs the same
    server-version-gated `indnuniqatts` plumbing as pg_dump (describe.c runs vs
    many server versions). Low priority, cosmetic.
-2. **Sub-partition DDL hard-error:** multi-level partitioning is fail-closed at
-   INSERT (verified, not a P0); a DDL-time rejection (at `CREATE TABLE … PARTITION
-   OF <spanning-child> … PARTITION BY …`) is cleaner UX. Self-contained.
+2. **Sub-partition DDL hard-error — DONE `35d1da2cbd`.** Multi-level
+   partitioning now rejected at DDL in both directions: `CREATE TABLE child
+   PARTITION OF <spanning-root> … PARTITION BY …` errors (tablecmds.c), and
+   building a GLOBAL index on a pre-existing multi-level tree errors
+   (indexcmds.c — replacing a SILENT skip that omitted grandchild rows from the
+   index → had left their uniqueness unenforced; real correctness gap closed).
+   progresql.sql Section 14; 240 green.
 3. **E5 inc5b (task #27):** isolation specs (drain∥DML, drain∥eager-VACUUM) +
    TAP crash test — isolation needs `make -C src/test/isolation check`; TAP needs
    `--enable-tap-tests`.
@@ -209,14 +213,13 @@ the vanilla error. README updated. 240 green.
   index from a leaf. Feature gap, not a P0.
 - **partseq allocation race** (concurrent ATTACH): PK backstop turns it into a
   spurious duplicate-key error (retriable), NOT silent corruption.
-- **Multi-level (sub-)partitioning is FAIL-CLOSED (verified 2026-06-02, live
-  repro), NOT a corruption P0**: partseq is allocated for direct children only,
-  so INSERT into a grandchild leaf errors "spanning index … has no partseq for
-  partition" — clean error, no silent uniqueness loss. UX gap only: the
-  sub-partition structure can be CREATED and only fails at INSERT (the README
-  says "excluded" but it's runtime-fail-closed, not DDL-rejected). FUTURE POLISH
-  (not correctness): hard-error at `CREATE TABLE … PARTITION OF <spanning-child>
-  … PARTITION BY …` (DDL time) instead of at INSERT, or support recursively.
+- **Multi-level (sub-)partitioning — now REJECTED at DDL (`35d1da2cbd`).**
+  Originally fail-closed at INSERT (verified); now hard-errors at DDL in both
+  directions (sub-partition under a spanning root; GLOBAL on a pre-existing
+  multi-level tree). The GLOBAL-build path had a SILENT skip of sub-partitioned
+  children (grandchild rows omitted → uniqueness unenforced) — that real gap is
+  closed by the error. Supporting multi-level recursively remains possible future
+  work, but rejection is the correct, presentable default.
 - **Strategic**: C1 (partseq + `pg_index_partition`) ≈ **Dilip Kumar/Google's
   live June-2025 in-core "Global Index" proposal** (msg
   CAFiTN-uyec_y2QS2whUam8Rp1M+PPGuP0Zz45uX_U6mhQ8mtRg), which is Haas-blessed.

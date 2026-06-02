@@ -222,10 +222,10 @@ git rebase upstream/REL_18_STABLE progresql-18
   stock PostgreSQL — `GLOBAL` is the only way to request a spanning index.)
 - The deferred coalesced VACUUM drain is behind `spanning_defer_vacuum` (default
   off) and currently applies to spanning leaves without local indexes.
-- Multi-level (sub-)partitioning is not supported under a spanning index:
-  partseq is allocated for direct children only, so an INSERT routed to a
-  grandchild leaf fails closed with an error (no silent uniqueness loss). A
-  DDL-time rejection is a planned refinement.
+- Multi-level (sub-)partitioning is not supported under a spanning index: every
+  partition must be a storage-bearing leaf. This is rejected at DDL — both
+  sub-partitioning a partition of a spanning-indexed root, and creating a
+  `GLOBAL` index on an already multi-level tree.
 - The per-statement cache is exactly that — per statement; it is rebuilt for
   each top-level DML.
 - This is a research fork, not a supported product.
