@@ -187,6 +187,78 @@ leaf page) per invocation. Consequences:
 
 ---
 
+### C1-D2 UPDATE (2026-06-01) — correctness DONE; perf is architecture-gated
+
+**Correctness (the latent P0) is fixed and verified.** The "collision-on-delete"
+hazard above was real and is now closed for *all* leaf shapes by C1-D2 (commit
+`66c9c0a3d9`). The mechanism is no longer a stock TID-only `btbulkdelete`; it is a
+new `bt_spanning_bulkdelete` (`nbtree.c`) that gates every entry on its trailing
+**partseq** key before the per-TID dead test and removes via the WAL-logged
+`_bt_delitems_vacuum` path. `lazy_vacuum()` runs it *before* the heap reap
+(index-first), and `LVRelState.has_spanning_index` forces a zero-local-index leaf
+onto the two-pass strategy so its dead TIDs are collected. Regression coverage:
+`progresql_vacuum_collision` + `progresql_oid_reuse`, both green (236/236). So the
+"M — collision fix" line above is **done**; what remains is purely the **L — cost**
+line, and the analysis below sharpens *why it is genuinely hard*, not a quick win.
+
+**The cost is structural to the key layout.** With key order `(user_cols…,
+partseq)`, one partition's entries are scattered across the whole spanning B-tree,
+so retiring partseq P's dead TIDs requires a full physical scan of the entire
+index (all partitions' entries). There is **no cheap targeted delete** for the
+current layout; `(partseq, user_cols…)` would localize per-partition entries but
+breaks the cross-partition uniqueness scan (rejected, see long-term note above).
+So per-leaf-vacuum cost is O(whole tree), and a full autovacuum sweep is ~O(N²).
+
+**Two independent reasons coalescing is not a drop-in optimization** (both
+verified in this tree this session):
+1. **Autovacuum vacuums leaves independently.** `do_autovacuum()` →
+   `autovacuum_do_vac_analyze(tab)` → `vacuum()` with a *single-leaf* relation
+   list, on each leaf's own dead-tuple cadence, often in different workers/times.
+   There is no point at which one agent holds the whole tree's dead sets, so the
+   common (autovacuum) case **cannot** be coalesced within today's architecture.
+2. **`vacuum_rel()` runs each leaf in its own transaction.** Even for a manual
+   `VACUUM <root>` — where `vacuum()` *does* expand the root into all leaves in
+   one command loop (`expand_vacuum_rel` → `foreach … vacuum_rel`) — each
+   `vacuum_rel()` is its own `StartTransactionCommand`/`CommitTransactionCommand`.
+   A dead-TID set is snapshot-bound to the transaction that computed it; you
+   cannot safely defer leaf A's dead set to a single end-of-command spanning pass
+   in a later transaction, because deletability is re-evaluated against the live
+   horizon. So even the manual case is **not** a simple "accumulate then one
+   pass."
+
+**Architectural options (this is now a design decision, not a code-it-now task):**
+- **(A) Accept + document + benchmark (S, ship now).** Keep per-leaf cleanup;
+  publish the O(N²) sweep curve and the structural reason. This is the honest
+  minimum bar and is what reviewers will ask for first. **Recommended next step.**
+- **(B) Deferred-cleanup queue (XL, real fix).** Leaf vacuum records "(spanning
+  index I, partseq P) has dead heap TIDs {…}" durably (a catalog/queue), and a
+  separate coalesced pass — a background worker, or a root-level maintenance
+  entry point — drains it with **one** spanning scan per root per cycle, turning
+  N² into ~N. Correctness hinge: a queued TID must still be provably dead when the
+  deferred pass runs (re-check against the heap, or record an XID horizon). This
+  is the architecturally correct answer and the one upstream would want, but it is
+  a multi-week build touching the vacuum lifecycle + a new catalog + recovery
+  semantics, and deserves its own RFC.
+- **(C) Manual-VACUUM-only coalescing (M–L, partial).** Special-case
+  `VACUUM <root>` to share a per-command accumulator across the leaf loop and do
+  one spanning pass at the end — but only by keeping each leaf's dead set inside
+  its own transaction and deferring *just the index scan*, which the
+  transaction-boundary point above shows is unsafe in general. Net: low value
+  (doesn't help autovacuum) for non-trivial risk. **Not recommended.**
+
+**Recommendation:** do **(A)** now (document the curve, add the benchmark note to
+`PRODUCTION_READINESS.md`), and write **(B)** up as its own RFC before any code.
+Do **not** hand-roll (C). Correctness is already upstream-credible; the perf story
+is "known, characterized, with a clear deferred-cleanup design" — which is a
+defensible position to present, rather than a half-built lifecycle change.
+
+### Effort estimate (revised)
+- Correctness fix: **DONE** (C1-D2).
+- (A) Document + benchmark: **S** (1–2 days). ← next.
+- (B) Deferred-cleanup queue: **XL** (multi-week; new catalog + lifecycle + RFC).
+
+---
+
 ## P2-4 — Logical decoding / replication of spanning writes
 
 ### Problem restatement
