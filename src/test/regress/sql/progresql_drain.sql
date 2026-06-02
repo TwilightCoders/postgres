@@ -95,4 +95,45 @@ CREATE TABLE drq_plain (x int PRIMARY KEY);
 SELECT pg_drain_spanning_index('drq_plain_pkey'::regclass);
 DROP TABLE drq_plain;
 
+-- A spanning leaf WITH a local index must NOT be deferred/drained: the drain
+-- reaps every LP_DEAD slot, which would orphan a live local-index entry.  Such
+-- leaves use the eager path (no enqueue), so the drain never touches them and
+-- the local index stays consistent with the heap.
+CREATE TABLE li_base (id bigint NOT NULL, v int NOT NULL);
+CREATE TABLE li (PRIMARY KEY (id)) INHERITS (li_base) PARTITION BY LIST ((id % 1));
+CREATE TABLE li0 PARTITION OF li FOR VALUES IN (0) WITH (autovacuum_enabled = false);
+CREATE INDEX li0_v ON li0 (v);
+INSERT INTO li SELECT g, g FROM generate_series(1, 500) g;
+DELETE FROM li WHERE id <= 250;
+VACUUM li0;                                  -- local-index leaf -> eager path
+SELECT count(*) AS drainq_after_local_idx FROM pg_spanning_drainq;   -- expect 0
+SELECT pg_drain_spanning_index('li_pkey'::regclass) AS retired;      -- expect 0
+INSERT INTO li SELECT g, g FROM generate_series(1, 250) g;           -- reinsert deleted
+SET enable_seqscan = off;
+SELECT count(*) AS li_index_rows FROM li0 WHERE v BETWEEN 1 AND 250;
+RESET enable_seqscan;
+SET enable_indexscan = off; SET enable_bitmapscan = off;
+SELECT count(*) AS li_seq_rows FROM li0 WHERE v BETWEEN 1 AND 250;
+RESET enable_indexscan; RESET enable_bitmapscan;
+DROP TABLE li CASCADE;
+DROP TABLE li_base;
+
+-- Dup-key churn against a spanning index must not crash: the heap-probing
+-- pre-split deletion passes are skipped for spanning indexes (their heapRel is
+-- the AM-less partitioned root).  Reaching the end without a crash is the test.
+CREATE TABLE ch_base (id bigint NOT NULL, pad text);
+CREATE TABLE ch (PRIMARY KEY (id)) INHERITS (ch_base) PARTITION BY RANGE (id);
+CREATE TABLE ch0 PARTITION OF ch FOR VALUES FROM (0) TO (100000)
+  WITH (autovacuum_enabled = false);
+DO $$
+BEGIN
+  FOR i IN 1..8 LOOP
+    INSERT INTO ch SELECT g, repeat('x', 40) FROM generate_series(1, 1000) g;
+    DELETE FROM ch WHERE id BETWEEN 1 AND 1000;
+  END LOOP;
+END $$;
+SELECT count(*) AS ch_survived FROM ch;
+DROP TABLE ch CASCADE;
+DROP TABLE ch_base;
+
 RESET spanning_defer_vacuum;

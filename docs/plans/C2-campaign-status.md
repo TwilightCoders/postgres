@@ -80,15 +80,28 @@ Full design: `docs/plans/C2-deferred-vacuum-DHR-design.md`. 5 increments.
   the ONLY new gate needed — on-access prune never marks LP_DEAD unused
   (pruneheap.c:263,374), PageAddItemExtended reuses only LP_UNUSED
   (bufpage.c:273); the drain is the sole reaper of spanning-leaf slots.**
-- **inc4 NEXT** — autovacuum `AVW_SpanningIndexDrain` work-item + launcher sweep;
-  `VACUUM <root>` end-of-command drain hook; failsafe skips enqueue (M2). M3
-  (don't bump num_index_scans) already done for the nindexes==0 path in inc2.
-- **inc5 IN PROGRESS** — committed regress (single/multi/reuse-trap/sibling),
-  isolation (drain vs DML / vs vacuum), TAP (crash between enqueue & drain),
-  perf characterization (N=4..64 buffer-hit collapse = the user's #1 proof).
-  Note: pre-drain reinsert of a deleted key SUCCEEDS (correct — `_bt_check_unique`
-  heap-liveness probe treats a stale-over-dead entry as non-conflict); the drain's
-  job is to retire the entry before its held slot can be reused.
+- **inc3a DONE** `aabfafa292` — fixed an AB-BA deadlock the adversarial review
+  caught (B1): the drain locked index-before-partition but the eager path locks
+  partition-before-index. Fix: drain now locks partitions (OID order) THEN the
+  index, matching the eager order; resolves partseqs via `…ByOid` (no index
+  lock); + recovery guard, try_table_open for vanishing partitions, VM/lock
+  comments. Review verdict otherwise: no other blockers; crash windows all
+  re-runnable; on-access prune never reaps held slots; memory/temp-horizon
+  concerns moot.
+- **inc5 (regress+perf) DONE** `f45787f780` — regress test `progresql_drain`
+  (single/multi/reuse-trap/sibling/idempotent/negative); perf characterization in
+  PRODUCTION_READINESS: per-leaf cost flat at 72 (deferred) vs 173..865 growing
+  (eager); sweep O(N²) 55,360 → O(N) ~5,401 at N=64 (~10×, widening). **The
+  user's #1 (kill O(N²)) is proven.** 239 tests green. Note: pre-drain reinsert
+  of a deleted key SUCCEEDS (correct — `_bt_check_unique` heap-liveness probe
+  treats a stale-over-dead entry as non-conflict); the drain's job is to retire
+  the entry before its held slot can be reused. Remaining inc5 hardening
+  (isolation specs + TAP crash test) tracked separately (task #27, deferred).
+- **inc4 IN PROGRESS** — make the drain automatic: autovacuum
+  `AVW_SpanningIndexDrain` work-item + handler; request from a leaf vacuum that
+  enqueued; `VACUUM <root>` end-of-command drain hook; launcher periodic sweep
+  (robust durability). Failsafe already skips enqueue (the failsafe lazy_vacuum
+  branch does no spanning work); M3 done in inc2.
 
 ## NEXT after E5 (priority order)
 2. **E2 / P0-2 — dump + `pg_upgrade`.** The ONE real silent-data-loss path:

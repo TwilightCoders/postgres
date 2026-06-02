@@ -2653,6 +2653,10 @@ perform_work_item(AutoVacuumWorkItem *workitem)
 									ObjectIdGetDatum(workitem->avw_relation),
 									Int64GetDatum((int64) workitem->avw_blockNumber));
 				break;
+			case AVW_SpanningIndexDrain:
+				/* ProgreSQL: coalesced drain of one spanning index's queue. */
+				progresql_drain_spanning_index(workitem->avw_relation);
+				break;
 			default:
 				elog(WARNING, "unrecognized work item found: type %d",
 					 workitem->avw_type);
@@ -3258,6 +3262,10 @@ autovac_report_workitem(AutoVacuumWorkItem *workitem,
 			snprintf(activity, MAX_AUTOVAC_ACTIV_LEN,
 					 "autovacuum: BRIN summarize");
 			break;
+		case AVW_SpanningIndexDrain:
+			snprintf(activity, MAX_AUTOVAC_ACTIV_LEN,
+					 "autovacuum: spanning index drain");
+			break;
 	}
 
 	/*
@@ -3304,6 +3312,29 @@ AutoVacuumRequestWork(AutoVacuumWorkItemType type, Oid relationId,
 	bool		result = false;
 
 	LWLockAcquire(AutovacuumLock, LW_EXCLUSIVE);
+
+	/*
+	 * Skip if an identical request is already pending: re-requesting the same
+	 * (type, relation, block) work would only waste a slot.  This matters for
+	 * the spanning-index drain, which every leaf vacuum of a partitioned tree
+	 * re-requests for the same root index; without dedup a single sweep could
+	 * exhaust the shared work-item array.  (BRIN range requests carry distinct
+	 * block numbers, so they are not collapsed.)
+	 */
+	for (i = 0; i < NUM_WORKITEMS; i++)
+	{
+		AutoVacuumWorkItem *workitem = &AutoVacuumShmem->av_workItems[i];
+
+		if (workitem->avw_used &&
+			workitem->avw_type == type &&
+			workitem->avw_database == MyDatabaseId &&
+			workitem->avw_relation == relationId &&
+			workitem->avw_blockNumber == blkno)
+		{
+			LWLockRelease(AutovacuumLock);
+			return true;
+		}
+	}
 
 	/*
 	 * Locate an unused work item and fill it with the given data.

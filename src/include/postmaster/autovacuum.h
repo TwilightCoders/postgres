@@ -23,6 +23,7 @@
 typedef enum
 {
 	AVW_BRINSummarizeRange,
+	AVW_SpanningIndexDrain,		/* ProgreSQL: coalesced spanning-index drain */
 } AutoVacuumWorkItemType;
 
 

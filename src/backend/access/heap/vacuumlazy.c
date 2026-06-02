@@ -163,6 +163,7 @@
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/read_stream.h"
+#include "utils/acl.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
@@ -2652,6 +2653,17 @@ progresql_enqueue_spanning_drain(LVRelState *vacrel)
 
 			SpanningDrainqEnqueue(idxRel, partseq, ndead);
 
+			/*
+			 * Nudge autovacuum to drain this spanning index soon (the work item
+			 * runs progresql_drain_spanning_index in an autovacuum worker).
+			 * Best-effort and deduplicated: the durable pg_spanning_drainq is the
+			 * source of truth, so a dropped or lost request only delays the drain
+			 * until the next leaf vacuum re-requests.
+			 */
+			AutoVacuumRequestWork(AVW_SpanningIndexDrain,
+								  RelationGetRelid(idxRel),
+								  InvalidBlockNumber);
+
 			index_close(idxRel, AccessShareLock);
 		}
 
@@ -2780,6 +2792,9 @@ spanning_drain_reap_partition(Relation rel, TidStore *dead,
 		OffsetNumber unused[MaxHeapTuplesPerPage];
 		int			nunused = 0;
 		Size		freespace = 0;
+
+		/* A heap page can hold at most MaxHeapTuplesPerPage line pointers. */
+		Assert(noff <= MaxHeapTuplesPerPage);
 
 		vacuum_delay_point(false);
 
@@ -3023,6 +3038,16 @@ pg_drain_spanning_index(PG_FUNCTION_ARGS)
 {
 	Oid			idxoid = PG_GETARG_OID(0);
 
+	/*
+	 * Must own the index, like brin_summarize_range and VACUUM: the drain does
+	 * WAL-logged index/heap rewrites and takes ShareUpdateExclusiveLock on
+	 * partitions, so it must not be callable by an unprivileged user.  (The
+	 * autovacuum path calls progresql_drain_spanning_index directly and is not
+	 * gated here.)
+	 */
+	if (!object_ownercheck(RelationRelationId, idxoid, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX, get_rel_name(idxoid));
+
 	PG_RETURN_INT64(progresql_drain_spanning_index(idxoid));
 }
 
@@ -3125,6 +3150,14 @@ lazy_vacuum(LVRelState *vacrel)
 			 * the heap's LP_DEAD items un-reaped --- the drain reaps them once it
 			 * has retired the matching spanning entries.  No index scan happens
 			 * here, so do not bump num_index_scans, and do not reap the heap.
+			 *
+			 * Deferral is intentionally confined to this nindexes == 0 path.
+			 * The drain reaps every LP_DEAD slot it finds; with no local index,
+			 * a slot's only index reference is the spanning index, which the
+			 * drain retires, so the reap is sound.  A leaf WITH local indexes
+			 * could have an LP_DEAD slot whose local-index entry is still live
+			 * (pruned on-access after this vacuum), and reaping it would orphan
+			 * that entry --- so local-index leaves keep the eager path below.
 			 */
 			progresql_enqueue_spanning_drain(vacrel);
 		}
@@ -3218,14 +3251,16 @@ lazy_vacuum(LVRelState *vacrel)
 		 * vacuuming.  dead_items is still populated here.  (We do not reap the
 		 * leaf heap in the bypass case, exactly as for a local index; the few
 		 * remaining LP_DEAD heap items wait for a later VACUUM.)
+		 *
+		 * DHR deferral is NOT used here: this branch is only reached when the
+		 * leaf has local indexes (nindexes > 0), and the coalesced drain reaps
+		 * every LP_DEAD slot, which would orphan a live LOCAL-index entry whose
+		 * slot was pruned after this vacuum.  Local-index leaves therefore always
+		 * use the eager path; deferral is restricted to no-local-index leaves
+		 * (the nindexes == 0 branch above).
 		 */
 		if (vacrel->has_spanning_index)
-		{
-			if (spanning_defer_vacuum)
-				progresql_enqueue_spanning_drain(vacrel);
-			else
-				progresql_vacuum_spanning_indexes(vacrel);
-		}
+			progresql_vacuum_spanning_indexes(vacrel);
 	}
 	else if (lazy_vacuum_all_indexes(vacrel))
 	{
@@ -3240,26 +3275,18 @@ lazy_vacuum(LVRelState *vacrel)
 		 * pointing at a slot that a later insert reuses.  dead_items is still
 		 * populated here.
 		 */
-		if (vacrel->has_spanning_index && spanning_defer_vacuum)
-		{
-			/*
-			 * DHR: defer spanning-entry retirement to a coalesced drain and do
-			 * NOT reap the heap here.  The local indexes were vacuumed above, so
-			 * their entries for these dead TIDs are gone, but the spanning index
-			 * still references the same heap slots until the drain runs --- so
-			 * the slots must stay LP_DEAD (un-reusable) until then.  The drain
-			 * retires the spanning entries and reaps the slots together.
-			 */
-			progresql_enqueue_spanning_drain(vacrel);
-		}
-		else
-		{
-			if (vacrel->has_spanning_index)
-				progresql_vacuum_spanning_indexes(vacrel);
+		/*
+		 * DHR deferral is NOT used here either: this branch runs only for leaves
+		 * with local indexes (nindexes > 0).  The coalesced drain reaps all
+		 * LP_DEAD slots, which would orphan a live local-index entry for a slot
+		 * pruned after this vacuum, so local-index leaves always retire spanning
+		 * entries eagerly (deferral is restricted to the nindexes == 0 branch).
+		 */
+		if (vacrel->has_spanning_index)
+			progresql_vacuum_spanning_indexes(vacrel);
 
-			/* Do related heap vacuuming now. */
-			lazy_vacuum_heap_rel(vacrel);
-		}
+		/* Do related heap vacuuming now. */
+		lazy_vacuum_heap_rel(vacrel);
 	}
 	else
 	{

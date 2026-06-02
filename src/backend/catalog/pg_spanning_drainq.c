@@ -102,24 +102,6 @@ SpanningDrainqEnqueue(Relation spanningIndex, int32 partseq, int64 ndead)
 }
 
 /*
- * SpanningDrainqHasPending
- *		Return true if (spanningIndexOid, partseq) currently has an un-drained
- *		queue row.  Point lookup via the SPANNINGDRAINQ syscache.
- *
- * This is the reap gate: a heap slot left LP_DEAD on behalf of a spanning index
- * must not be reaped to LP_UNUSED while its (index, partseq) still has pending
- * un-retired spanning entries, because the drain has not yet removed the index
- * entry that points at that slot.
- */
-bool
-SpanningDrainqHasPending(Oid spanningIndexOid, int32 partseq)
-{
-	return SearchSysCacheExists2(SPANNINGDRAINQ,
-								 ObjectIdGetDatum(spanningIndexOid),
-								 Int32GetDatum(partseq));
-}
-
-/*
  * SpanningDrainqListDirty
  *		Return the list of partseqs (as a List of int) that currently have
  *		pending un-drained rows for this spanning index.  This is the drain's

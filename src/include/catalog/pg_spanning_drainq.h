@@ -86,7 +86,6 @@ MAKE_SYSCACHE(SPANNINGDRAINQ, pg_spanning_drainq_idxid_seq_index, 16);
 
 extern void SpanningDrainqEnqueue(Relation spanningIndex, int32 partseq,
 								  int64 ndead);
-extern bool SpanningDrainqHasPending(Oid spanningIndexOid, int32 partseq);
 extern List *SpanningDrainqListDirty(Oid spanningIndexOid);
 extern void SpanningDrainqDeleteList(Oid spanningIndexOid, List *partseqs);
 extern void RemoveSpanningDrainqForIndex(Oid spanningIndexOid);
