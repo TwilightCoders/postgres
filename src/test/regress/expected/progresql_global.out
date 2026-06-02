@@ -93,9 +93,20 @@ ERROR:  GLOBAL index is only supported on partitioned tables
 CREATE TABLE pg_plain2 (id bigint);
 CREATE UNIQUE INDEX ON pg_plain2 (id) GLOBAL;                          -- ERROR: not partitioned
 ERROR:  GLOBAL index is only supported on partitioned tables
+-- Multi-level partitioning under a spanning index is rejected at DDL time:
+-- every partition must be a leaf (the partseq map keys leaves, not interior
+-- nodes).  This forbids the untested grandchild-leaf case by construction.
+CREATE TABLE pg_ml (id bigint NOT NULL, ts timestamptz NOT NULL, region text NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pg_ml_2024 PARTITION OF pg_ml
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')
+    PARTITION BY LIST (region);                                        -- ERROR: cannot sub-partition
+ERROR:  cannot sub-partition a partition of a table with a spanning (GLOBAL) index
+DETAIL:  Spanning index "pg_ml_pkey" does not support multi-level partitioning; every partition must be a leaf.
 -- Cleanup
 DROP TABLE pg_events;
 DROP TABLE pg_codes;
 DROP TABLE pg_sku;
 DROP TABLE pg_alt;
 DROP TABLE pg_plain2;
+DROP TABLE pg_ml;
