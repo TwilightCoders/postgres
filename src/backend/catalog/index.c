@@ -27,6 +27,7 @@
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
+#include "access/spanning.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/transam.h"

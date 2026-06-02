@@ -29,6 +29,7 @@
 #include "catalog/pg_index_partition.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
+#include "partitioning/partdesc.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -278,4 +279,113 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 	}
 
 	list_free(ancestors);
+}
+
+/*
+ * BuildSpanningIndexFromPartitions
+ *
+ * After creating a ProgreSQL spanning index on a partitioned root, populate
+ * it with entries for all existing tuples in all leaf child partitions.
+ * Without this step the spanning index is empty after ALTER TABLE ADD
+ * CONSTRAINT on a non-empty table, so cross-partition uniqueness checks
+ * miss pre-existing rows.
+ *
+ * For each live tuple in each partition we compute the index key
+ * (user_columns... + tableoid) via FormIndexDatum and call index_insert with
+ * UNIQUE_CHECK_YES so that pre-existing duplicates are caught.
+ */
+void
+BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
+{
+	Relation	idxRel;
+	IndexInfo  *idxInfo;
+	PartitionDesc partdesc;
+	Snapshot	snapshot;
+	int			pi;
+
+	idxRel = index_open(indexRelationId, RowExclusiveLock);
+	idxInfo = BuildIndexInfo(idxRel);
+
+	partdesc = RelationGetPartitionDesc(rel, true);
+
+	/*
+	 * Push the transaction snapshot as active so that heap visibility checks
+	 * inside table_scan_getnextslot (and the btree uniqueness check path) can
+	 * satisfy the snapshot active_count assertions.  DDL commands do not
+	 * push a snapshot automatically, so we must do it explicitly here.
+	 */
+	snapshot = GetTransactionSnapshot();
+	PushActiveSnapshot(snapshot);
+
+	for (pi = 0; pi < partdesc->nparts; pi++)
+	{
+		Oid			partOid = partdesc->oids[pi];
+		Relation	partRel;
+		TupleTableSlot *slot;
+		TableScanDesc scan;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+		int32		partseq;
+
+		partRel = table_open(partOid, AccessShareLock);
+
+		/*
+		 * Spanning indexes do not support multi-level partitioning: partdesc
+		 * holds only the root's DIRECT partitions, so a sub-partitioned child's
+		 * grandchild leaves are never visited here --- they would silently be
+		 * omitted from the index (their rows unenforced for uniqueness) and
+		 * could never get a partseq.  Reject it at build time rather than
+		 * corrupt-by-omission.
+		 */
+		if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot create a spanning (GLOBAL) index on a multi-level partitioned table"),
+					 errdetail("Partition \"%s\" is itself partitioned; spanning indexes require every partition to be a leaf.",
+							   RelationGetRelationName(partRel))));
+
+		/*
+		 * ProgreSQL C1: this partition's index-local partseq (get-or-allocate;
+		 * stable across rebuilds).  It is the trailing discriminator stored in
+		 * each spanning index entry below.
+		 */
+		partseq = SpanningGetOrAllocPartseq(idxRel, partOid);
+
+		slot = table_slot_create(partRel, NULL);
+		scan = table_beginscan(partRel, GetActiveSnapshot(), 0, NULL);
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			int			k;
+
+			FormIndexDatum(idxInfo, slot, NULL, values, isnull);
+
+			/*
+			 * The trailing key column is this partition's index-local
+			 * partseq, the stable discriminator that resolves back to the
+			 * partition via pg_index_partition.
+			 */
+			k = idxInfo->ii_NumIndexKeyAttrs - 1;
+			values[k] = Int32GetDatum(partseq);
+			isnull[k] = false;
+
+			/*
+			 * Pass rel (the partitioned root) as heapRelation, not partRel.
+			 * The root has rd_tableam == NULL, which signals nbtinsert.c to
+			 * skip the heap-liveness deletion passes (_bt_simpledel_pass and
+			 * _bt_bottomupdel_pass) that cannot safely process TIDs spread
+			 * across multiple partitions.
+			 */
+			index_insert(idxRel, values, isnull, &slot->tts_tid,
+						 rel, UNIQUE_CHECK_YES, false, idxInfo);
+		}
+
+		table_endscan(scan);
+		ExecDropSingleTupleTableSlot(slot);
+		table_close(partRel, AccessShareLock);
+	}
+
+	PopActiveSnapshot();
+
+	index_close(idxRel, RowExclusiveLock);
 }

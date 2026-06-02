@@ -37,14 +37,6 @@ extern ObjectAddress DefineIndex(Oid tableId,
 								 bool skip_build,
 								 bool quiet);
 extern void ExecReindex(ParseState *pstate, const ReindexStmt *stmt, bool isTopLevel);
-
-/*
- * ProgreSQL: populate a spanning index on a partitioned root by scanning
- * all leaf partitions and inserting their (user_columns..., tableoid)
- * keys with UNIQUE_CHECK_YES.  Used during initial creation (CREATE TABLE,
- * ALTER TABLE ADD CONSTRAINT) and after REINDEX rebuilds the empty index.
- */
-extern void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
 extern char *makeObjectName(const char *name1, const char *name2,
 							const char *label);
 extern char *ChooseRelationName(const char *name1, const char *name2,

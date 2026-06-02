@@ -29,5 +29,6 @@ extern void ProgresqlReleasePartitionCache(EState *estate);
 extern void progresql_clean_spanning_indexes_for_partition(Relation partRel,
 														   bool drop_map);
 extern void progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel);
+extern void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
 
 #endif							/* SPANNING_H */
