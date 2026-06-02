@@ -83,6 +83,14 @@ bool		track_cost_delay_timing;
 bool		vacuum_truncate;
 
 /*
+ * ProgreSQL: when on, leaf-partition VACUUM defers retirement of a spanning
+ * index's dead entries to a coalesced background drain (DHR) instead of
+ * scanning the whole spanning index once per leaf (which is O(N^2) per sweep).
+ * Default off preserves the eager behavior.
+ */
+bool		spanning_defer_vacuum = false;
+
+/*
  * Variables for cost-based vacuum delay. The defaults differ between
  * autovacuum and vacuum. They should be set with the appropriate GUC value in
  * vacuum code. They are initialized here to the defaults for client backends

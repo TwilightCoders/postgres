@@ -145,6 +145,7 @@
 #include "catalog/partition.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_index_partition.h"
+#include "catalog/pg_spanning_drainq.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
@@ -459,6 +460,7 @@ static bool lazy_scan_noprune(LVRelState *vacrel, Buffer buf,
 static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
 static void progresql_vacuum_spanning_indexes(LVRelState *vacrel);
+static void progresql_enqueue_spanning_drain(LVRelState *vacrel);
 static bool progresql_rel_has_spanning_ancestor(Relation rel);
 static bool spanning_tid_reaped(ItemPointer tid, void *state);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
@@ -2588,6 +2590,76 @@ progresql_vacuum_spanning_indexes(LVRelState *vacrel)
 }
 
 /*
+ * progresql_enqueue_spanning_drain
+ *
+ * DHR enqueue path (spanning_defer_vacuum on): instead of eagerly scanning each
+ * ancestor spanning index to retire this leaf's dead entries --- a full index
+ * scan per leaf, O(N^2) across a sweep --- record one durable pg_spanning_drainq
+ * row per (spanning index, partseq) saying "this partition has pending dead
+ * entries", and leave the heap's LP_DEAD line pointers un-reaped.  A later
+ * coalesced drain scans each spanning index once, retires all queued partitions'
+ * entries, and only then reaps the now-safe LP_DEAD slots.
+ *
+ * This does NOT open or scan the spanning btree: it takes only AccessShareLock
+ * on the index (to read its relcache entry and resolve partseq via the syscache)
+ * and writes the queue catalog.  O(#ancestor spanning indexes) per leaf vacuum.
+ * The matching heap reap is suppressed by the caller (the LP_DEAD slots stay
+ * un-reusable until the drain runs), which is what makes the deferral safe.
+ */
+static void
+progresql_enqueue_spanning_drain(LVRelState *vacrel)
+{
+	Oid			partOid = RelationGetRelid(vacrel->rel);
+	int64		ndead = vacrel->dead_items_info->num_items;
+	List	   *ancestors = get_partition_ancestors(partOid);
+	ListCell   *lc;
+
+	foreach(lc, ancestors)
+	{
+		Oid			parentOid = lfirst_oid(lc);
+		Relation	parentRel;
+		List	   *indexoidlist;
+		ListCell   *il;
+
+		parentRel = table_open(parentOid, AccessShareLock);
+		indexoidlist = RelationGetIndexList(parentRel);
+
+		foreach(il, indexoidlist)
+		{
+			Oid			indexOid = lfirst_oid(il);
+			Relation	idxRel;
+			int32		partseq;
+
+			idxRel = index_open(indexOid, AccessShareLock);
+
+			/* Only spanning indexes. */
+			if (!RelationIsSpanning(idxRel))
+			{
+				index_close(idxRel, AccessShareLock);
+				continue;
+			}
+
+			/* Resolve partseq; skip if this partition is not in the map. */
+			partseq = SpanningLookupPartseqByRelid(idxRel, partOid);
+			if (partseq < 0)
+			{
+				index_close(idxRel, AccessShareLock);
+				continue;
+			}
+
+			SpanningDrainqEnqueue(idxRel, partseq, ndead);
+
+			index_close(idxRel, AccessShareLock);
+		}
+
+		list_free(indexoidlist);
+		table_close(parentRel, AccessShareLock);
+	}
+
+	list_free(ancestors);
+}
+
+/*
  * progresql_rel_has_spanning_ancestor
  *
  * True if rel is a partition whose ancestor (root) carries at least one
@@ -2678,10 +2750,24 @@ lazy_vacuum(LVRelState *vacrel)
 	if (vacrel->nindexes == 0)
 	{
 		Assert(vacrel->has_spanning_index);
-		progresql_vacuum_spanning_indexes(vacrel);
-		/* count this as an index-vacuuming round for lazy_vacuum_heap_rel */
-		vacrel->num_index_scans++;
-		lazy_vacuum_heap_rel(vacrel);
+		if (spanning_defer_vacuum)
+		{
+			/*
+			 * DHR: enqueue this partition's dead entries for a later coalesced
+			 * drain instead of scanning the whole spanning index now, and leave
+			 * the heap's LP_DEAD items un-reaped --- the drain reaps them once it
+			 * has retired the matching spanning entries.  No index scan happens
+			 * here, so do not bump num_index_scans, and do not reap the heap.
+			 */
+			progresql_enqueue_spanning_drain(vacrel);
+		}
+		else
+		{
+			progresql_vacuum_spanning_indexes(vacrel);
+			/* count this as an index-vacuuming round for lazy_vacuum_heap_rel */
+			vacrel->num_index_scans++;
+			lazy_vacuum_heap_rel(vacrel);
+		}
 		dead_items_reset(vacrel);
 		return;
 	}
@@ -2767,7 +2853,12 @@ lazy_vacuum(LVRelState *vacrel)
 		 * remaining LP_DEAD heap items wait for a later VACUUM.)
 		 */
 		if (vacrel->has_spanning_index)
-			progresql_vacuum_spanning_indexes(vacrel);
+		{
+			if (spanning_defer_vacuum)
+				progresql_enqueue_spanning_drain(vacrel);
+			else
+				progresql_vacuum_spanning_indexes(vacrel);
+		}
 	}
 	else if (lazy_vacuum_all_indexes(vacrel))
 	{
@@ -2782,11 +2873,26 @@ lazy_vacuum(LVRelState *vacrel)
 		 * pointing at a slot that a later insert reuses.  dead_items is still
 		 * populated here.
 		 */
-		if (vacrel->has_spanning_index)
-			progresql_vacuum_spanning_indexes(vacrel);
+		if (vacrel->has_spanning_index && spanning_defer_vacuum)
+		{
+			/*
+			 * DHR: defer spanning-entry retirement to a coalesced drain and do
+			 * NOT reap the heap here.  The local indexes were vacuumed above, so
+			 * their entries for these dead TIDs are gone, but the spanning index
+			 * still references the same heap slots until the drain runs --- so
+			 * the slots must stay LP_DEAD (un-reusable) until then.  The drain
+			 * retires the spanning entries and reaps the slots together.
+			 */
+			progresql_enqueue_spanning_drain(vacrel);
+		}
+		else
+		{
+			if (vacrel->has_spanning_index)
+				progresql_vacuum_spanning_indexes(vacrel);
 
-		/* Do related heap vacuuming now. */
-		lazy_vacuum_heap_rel(vacrel);
+			/* Do related heap vacuuming now. */
+			lazy_vacuum_heap_rel(vacrel);
+		}
 	}
 	else
 	{

@@ -83,6 +83,9 @@ DECLARE_UNIQUE_INDEX_PKEY(pg_spanning_drainq_idxid_seq_index, 564, SpanningDrain
 
 MAKE_SYSCACHE(SPANNINGDRAINQ, pg_spanning_drainq_idxid_seq_index, 16);
 
+extern void SpanningDrainqEnqueue(Relation spanningIndex, int32 partseq,
+								  int64 ndead);
+extern bool SpanningDrainqHasPending(Oid spanningIndexOid, int32 partseq);
 extern void RemoveSpanningDrainqForIndex(Oid spanningIndexOid);
 
 #endif							/* PG_SPANNING_DRAINQ_H */

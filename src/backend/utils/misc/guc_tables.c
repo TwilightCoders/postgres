@@ -2151,6 +2151,17 @@ struct config_bool ConfigureNamesBool[] =
 		true,
 		NULL, NULL, NULL
 	},
+	{
+		{"spanning_defer_vacuum", PGC_USERSET, VACUUM_DEFAULT,
+			gettext_noop("Defers spanning-index vacuuming into a coalesced background drain."),
+			gettext_noop("When on, leaf-partition VACUUM enqueues a cross-partition "
+						 "spanning index's dead entries for a single coalesced drain "
+						 "instead of scanning the whole spanning index once per leaf."),
+		},
+		&spanning_defer_vacuum,
+		false,
+		NULL, NULL, NULL
+	},
 
 	/* End-of-list marker */
 	{

@@ -28,9 +28,96 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_spanning_drainq.h"
 #include "utils/fmgroids.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+
+/*
+ * SpanningDrainqEnqueue
+ *		Record that partseq P of spanningIndex has ndead newly-dead heap entries
+ *		pending a coalesced drain.  UPSERT on the (sdq_idxid, sdq_partseq) key:
+ *		if the row already exists, accumulate sdq_ndead in place; otherwise insert
+ *		a fresh row witnessed by this (vacuum) transaction's xid.
+ *
+ * The pre-existing row always carries the OLDER enqueue witness --- it was
+ * written by a strictly earlier transaction (a partition maps to one partseq and
+ * is vacuumed by one transaction at a time, so re-enqueue of the same
+ * (index, partseq) only happens in a later run) --- so we deliberately leave
+ * sdq_enqueue_xid untouched on update: it is already the oldest, which is exactly
+ * the age signal the drain trigger wants.
+ *
+ * Caller holds at least AccessShareLock on spanningIndex (to read its relcache
+ * entry / partseq); the RowExclusiveLock taken here on the queue catalog plus the
+ * unique PK index serialize concurrent enqueues, and different partitions of the
+ * same root touch different rows so they do not conflict.  Forces assignment of a
+ * top-level xid (this is a catalog write, which needs one anyway), making that
+ * xid the durable witness for the LP_DEAD marks this vacuum produced.
+ */
+void
+SpanningDrainqEnqueue(Relation spanningIndex, int32 partseq, int64 ndead)
+{
+	Oid			spanningIndexOid = RelationGetRelid(spanningIndex);
+	Relation	catalog;
+	HeapTuple	tup;
+
+	Assert(RelationIsSpanning(spanningIndex));
+	Assert(partseq >= 0);
+
+	catalog = table_open(SpanningDrainqRelationId, RowExclusiveLock);
+
+	tup = SearchSysCacheCopy2(SPANNINGDRAINQ,
+							  ObjectIdGetDatum(spanningIndexOid),
+							  Int32GetDatum(partseq));
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_spanning_drainq form = (Form_pg_spanning_drainq) GETSTRUCT(tup);
+
+		/* Accumulate the dead count; keep the (older) existing witness xid. */
+		form->sdq_ndead += ndead;
+		CatalogTupleUpdate(catalog, &tup->t_self, tup);
+		heap_freetuple(tup);
+	}
+	else
+	{
+		Datum		values[Natts_pg_spanning_drainq];
+		bool		nulls[Natts_pg_spanning_drainq];
+
+		memset(nulls, 0, sizeof(nulls));
+		values[Anum_pg_spanning_drainq_sdq_idxid - 1] =
+			ObjectIdGetDatum(spanningIndexOid);
+		values[Anum_pg_spanning_drainq_sdq_partseq - 1] = Int32GetDatum(partseq);
+		values[Anum_pg_spanning_drainq_sdq_enqueue_xid - 1] =
+			TransactionIdGetDatum(GetTopTransactionId());
+		values[Anum_pg_spanning_drainq_sdq_ndead - 1] = Int64GetDatum(ndead);
+
+		tup = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
+		CatalogTupleInsert(catalog, tup);
+		heap_freetuple(tup);
+	}
+
+	table_close(catalog, RowExclusiveLock);
+}
+
+/*
+ * SpanningDrainqHasPending
+ *		Return true if (spanningIndexOid, partseq) currently has an un-drained
+ *		queue row.  Point lookup via the SPANNINGDRAINQ syscache.
+ *
+ * This is the reap gate: a heap slot left LP_DEAD on behalf of a spanning index
+ * must not be reaped to LP_UNUSED while its (index, partseq) still has pending
+ * un-retired spanning entries, because the drain has not yet removed the index
+ * entry that points at that slot.
+ */
+bool
+SpanningDrainqHasPending(Oid spanningIndexOid, int32 partseq)
+{
+	return SearchSysCacheExists2(SPANNINGDRAINQ,
+								 ObjectIdGetDatum(spanningIndexOid),
+								 Int32GetDatum(partseq));
+}
 
 /*
  * RemoveSpanningDrainqForIndex
