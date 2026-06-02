@@ -150,6 +150,18 @@ BEGIN;
 INSERT INTO pgddl_data VALUES (21, 'dup-post-attach', '2025-10-01 00:00:00+00');
 ROLLBACK;
 
+-- ATTACH of a partition whose rows would violate the spanning constraint must
+-- be REJECTED: the backfill inserts with UNIQUE_CHECK_YES, so a pre-existing
+-- cross-partition duplicate (here id=21, already live above) fails the ATTACH.
+CREATE TABLE pgddl_dupatt (id bigint NOT NULL, kind text, ts timestamptz NOT NULL,
+    CONSTRAINT pgddl_dupatt_pkey PRIMARY KEY (id));
+INSERT INTO pgddl_dupatt VALUES (21, 'conflicts', '2027-03-01 00:00:00+00');
+ALTER TABLE pgddl_data ATTACH PARTITION pgddl_dupatt
+    FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');  -- expect ERROR (dup id=21)
+-- The failed ATTACH left pgddl_dupatt standalone (not a partition).
+SELECT count(*) AS still_one FROM pgddl_data WHERE id = 21;  -- 1
+DROP TABLE pgddl_dupatt;
+
 -- Section 6: abort-safety of partition-lifecycle cleanup
 -- DETACH/DROP/TRUNCATE retire a partition's spanning entries by marking them
 -- LP_DEAD, a NON-transactional page hint.  The marking is therefore deferred
