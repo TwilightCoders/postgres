@@ -1,0 +1,52 @@
+-- P0 regression: HOT updates must not corrupt a spanning index.
+--
+-- A spanning (GLOBAL) index lives on the partitioned ROOT; a leaf partition has
+-- no LOCAL index on the spanning-key columns.  Without special handling, an
+-- UPDATE that changes a spanning-key column on a leaf would be treated as
+-- HOT-eligible (the leaf's own index set does not mention the column), and a HOT
+-- update does not maintain indexes -- leaving a stale spanning-index entry whose
+-- TID is still a live heap chain.  That stale entry is a permanent false
+-- cross-partition uniqueness conflict that vacuum can never reclaim.
+--
+-- The fix makes the spanning index's key columns HOT-blocking on the leaf, so a
+-- spanning-key change is a non-HOT update: the old tuple dies normally and its
+-- spanning entry becomes reclaimable.  These tests assert the *behavior* (no
+-- false conflicts, no lost conflicts) rather than the HOT counter, so they are
+-- stable regardless of pruning timing.
+
+CREATE TABLE hot_span (id bigint, code text, ts timestamptz NOT NULL,
+    UNIQUE (code) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE hot_span_a PARTITION OF hot_span
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE hot_span_b PARTITION OF hot_span
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- In-place spanning-key UPDATE within a partition (the HOT-eligible shape).
+INSERT INTO hot_span VALUES (1, 'a', '2024-06-01');
+UPDATE hot_span SET code = 'b' WHERE id = 1;
+
+-- The freed key 'a' must be re-insertable in a sibling partition (no live 'a').
+-- Before the fix this was wrongly rejected by a stale spanning entry.
+INSERT INTO hot_span VALUES (2, 'a', '2025-06-01');   -- must SUCCEED
+-- The new key 'b' is live, so a cross-partition duplicate must be rejected.
+INSERT INTO hot_span VALUES (3, 'b', '2025-06-01');   -- must ERROR
+
+-- A chain of in-place key changes p -> q -> r: p and q become free, r is live.
+INSERT INTO hot_span VALUES (10, 'p', '2024-03-01');
+UPDATE hot_span SET code = 'q' WHERE id = 10;
+UPDATE hot_span SET code = 'r' WHERE id = 10;
+INSERT INTO hot_span VALUES (11, 'p', '2025-03-01');  -- must SUCCEED (p freed)
+INSERT INTO hot_span VALUES (12, 'q', '2025-03-01');  -- must SUCCEED (q freed)
+INSERT INTO hot_span VALUES (13, 'r', '2025-03-01');  -- must ERROR (r live)
+
+-- After VACUUM the stale entries are physically gone; behavior is unchanged.
+VACUUM hot_span_a;
+INSERT INTO hot_span VALUES (20, 'a2', '2024-08-01');
+UPDATE hot_span SET code = 'b2' WHERE id = 20;
+VACUUM hot_span_a;
+INSERT INTO hot_span VALUES (21, 'a2', '2025-08-01');  -- must SUCCEED (a2 freed)
+INSERT INTO hot_span VALUES (22, 'b2', '2025-08-01');  -- must ERROR (b2 live)
+
+SELECT id, code, tableoid::regclass FROM hot_span ORDER BY id;
+
+DROP TABLE hot_span;
