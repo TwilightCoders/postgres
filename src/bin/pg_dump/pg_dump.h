@@ -426,6 +426,10 @@ typedef struct _indxInfo
 	char	   *indstatvals;	/* statistic values for columns */
 	int			indnkeyattrs;	/* number of index key attributes */
 	int			indnattrs;		/* total number of index attributes */
+	int			indnuniqattrs;	/* ProgreSQL: spanning index's user-key column
+								 * count (0 = not spanning); the trailing
+								 * discriminator key column is clipped and a GLOBAL
+								 * marker emitted when this is > 0 */
 	Oid		   *indkeys;		/* In spite of the name 'indkeys' this field
 								 * contains both key and nonkey attributes */
 	bool		indisclustered;

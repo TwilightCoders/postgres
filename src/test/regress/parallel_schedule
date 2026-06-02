@@ -127,6 +127,7 @@ test: partition_join partition_prune reloptions hash_part indexing partition_agg
 # progresql_drain runs serially: it queries the global pg_spanning_drainq catalog
 # and toggles spanning_defer_vacuum, so it must not overlap other vacuum tests.
 test: progresql_drain
+test: progresql_dumpdef
 
 # ----------
 # Another group of parallel tests (compression)

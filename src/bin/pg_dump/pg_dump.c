@@ -7701,6 +7701,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 				i_indexdef,
 				i_indnkeyatts,
 				i_indnatts,
+				i_indnuniqatts,
 				i_indkey,
 				i_indisclustered,
 				i_indisreplident,
@@ -7810,6 +7811,19 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 		appendPQExpBufferStr(query,
 							 "false AS indnullsnotdistinct, ");
 
+	/*
+	 * ProgreSQL: indnuniqatts marks a spanning index and gives its user-key
+	 * column count.  It is a fork extension to pg_index; this fork's pg_dump
+	 * targets this fork's servers (also version 180000), so select it there and
+	 * default to 0 for older servers.
+	 */
+	if (fout->remoteVersion >= 180000)
+		appendPQExpBufferStr(query,
+							 "i.indnuniqatts AS indnuniqatts, ");
+	else
+		appendPQExpBufferStr(query,
+							 "0 AS indnuniqatts, ");
+
 	if (fout->remoteVersion >= 180000)
 		appendPQExpBufferStr(query,
 							 "c.conperiod ");
@@ -7879,6 +7893,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	i_indexdef = PQfnumber(res, "indexdef");
 	i_indnkeyatts = PQfnumber(res, "indnkeyatts");
 	i_indnatts = PQfnumber(res, "indnatts");
+	i_indnuniqatts = PQfnumber(res, "indnuniqatts");
 	i_indkey = PQfnumber(res, "indkey");
 	i_indisclustered = PQfnumber(res, "indisclustered");
 	i_indisreplident = PQfnumber(res, "indisreplident");
@@ -7959,6 +7974,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 			indxinfo[j].indexdef = pg_strdup(PQgetvalue(res, j, i_indexdef));
 			indxinfo[j].indnkeyattrs = atoi(PQgetvalue(res, j, i_indnkeyatts));
 			indxinfo[j].indnattrs = atoi(PQgetvalue(res, j, i_indnatts));
+			indxinfo[j].indnuniqattrs = atoi(PQgetvalue(res, j, i_indnuniqatts));
 			indxinfo[j].tablespace = pg_strdup(PQgetvalue(res, j, i_tablespace));
 			indxinfo[j].indreloptions = pg_strdup(PQgetvalue(res, j, i_indreloptions));
 			indxinfo[j].indstatcols = pg_strdup(PQgetvalue(res, j, i_indstatcols));
@@ -18389,6 +18405,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		/* Index-related constraint */
 		IndxInfo   *indxinfo;
 		int			k;
+		int			keymax;
 
 		indxinfo = (IndxInfo *) findObjectByDumpId(coninfo->conindex);
 
@@ -18424,7 +18441,18 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 			if (indxinfo->indnullsnotdistinct && coninfo->contype != 'p')
 				appendPQExpBufferStr(q, " NULLS NOT DISTINCT");
 			appendPQExpBufferStr(q, " (");
-			for (k = 0; k < indxinfo->indnkeyattrs; k++)
+
+			/*
+			 * ProgreSQL spanning constraint: emit only the indnuniqattrs leading
+			 * user-key columns, clipping the trailing discriminator key column.
+			 * It is re-derived by GLOBAL, so it must not appear here, or the
+			 * restored PRIMARY KEY/UNIQUE would be a plain constraint over
+			 * (user_cols, discriminator) and silently lose cross-partition
+			 * uniqueness.  Non-spanning indexes keep the full indnkeyattrs count.
+			 */
+			keymax = (indxinfo->indnuniqattrs > 0) ?
+				indxinfo->indnuniqattrs : indxinfo->indnkeyattrs;
+			for (k = 0; k < keymax; k++)
 			{
 				int			indkey = (int) indxinfo->indkeys[k];
 				const char *attname;
@@ -18472,6 +18500,14 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 				if (coninfo->condeferred)
 					appendPQExpBufferStr(q, " INITIALLY DEFERRED");
 			}
+
+			/*
+			 * ProgreSQL: emit the GLOBAL marker so the restored constraint is a
+			 * spanning (cross-partition) one, re-deriving the discriminator
+			 * column clipped from the key list above.
+			 */
+			if (indxinfo->indnuniqattrs > 0)
+				appendPQExpBufferStr(q, " GLOBAL");
 
 			appendPQExpBufferStr(q, ";\n");
 		}

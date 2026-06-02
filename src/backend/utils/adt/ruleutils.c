@@ -354,7 +354,8 @@ static char *pg_get_viewdef_worker(Oid viewoid,
 								   int prettyFlags, int wrapColumn);
 static char *pg_get_triggerdef_worker(Oid trigid, bool pretty);
 static int	decompile_column_index_array(Datum column_index_array, Oid relId,
-										 bool withPeriod, StringInfo buf);
+										 bool withPeriod, int maxcols,
+										 StringInfo buf);
 static char *pg_get_ruledef_worker(Oid ruleoid, int prettyFlags);
 static char *pg_get_indexdef_worker(Oid indexrelid, int colno,
 									const Oid *excludeOps,
@@ -1402,6 +1403,16 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 		Oid			keycolcollation;
 
 		/*
+		 * ProgreSQL spanning index: omit the trailing discriminator key column
+		 * (the system column appended after the indnuniqatts user key columns).
+		 * It is not user-written --- CREATE ... GLOBAL re-derives it --- so it
+		 * must not appear in the dumped definition, or a restore would build a
+		 * plain index and silently lose cross-partition uniqueness.
+		 */
+		if (idxrec->indnuniqatts > 0 && keyno == idxrec->indnuniqatts)
+			continue;
+
+		/*
 		 * Ignore non-key attributes if told to.
 		 */
 		if (keysOnly && keyno >= idxrec->indnkeyatts)
@@ -1565,6 +1576,15 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 			else
 				appendStringInfo(&buf, " WHERE %s", str);
 		}
+
+		/*
+		 * ProgreSQL spanning index: emit the GLOBAL marker (last, after any
+		 * WHERE clause, matching the grammar) so replaying this CREATE INDEX
+		 * recreates a spanning index --- re-deriving the trailing discriminator
+		 * column clipped from the key list above.
+		 */
+		if (idxrec->indnuniqatts > 0 && !isConstraint && colno == 0)
+			appendStringInfoString(&buf, " GLOBAL");
 	}
 
 	/* Clean up */
@@ -2198,6 +2218,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 	StringInfoData buf;
 	SysScanDesc scandesc;
 	ScanKeyData scankey[1];
+	bool		spanning_constraint = false;	/* ProgreSQL: emit GLOBAL marker */
 	Snapshot	snapshot = RegisterSnapshot(GetTransactionSnapshot());
 	Relation	relation = table_open(ConstraintRelationId, AccessShareLock);
 
@@ -2277,7 +2298,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 											 Anum_pg_constraint_conkey);
 
 				/* If it is a temporal foreign key then it uses PERIOD. */
-				decompile_column_index_array(val, conForm->conrelid, conForm->conperiod, &buf);
+				decompile_column_index_array(val, conForm->conrelid, conForm->conperiod, 0, &buf);
 
 				/* add foreign relation name */
 				appendStringInfo(&buf, ") REFERENCES %s(",
@@ -2288,7 +2309,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				val = SysCacheGetAttrNotNull(CONSTROID, tup,
 											 Anum_pg_constraint_confkey);
 
-				decompile_column_index_array(val, conForm->confrelid, conForm->conperiod, &buf);
+				decompile_column_index_array(val, conForm->confrelid, conForm->conperiod, 0, &buf);
 
 				appendStringInfoChar(&buf, ')');
 
@@ -2374,7 +2395,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				if (!isnull)
 				{
 					appendStringInfoString(&buf, " (");
-					decompile_column_index_array(val, conForm->conrelid, false, &buf);
+					decompile_column_index_array(val, conForm->conrelid, false, 0, &buf);
 					appendStringInfoChar(&buf, ')');
 				}
 
@@ -2386,6 +2407,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				Datum		val;
 				Oid			indexId;
 				int			keyatts;
+				int16		nuniqatts;
 				HeapTuple	indtup;
 
 				/* Start off the constraint definition */
@@ -2403,13 +2425,23 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 					((Form_pg_index) GETSTRUCT(indtup))->indnullsnotdistinct)
 					appendStringInfoString(&buf, "NULLS NOT DISTINCT ");
 
+				/*
+				 * ProgreSQL spanning constraint: indnuniqatts > 0 means the
+				 * conkey ends with a discriminator column to clip from the
+				 * rendered key list, and the GLOBAL marker must be emitted.
+				 */
+				nuniqatts = ((Form_pg_index) GETSTRUCT(indtup))->indnuniqatts;
+				if (nuniqatts > 0)
+					spanning_constraint = true;
+
 				appendStringInfoChar(&buf, '(');
 
 				/* Fetch and build target column list */
 				val = SysCacheGetAttrNotNull(CONSTROID, tup,
 											 Anum_pg_constraint_conkey);
 
-				keyatts = decompile_column_index_array(val, conForm->conrelid, false, &buf);
+				keyatts = decompile_column_index_array(val, conForm->conrelid, false,
+													   nuniqatts, &buf);
 				if (conForm->conperiod)
 					appendStringInfoString(&buf, " WITHOUT OVERLAPS");
 
@@ -2604,6 +2636,15 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 	else if (!conForm->convalidated)
 		appendStringInfoString(&buf, " NOT VALID");
 
+	/*
+	 * ProgreSQL: emit the GLOBAL marker last (after the constraint attributes,
+	 * matching the grammar) so replaying this PRIMARY KEY / UNIQUE definition
+	 * recreates a spanning constraint rather than a plain one over the clipped
+	 * columns.
+	 */
+	if (spanning_constraint)
+		appendStringInfoString(&buf, " GLOBAL");
+
 	/* Cleanup */
 	systable_endscan(scandesc);
 	table_close(relation, AccessShareLock);
@@ -2619,17 +2660,27 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
  */
 static int
 decompile_column_index_array(Datum column_index_array, Oid relId,
-							 bool withPeriod, StringInfo buf)
+							 bool withPeriod, int maxcols, StringInfo buf)
 {
 	Datum	   *keys;
 	int			nKeys;
+	int			nRender;
 	int			j;
 
 	/* Extract data from array of int16 */
 	deconstruct_array_builtin(DatumGetArrayTypeP(column_index_array), INT2OID,
 							  &keys, NULL, &nKeys);
 
-	for (j = 0; j < nKeys; j++)
+	/*
+	 * ProgreSQL: a spanning constraint's conkey ends with the trailing
+	 * discriminator column; maxcols (= the index's indnuniqatts) clips it from
+	 * the rendered list.  We still RETURN the full count so the caller's INCLUDE
+	 * arithmetic starts past the discriminator and never emits it.  maxcols <= 0
+	 * means render everything (the non-spanning default).
+	 */
+	nRender = (maxcols > 0 && maxcols < nKeys) ? maxcols : nKeys;
+
+	for (j = 0; j < nRender; j++)
 	{
 		char	   *colName;
 
