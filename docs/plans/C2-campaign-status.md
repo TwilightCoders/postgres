@@ -140,7 +140,22 @@ cross-partition-PK case) — see BLK-2 below.
   could batch); MIN-2 (proactively clear drainq on partition DROP/DETACH);
   MIN-4 (drain skips pending-FSM page recycle); MIN-5 (`retired` counts TIDs).
 
-## NEXT after E5 (priority order)
+## E2 / P0-2 — DONE `c1c7fee4ef` (the silent-data-loss path, fixed + tested)
+pg_dump emitted spanning indexes/constraints with the trailing discriminator
+exposed (`PRIMARY KEY (city_id, tableoid)`), so restore/upgrade rebuilt a PLAIN
+index → cross-partition uniqueness silently lost. Fix (Option A1): ruleutils
+(`pg_get_indexdef`/`pg_get_constraintdef`) and pg_dump (`dumpConstraint`, which
+builds PK/UNIQUE itself) now clip the discriminator + emit `GLOBAL`;
+`decompile_column_index_array` got a `maxcols` arg (render clipped, return full
+so INCLUDE math still skips the discriminator); pg_dump learns `indnuniqatts`
+(new IndxInfo field + getIndexes column, fork servers >=180000). Verified:
+dumped+restored DB rejects a cross-partition dup the original rejected; regress
+`progresql_dumpdef` (240 tests). Follow-ups (NOT data-loss): pg_dump|psql +
+pg_upgrade TAP tests; psql `\d` spanning annotation (P2-2). Note the pg_dump
+query gates indnuniqatts at remoteVersion>=180000 — fork pg_dump targets fork
+servers (vanilla-18 dump would need a feature probe; documented).
+
+## NEXT after E2 (priority order)
 2. **E2 / P0-2 — dump + `pg_upgrade`.** The ONE real silent-data-loss path:
    `pg_get_indexdef` (ruleutils.c ~1398 loop over `indnatts`) emits the trailing
    discriminator → logical restore silently downgrades to a plain index. Fix:
