@@ -2551,13 +2551,19 @@ progresql_vacuum_spanning_indexes(LVRelState *vacrel)
 			}
 
 			/*
-			 * The spanning index's "table" is the partitioned root.  It has no
-			 * table AM (storage-less), but it is a valid relation; the btree
-			 * vacuum only uses heaprel for the page-recycle visibility test
-			 * (GlobalVisCheckRemovableFullXid), which works fine with it.
+			 * heaprel is used by btree vacuum for the page-recycle visibility
+			 * test (BTPageIsRecyclable -> GlobalVisCheckRemovableFullXid ->
+			 * GlobalVisHorizonKindForRel), which Asserts the relkind is a real
+			 * table (RELATION/MATVIEW/TOASTVALUE).  The spanning index's logical
+			 * "table" is the partitioned ROOT, but the root is
+			 * RELKIND_PARTITIONED_TABLE and would trip that Assert once the
+			 * spanning index accumulates deleted, recyclable pages.  Pass the
+			 * leaf currently being vacuumed instead: it is a real table and
+			 * yields the same (non-catalog, non-temp) global visibility horizon
+			 * class, so the recyclability decision is correct.
 			 */
 			ivinfo.index = idxRel;
-			ivinfo.heaprel = parentRel;
+			ivinfo.heaprel = vacrel->rel;
 			ivinfo.analyze_only = false;
 			ivinfo.report_progress = false;
 			ivinfo.estimated_count = true;
