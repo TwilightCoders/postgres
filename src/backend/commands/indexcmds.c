@@ -1299,8 +1299,18 @@ DefineIndex(Oid tableId,
 	/*
 	 * If the table is partitioned, and recursion was declined but partitions
 	 * exist, mark the index as invalid.
+	 *
+	 * ProgreSQL spanning indexes (progresql_bypass) are exempt: a spanning
+	 * index is a single complete btree on the root, with no per-partition child
+	 * indexes that must be attached before it becomes usable.  It is therefore
+	 * valid as soon as it is built.  This matters for pg_upgrade, whose
+	 * pg_dump emits "ALTER TABLE ONLY <root> ADD CONSTRAINT ... GLOBAL"
+	 * (stmt->relation->inh == false): without this exemption the restored
+	 * spanning index would be left permanently indisvalid = false (nothing ever
+	 * attaches a child to validate it), silently disabling cross-partition
+	 * uniqueness enforcement.
 	 */
-	if (partitioned && stmt->relation && !stmt->relation->inh)
+	if (partitioned && !progresql_bypass && stmt->relation && !stmt->relation->inh)
 	{
 		PartitionDesc pd = RelationGetPartitionDesc(rel, true);
 
@@ -1369,8 +1379,18 @@ DefineIndex(Oid tableId,
 	 * the newly-created spanning index from any existing tuples in child
 	 * partitions so that uniqueness enforcement works immediately (e.g.
 	 * ALTER TABLE ADD CONSTRAINT on a non-empty table).
+	 *
+	 * Exception: in binary-upgrade mode the index build is skipped entirely
+	 * (INDEX_CREATE_SKIP_BUILD above) because the spanning index's physical
+	 * file is transferred verbatim from the old cluster by pg_upgrade; running
+	 * the build here would only construct an empty index over the not-yet-
+	 * transferred partitions and (worse) re-allocate partseq values in
+	 * partition-descriptor order, which need not match the partseq discriminators
+	 * baked into the transferred index entries.  pg_dump --binary-upgrade
+	 * instead restores the exact pg_index_partition mapping, so we must not
+	 * touch it here.
 	 */
-	if (progresql_bypass && OidIsValid(indexRelationId))
+	if (progresql_bypass && OidIsValid(indexRelationId) && !IsBinaryUpgrade)
 		BuildSpanningIndexFromPartitions(rel, indexRelationId);
 
 	if (partitioned && !progresql_bypass)

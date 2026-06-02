@@ -315,6 +315,8 @@ static void collectSequences(Archive *fout);
 static void dumpSequence(Archive *fout, const TableInfo *tbinfo);
 static void dumpSequenceData(Archive *fout, const TableDataInfo *tdinfo);
 static void dumpIndex(Archive *fout, const IndxInfo *indxinfo);
+static void dumpSpanningIndexPartitionMap(Archive *fout, PQExpBuffer q,
+										  const IndxInfo *indxinfo);
 static void dumpIndexAttach(Archive *fout, const IndexAttachInfo *attachinfo);
 static void dumpStatisticsExt(Archive *fout, const StatsExtInfo *statsextinfo);
 static void dumpConstraint(Archive *fout, const ConstraintInfo *coninfo);
@@ -18104,6 +18106,64 @@ getAttrName(int attrnum, const TableInfo *tblInfo)
 }
 
 /*
+ * dumpSpanningIndexPartitionMap
+ *	  ProgreSQL: in binary-upgrade mode, emit SQL to restore the exact
+ *	  pg_index_partition mapping (partseq <-> partition) of a spanning
+ *	  (GLOBAL) index.
+ *
+ * pg_upgrade transfers the spanning index's physical file verbatim, so the
+ * partseq discriminators baked into its index entries must continue to resolve
+ * to the same partitions on the new cluster.  The normal restore-time build
+ * that would otherwise repopulate pg_index_partition is intentionally skipped
+ * under binary upgrade (see BuildSpanningIndexFromPartitions in indexcmds.c),
+ * and even if it ran it would re-allocate partseq values in partition-
+ * descriptor order, which need not match the transferred entries (e.g. after
+ * DETACH/ATTACH churn).  We therefore reproduce the rows here, preserving the
+ * original partseq values exactly.  A direct catalog INSERT is used, mirroring
+ * the direct catalog UPDATEs pg_dump already emits in binary-upgrade mode.
+ *
+ * No-op except for spanning indexes (indnuniqattrs > 0) under --binary-upgrade.
+ */
+static void
+dumpSpanningIndexPartitionMap(Archive *fout, PQExpBuffer q,
+							  const IndxInfo *indxinfo)
+{
+	PQExpBuffer query;
+	PGresult   *res;
+	int			ntups;
+	int			i;
+
+	if (!fout->dopt->binary_upgrade || indxinfo->indnuniqattrs <= 0)
+		return;
+
+	query = createPQExpBuffer();
+	appendPQExpBuffer(query,
+					  "SELECT indpartseq, indpartrelid "
+					  "FROM pg_catalog.pg_index_partition "
+					  "WHERE indpartidxid = '%u'::pg_catalog.oid "
+					  "ORDER BY indpartseq",
+					  indxinfo->dobj.catId.oid);
+	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+	ntups = PQntuples(res);
+
+	if (ntups > 0)
+		appendPQExpBufferStr(q,
+							 "\n-- For binary upgrade, restore spanning index partseq map\n");
+
+	for (i = 0; i < ntups; i++)
+		appendPQExpBuffer(q,
+						  "INSERT INTO pg_catalog.pg_index_partition "
+						  "(indpartidxid, indpartseq, indpartrelid) "
+						  "VALUES ('%u'::pg_catalog.oid, %s, '%s'::pg_catalog.oid);\n",
+						  indxinfo->dobj.catId.oid,
+						  PQgetvalue(res, i, 0),
+						  PQgetvalue(res, i, 1));
+
+	PQclear(res);
+	destroyPQExpBuffer(query);
+}
+
+/*
  * dumpIndex
  *	  write out to fout a user-defined index
  */
@@ -18150,6 +18210,9 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 
 		/* Plain secondary index */
 		appendPQExpBuffer(q, "%s;\n", indxinfo->indexdef);
+
+		/* ProgreSQL: preserve a spanning index's partseq map (binary upgrade) */
+		dumpSpanningIndexPartitionMap(fout, q, indxinfo);
 
 		/*
 		 * Append ALTER TABLE commands as needed to set properties that we
@@ -18511,6 +18574,9 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 
 			appendPQExpBufferStr(q, ";\n");
 		}
+
+		/* ProgreSQL: preserve a spanning index's partseq map (binary upgrade) */
+		dumpSpanningIndexPartitionMap(fout, q, indxinfo);
 
 		/*
 		 * Append ALTER TABLE commands as needed to set properties that we

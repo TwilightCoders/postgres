@@ -521,15 +521,39 @@ get_rel_infos_query(void)
 	 * Testing indisready is necessary in 9.2, and harmless in earlier/later
 	 * versions.
 	 */
-	appendPQExpBufferStr(&query,
-						 "  all_index (reloid, indtable, toastheap) AS ( "
-						 "  SELECT indexrelid, indrelid, 0::oid "
-						 "  FROM pg_catalog.pg_index "
-						 "  WHERE indisvalid AND indisready "
-						 "    AND indrelid IN "
-						 "        (SELECT reloid FROM regular_heap "
-						 "         UNION ALL "
-						 "         SELECT reloid FROM toast_heap)) ");
+	appendPQExpBuffer(&query,
+					  "  all_index (reloid, indtable, toastheap) AS ( "
+					  "  SELECT indexrelid, indrelid, 0::oid "
+					  "  FROM pg_catalog.pg_index "
+					  "  WHERE indisvalid AND indisready "
+					  "    AND indrelid IN "
+					  "        (SELECT reloid FROM regular_heap "
+					  "         UNION ALL "
+					  "         SELECT reloid FROM toast_heap) "
+					  "  UNION ALL "
+	/*
+	 * ProgreSQL: a spanning (GLOBAL) index is a real storage index
+	 * (relkind 'i') living on a PARTITIONED root (relkind 'p').  The root
+	 * has no storage of its own, so it is absent from regular_heap and the
+	 * stock query above never collects the spanning index --- its file would
+	 * then not be transferred, silently dropping cross-partition uniqueness
+	 * after upgrade.  Collect it explicitly here.  (relfilenode <> 0
+	 * distinguishes the spanning index from a stock storage-less partitioned
+	 * index, relkind 'I'.)
+	 */
+					  "  SELECT i.indexrelid, i.indrelid, 0::oid "
+					  "  FROM pg_catalog.pg_index i "
+					  "      JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid "
+					  "      JOIN pg_catalog.pg_class tc ON tc.oid = i.indrelid "
+					  "      JOIN pg_catalog.pg_namespace tn ON tn.oid = tc.relnamespace "
+					  "  WHERE i.indisvalid AND i.indisready "
+					  "    AND ic.relkind = " CppAsString2(RELKIND_INDEX) " "
+					  "    AND ic.relfilenode <> 0 "
+					  "    AND tc.relkind = " CppAsString2(RELKIND_PARTITIONED_TABLE) " "
+					  "    AND tc.oid >= %u::pg_catalog.oid "
+					  "    AND tn.nspname NOT IN ('pg_catalog', 'information_schema', "
+					  "                           'binary_upgrade', 'pg_toast')) ",
+					  FirstNormalObjectId);
 
 	/*
 	 * And now we can write the query that retrieves the data we want for each
