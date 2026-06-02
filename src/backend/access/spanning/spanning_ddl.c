@@ -24,6 +24,7 @@
 #include "access/stratnum.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/partition.h"
 #include "catalog/pg_index_partition.h"
@@ -31,10 +32,195 @@
 #include "executor/tuptable.h"
 #include "partitioning/partdesc.h"
 #include "utils/fmgroids.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 #include "access/spanning.h"
+
+/*
+ * Deferred, abort-safe retirement of a partition's spanning-index entries.
+ *
+ * Retirement marks the matching index entries LP_DEAD (see
+ * spanning_retire_entries below).  An LP_DEAD page hint is NOT transactional:
+ * once set it survives a ROLLBACK.  Doing it inline during DETACH / DROP /
+ * TRUNCATE was therefore unsafe -- if the command's transaction aborted, the
+ * catalog changes rolled back (partition stays attached, rows return) but the
+ * hints did not, leaving a live partition's keys invisible to
+ * _bt_check_unique.  Cross-partition uniqueness was then silently unenforced
+ * (a duplicate could be inserted into another partition).
+ *
+ * Fix: queue (indexOid, partseq) during the command and perform the actual
+ * LP_DEAD marking from an XACT_EVENT_PRE_COMMIT callback, so it happens only
+ * if the transaction commits.  An aborting (sub)transaction discards its
+ * queued entries, leaving the index untouched.
+ *
+ * Caveats (both conservative -- they over-enforce, never corrupt):
+ *  - Marking is deferred to commit, so within the SAME transaction a
+ *    DETACH/TRUNCATE followed by reinserting the just-freed key still sees the
+ *    old entry and conflicts; it succeeds once committed.
+ *  - PREPARE TRANSACTION discards the queue (a committed-prepared detach leaves
+ *    stale-but-live entries that VACUUM reclaims); like a lost LP_DEAD hint
+ *    after a crash, the only effect is a spurious conflict, not lost rows.
+ */
+typedef struct SpanningPendingRetire
+{
+	Oid			indexOid;
+	int32		partseq;
+	int			nestLevel;		/* subxact nest level at enqueue time */
+} SpanningPendingRetire;
+
+/* pending list lives in TopTransactionContext; reset at end of every xact */
+static List *spanning_pending_retire = NIL;
+static bool spanning_retire_cb_registered = false;
+
+static void spanning_retire_entries(Oid indexOid, int32 partseq);
+
+/*
+ * XACT callback: mark queued entries LP_DEAD at pre-commit; discard on abort.
+ */
+static void
+spanning_retire_xact_cb(XactEvent event, void *arg)
+{
+	ListCell   *lc;
+
+	switch (event)
+	{
+		case XACT_EVENT_PRE_COMMIT:
+			foreach(lc, spanning_pending_retire)
+			{
+				SpanningPendingRetire *p = (SpanningPendingRetire *) lfirst(lc);
+
+				spanning_retire_entries(p->indexOid, p->partseq);
+			}
+			spanning_pending_retire = NIL;	/* freed with TopTransactionContext */
+			break;
+
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			/* discard without marking (see caveats above) */
+			spanning_pending_retire = NIL;
+			break;
+
+		default:
+			break;
+	}
+}
+
+/*
+ * Sub-XACT callback: a rolled-back subtransaction must drop the entries it
+ * queued, otherwise a savepoint rollback of a DETACH would still retire the
+ * partition's entries at top-level commit.
+ */
+static void
+spanning_retire_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
+						   SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB && spanning_pending_retire != NIL)
+	{
+		int			abortLevel = GetCurrentTransactionNestLevel();
+		List	   *kept = NIL;
+		ListCell   *lc;
+
+		foreach(lc, spanning_pending_retire)
+		{
+			SpanningPendingRetire *p = (SpanningPendingRetire *) lfirst(lc);
+
+			/* keep only entries queued at a shallower (surviving) level */
+			if (p->nestLevel < abortLevel)
+				kept = lappend(kept, p);
+		}
+		spanning_pending_retire = kept;
+	}
+}
+
+/*
+ * Queue one (spanning index, partseq) pair for pre-commit retirement.
+ */
+static void
+spanning_queue_retire(Oid indexOid, int32 partseq)
+{
+	MemoryContext old;
+	SpanningPendingRetire *p;
+
+	if (!spanning_retire_cb_registered)
+	{
+		RegisterXactCallback(spanning_retire_xact_cb, NULL);
+		RegisterSubXactCallback(spanning_retire_subxact_cb, NULL);
+		spanning_retire_cb_registered = true;
+	}
+
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	p = (SpanningPendingRetire *) palloc(sizeof(SpanningPendingRetire));
+	p->indexOid = indexOid;
+	p->partseq = partseq;
+	p->nestLevel = GetCurrentTransactionNestLevel();
+	spanning_pending_retire = lappend(spanning_pending_retire, p);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Mark LP_DEAD every entry in the given spanning index whose trailing partseq
+ * key equals partseq.  Tolerates the index (or its root) having been dropped
+ * in the same committing transaction (e.g. DROP of the whole partitioned root).
+ */
+static void
+spanning_retire_entries(Oid indexOid, int32 partseq)
+{
+	Relation		idxRel;
+	Relation		rootRel;
+	IndexScanDesc	scan;
+	ScanKeyData		skey;
+
+	idxRel = try_index_open(indexOid, RowExclusiveLock);
+	if (idxRel == NULL)
+		return;					/* index dropped in this txn */
+
+	if (!RelationIsSpanning(idxRel))
+	{
+		index_close(idxRel, RowExclusiveLock);
+		return;
+	}
+
+	/*
+	 * The spanning index lives on the partitioned root; open it as the
+	 * heapRelation for index_beginscan.  The root has no table AM
+	 * (rd_tableam == NULL); index_beginscan skips table_index_fetch_begin in
+	 * that case and we only call index_getnext_tid (TID-only), so
+	 * xs_heapfetch is never dereferenced.
+	 */
+	rootRel = try_table_open(idxRel->rd_index->indrelid, AccessShareLock);
+	if (rootRel == NULL)
+	{
+		index_close(idxRel, RowExclusiveLock);
+		return;
+	}
+
+	ScanKeyInit(&skey,
+				idxRel->rd_index->indnkeyatts,
+				BTEqualStrategyNumber,
+				F_INT4EQ,
+				Int32GetDatum(partseq));
+
+	scan = index_beginscan(rootRel, idxRel, SnapshotAny, NULL, 1, 0);
+	index_rescan(scan, &skey, 1, NULL, 0);
+
+	while (index_getnext_tid(scan, ForwardScanDirection) != NULL)
+	{
+		/*
+		 * Mark this entry LP_DEAD on the next index_getnext_tid call (or on
+		 * index_endscan).  _bt_check_unique skips LP_DEAD items, so future
+		 * inserts won't see these retired entries as conflicts; they're
+		 * physically reclaimed when the page is next modified or VACUUMed.
+		 */
+		scan->kill_prior_tuple = true;
+	}
+
+	index_endscan(scan);
+	table_close(rootRel, AccessShareLock);
+	index_close(idxRel, RowExclusiveLock);
+}
 
 /*
  * Clean all ProgreSQL spanning index entries that reference partRel.
@@ -42,17 +228,18 @@
  * DETACH); any stale entries in spanning indexes on ancestor partitioned
  * roots are removed so they don't dangle to a now-invalid heap TID.
  *
- * Implementation: scan the spanning index for entries whose trailing
- * tableoid key column equals partOid, and set kill_prior_tuple on each
- * match so the btree marks the index entry LP_DEAD.  _bt_check_unique
- * skips LP_DEAD items (nbtinsert.c, the !ItemIdIsDead test in the leaf
- * scan loop), so future uniqueness checks correctly ignore them.
- * Physical removal happens lazily via btree's simple/bottom-up deletion
- * passes when pages are next modified, or via VACUUM.
+ * Implementation: resolve each spanning index's partseq for this partition
+ * and queue (indexOid, partseq) for pre-commit retirement (see
+ * spanning_queue_retire / spanning_retire_entries).  Retirement marks the
+ * matching entries LP_DEAD; _bt_check_unique skips LP_DEAD items
+ * (nbtinsert.c, the !ItemIdIsDead test in the leaf scan loop), so future
+ * uniqueness checks correctly ignore them.  Physical removal happens lazily
+ * via btree's simple/bottom-up deletion passes when pages are next modified,
+ * or via VACUUM.
  *
- * This is the BUG-A-safe replacement for the prior bulk_delete-based
- * cleanup, which collided across partitions whenever heap TIDs (e.g.
- * (0,1), the first row of every partition) were shared.  Filtering by
+ * The marking is deferred to commit because an LP_DEAD page hint is not
+ * transactional: doing it here would leave a live partition's keys retired
+ * if the command's transaction later rolled back.  Filtering by
  * (key, partseq) via the index scan key is exact: no false positives,
  * no false negatives.
  *
@@ -87,8 +274,6 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 		{
 			Oid				indexOid = lfirst_oid(il);
 			Relation		idxRel;
-			IndexScanDesc	scan;
-			ScanKeyData		skey;
 			int32			partseq;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
@@ -102,49 +287,21 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 
 			/*
 			 * Resolve this partition's index-local partseq while its map row
-			 * still exists (we delete the map rows only after this loop).  If
-			 * the partition was never mapped to this index there is nothing to
+			 * still exists (drop_map removes it only after this loop).  If the
+			 * partition was never mapped to this index there is nothing to
 			 * clean.
 			 */
 			partseq = SpanningLookupPartseqByRelid(idxRel, partOid);
+			index_close(idxRel, RowExclusiveLock);
 			if (partseq < 0)
-			{
-				index_close(idxRel, RowExclusiveLock);
 				continue;
-			}
-
-			/* Scan for entries whose trailing partseq matches this partition. */
-			ScanKeyInit(&skey,
-						idxRel->rd_index->indnkeyatts,
-						BTEqualStrategyNumber,
-						F_INT4EQ,
-						Int32GetDatum(partseq));
 
 			/*
-			 * Pass parentRel as heapRelation.  The partitioned root has no
-			 * table AM (rd_tableam == NULL); index_beginscan skips
-			 * table_index_fetch_begin in that case.  We only call
-			 * index_getnext_tid (TID-only), never index_getnext (heap fetch),
-			 * so xs_heapfetch is never dereferenced.
+			 * Queue the LP_DEAD marking for pre-commit rather than doing it
+			 * inline: the marking is a non-transactional page hint and must
+			 * not survive a rollback of this command (spanning_queue_retire).
 			 */
-			scan = index_beginscan(parentRel, idxRel, SnapshotAny, NULL,
-								   1, 0);
-			index_rescan(scan, &skey, 1, NULL, 0);
-
-			while (index_getnext_tid(scan, ForwardScanDirection) != NULL)
-			{
-				/*
-				 * Mark this entry LP_DEAD on the next index_getnext_tid call
-				 * (or on index_endscan).  btree's _bt_check_unique skips
-				 * LP_DEAD items, so future inserts won't see these stale
-				 * entries as conflicts; they're physically reclaimed when
-				 * the page is next modified or VACUUMed.
-				 */
-				scan->kill_prior_tuple = true;
-			}
-
-			index_endscan(scan);
-			index_close(idxRel, RowExclusiveLock);
+			spanning_queue_retire(indexOid, partseq);
 		}
 
 		list_free(indexoidlist);

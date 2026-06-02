@@ -182,7 +182,63 @@ INSERT INTO pgddl_data VALUES (21, 'dup-post-attach', '2025-10-01 00:00:00+00');
 ERROR:  duplicate key value violates unique constraint "pgddl_data_pkey"
 DETAIL:  Key (id)=(21) already exists.
 ROLLBACK;
--- Section 6: CASCADE DROP cleans up all objects.
+-- Section 6: abort-safety of partition-lifecycle cleanup
+-- DETACH/DROP/TRUNCATE retire a partition's spanning entries by marking them
+-- LP_DEAD, a NON-transactional page hint.  The marking is therefore deferred
+-- to pre-commit: if the command's transaction rolls back, the partition stays
+-- attached and its keys must remain enforced.  (Before the fix the hint was
+-- set inline and survived the rollback, silently letting a cross-partition
+-- duplicate through.)
+CREATE TABLE pgddl_ab (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pgddl_ab_a PARTITION OF pgddl_ab
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pgddl_ab_b PARTITION OF pgddl_ab
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO pgddl_ab VALUES (1, '2024-06-01 00:00:00+00');  -- key 1 -> pgddl_ab_a
+-- Aborted DETACH: pgddl_ab_a stays attached, so key 1 stays enforced.
+BEGIN;
+ALTER TABLE pgddl_ab DETACH PARTITION pgddl_ab_a;
+ROLLBACK;
+INSERT INTO pgddl_ab VALUES (1, '2025-06-01 00:00:00+00');  -- expect ERROR (dup)
+ERROR:  duplicate key value violates unique constraint "pgddl_ab_pkey"
+DETAIL:  Key (id)=(1) already exists.
+-- Aborted DROP: same guarantee via the heap.c cleanup path.
+BEGIN;
+DROP TABLE pgddl_ab_a;
+ROLLBACK;
+INSERT INTO pgddl_ab VALUES (1, '2025-07-01 00:00:00+00');  -- expect ERROR (dup)
+ERROR:  duplicate key value violates unique constraint "pgddl_ab_pkey"
+DETAIL:  Key (id)=(1) already exists.
+-- Aborted TRUNCATE: rows come back, so key 1 stays enforced.
+BEGIN;
+TRUNCATE pgddl_ab_a;
+ROLLBACK;
+INSERT INTO pgddl_ab VALUES (1, '2025-08-01 00:00:00+00');  -- expect ERROR (dup)
+ERROR:  duplicate key value violates unique constraint "pgddl_ab_pkey"
+DETAIL:  Key (id)=(1) already exists.
+-- Savepoint rollback of DETACH: the subtransaction's queued retirement is
+-- discarded, so the committed top transaction leaves key 1 enforced.
+BEGIN;
+SAVEPOINT sp;
+ALTER TABLE pgddl_ab DETACH PARTITION pgddl_ab_a;
+ROLLBACK TO SAVEPOINT sp;
+COMMIT;
+INSERT INTO pgddl_ab VALUES (1, '2025-09-01 00:00:00+00');  -- expect ERROR (dup)
+ERROR:  duplicate key value violates unique constraint "pgddl_ab_pkey"
+DETAIL:  Key (id)=(1) already exists.
+-- Committed DETACH still frees the key (the deferred marking runs at commit).
+ALTER TABLE pgddl_ab DETACH PARTITION pgddl_ab_a;
+INSERT INTO pgddl_ab VALUES (1, '2025-10-01 00:00:00+00');  -- expect SUCCESS
+SELECT count(*) AS id1_in_parent FROM pgddl_ab WHERE id = 1;  -- 1
+ id1_in_parent 
+---------------
+             1
+(1 row)
+
+DROP TABLE pgddl_ab CASCADE;
+DROP TABLE pgddl_ab_a;  -- detached, now standalone
+-- Section 7: CASCADE DROP cleans up all objects.
 DROP TABLE pgddl_data CASCADE;
 SELECT COUNT(*) FROM pg_class WHERE relname LIKE 'pgddl%';
  count 
