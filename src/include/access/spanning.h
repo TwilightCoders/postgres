@@ -25,4 +25,9 @@ extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 										  ResultRelInfo *resultRelInfo);
 extern void ProgresqlReleasePartitionCache(EState *estate);
 
+/* spanning_ddl.c — partition-lifecycle maintenance (ATTACH/DETACH/DROP/TRUNCATE) */
+extern void progresql_clean_spanning_indexes_for_partition(Relation partRel,
+														   bool drop_map);
+extern void progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel);
+
 #endif							/* SPANNING_H */
