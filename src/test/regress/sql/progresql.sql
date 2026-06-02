@@ -122,5 +122,26 @@ CREATE TABLE ml2_us_2024 PARTITION OF ml2_us
 CREATE UNIQUE INDEX ON ml2 (id) GLOBAL;   -- ERROR: multi-level partitioned table
 DROP TABLE ml2;
 
+-- Section 15: INSERT ... ON CONFLICT is unsupported on a spanning index -- the
+-- arbiter-inference path cannot see the root's spanning index from a leaf -- so
+-- it FAILS CLOSED with a clear error, never silently bypassing cross-partition
+-- uniqueness.  MERGE (which matches by scanning all partitions) works, and its
+-- inserts still flow through the uniqueness-enforced path.
+CREATE TABLE oc (id bigint NOT NULL, v text, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE oc1 PARTITION OF oc FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE oc2 PARTITION OF oc FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO oc VALUES (1, 'a', '2024-06-01');
+INSERT INTO oc VALUES (1, 'b', '2025-06-01')
+  ON CONFLICT (id) DO NOTHING;             -- ERROR: no matching arbiter
+INSERT INTO oc VALUES (1, 'c', '2025-06-01')
+  ON CONFLICT (id) DO UPDATE SET v = 'x';  -- ERROR: no matching arbiter
+MERGE INTO oc t USING (SELECT 1 AS id) s ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = 'm'
+  WHEN NOT MATCHED THEN INSERT VALUES (1, 'm', '2025-06-01');
+SELECT id, v FROM oc ORDER BY id;          -- id=1, v=m (matched + updated)
+INSERT INTO oc VALUES (1, 'dup', '2025-08-01');  -- ERROR: duplicate key (id)=(1)
+DROP TABLE oc;
+
 -- Cleanup
 DROP TABLE progresql_data;

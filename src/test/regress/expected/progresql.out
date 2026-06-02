@@ -162,5 +162,34 @@ CREATE UNIQUE INDEX ON ml2 (id) GLOBAL;   -- ERROR: multi-level partitioned tabl
 ERROR:  cannot create a spanning (GLOBAL) index on a multi-level partitioned table
 DETAIL:  Partition "ml2_us" is itself partitioned; spanning indexes require every partition to be a leaf.
 DROP TABLE ml2;
+-- Section 15: INSERT ... ON CONFLICT is unsupported on a spanning index -- the
+-- arbiter-inference path cannot see the root's spanning index from a leaf -- so
+-- it FAILS CLOSED with a clear error, never silently bypassing cross-partition
+-- uniqueness.  MERGE (which matches by scanning all partitions) works, and its
+-- inserts still flow through the uniqueness-enforced path.
+CREATE TABLE oc (id bigint NOT NULL, v text, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE oc1 PARTITION OF oc FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE oc2 PARTITION OF oc FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO oc VALUES (1, 'a', '2024-06-01');
+INSERT INTO oc VALUES (1, 'b', '2025-06-01')
+  ON CONFLICT (id) DO NOTHING;             -- ERROR: no matching arbiter
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+INSERT INTO oc VALUES (1, 'c', '2025-06-01')
+  ON CONFLICT (id) DO UPDATE SET v = 'x';  -- ERROR: no matching arbiter
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+MERGE INTO oc t USING (SELECT 1 AS id) s ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = 'm'
+  WHEN NOT MATCHED THEN INSERT VALUES (1, 'm', '2025-06-01');
+SELECT id, v FROM oc ORDER BY id;          -- id=1, v=m (matched + updated)
+ id | v 
+----+---
+  1 | m
+(1 row)
+
+INSERT INTO oc VALUES (1, 'dup', '2025-08-01');  -- ERROR: duplicate key (id)=(1)
+ERROR:  duplicate key value violates unique constraint "oc_pkey"
+DETAIL:  Key (id)=(1) already exists.
+DROP TABLE oc;
 -- Cleanup
 DROP TABLE progresql_data;
