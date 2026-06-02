@@ -1292,6 +1292,21 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			 */
 			if (RelationIsSpanning(idxRel))
 			{
+				/*
+				 * Spanning indexes require every partition to be a storage-bearing
+				 * leaf: partseq is allocated per direct partition, and a row is
+				 * routed to a leaf whose partseq resolves the spanning entry.  A
+				 * sub-partitioned partition has no partseq of its own for its
+				 * grandchildren, so reject multi-level partitioning at DDL time
+				 * (it would otherwise fail-closed only at INSERT into a grandchild).
+				 */
+				if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot sub-partition a partition of a table with a spanning (GLOBAL) index"),
+							 errdetail("Spanning index \"%s\" does not support multi-level partitioning; every partition must be a leaf.",
+									   RelationGetRelationName(idxRel))));
+
 				(void) SpanningGetOrAllocPartseq(idxRel, RelationGetRelid(rel));
 				index_close(idxRel, AccessShareLock);
 				continue;

@@ -2950,14 +2950,19 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 		partRel = table_open(partOid, AccessShareLock);
 
 		/*
-		 * Skip sub-partitioned tables; their leaf children are visited in
-		 * their own iterations of the outer loop.
+		 * Spanning indexes do not support multi-level partitioning: partdesc
+		 * holds only the root's DIRECT partitions, so a sub-partitioned child's
+		 * grandchild leaves are never visited here --- they would silently be
+		 * omitted from the index (their rows unenforced for uniqueness) and
+		 * could never get a partseq.  Reject it at build time rather than
+		 * corrupt-by-omission.
 		 */
 		if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-		{
-			table_close(partRel, AccessShareLock);
-			continue;
-		}
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot create a spanning (GLOBAL) index on a multi-level partitioned table"),
+					 errdetail("Partition \"%s\" is itself partitioned; spanning indexes require every partition to be a leaf.",
+							   RelationGetRelationName(partRel))));
 
 		/*
 		 * ProgreSQL C1: this partition's index-local partseq (get-or-allocate;

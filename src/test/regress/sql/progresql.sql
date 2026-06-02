@@ -105,5 +105,22 @@ CREATE TABLE legacy (PRIMARY KEY (id)) INHERITS (legacy_base)
                                       --        as inheritance child
 DROP TABLE legacy_base;
 
+-- Section 14: spanning indexes reject multi-level partitioning at DDL time
+-- (every partition must be a storage-bearing leaf).
+-- (a) cannot sub-partition a partition of a spanning-indexed root
+CREATE TABLE ml1 (id bigint NOT NULL, region text NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY LIST (region);
+CREATE TABLE ml1_us PARTITION OF ml1 FOR VALUES IN ('us')
+    PARTITION BY RANGE (ts);            -- ERROR: cannot sub-partition
+DROP TABLE ml1;
+-- (b) cannot create a GLOBAL index on a pre-existing multi-level tree
+CREATE TABLE ml2 (id bigint NOT NULL, region text NOT NULL, ts timestamptz NOT NULL)
+    PARTITION BY LIST (region);
+CREATE TABLE ml2_us PARTITION OF ml2 FOR VALUES IN ('us') PARTITION BY RANGE (ts);
+CREATE TABLE ml2_us_2024 PARTITION OF ml2_us
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE UNIQUE INDEX ON ml2 (id) GLOBAL;   -- ERROR: multi-level partitioned table
+DROP TABLE ml2;
+
 -- Cleanup
 DROP TABLE progresql_data;
