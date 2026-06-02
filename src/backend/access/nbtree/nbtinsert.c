@@ -583,6 +583,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				{
 					Relation	checkRel = heapRel;
 					Relation	spanChildRel = NULL;
+					bool		span_unresolved = false;
 
 					if (nuniqs < saved_keysz)
 					{
@@ -591,27 +592,55 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 
 						seqval = index_getattr(curitup, saved_keysz,
 											   RelationGetDescr(rel), &seqnull);
-						if (!seqnull)
+						if (seqnull)
+						{
+							/* No partseq to resolve: cannot probe a partition. */
+							span_unresolved = true;
+						}
+						else
 						{
 							int32		partseq = DatumGetInt32(seqval);
 							Oid		child_relid =
 								SpanningResolvePartseqRelid(rel, partseq);
 
-							/*
-							 * A partseq that no longer resolves belongs to a
-							 * detached/dropped partition whose entry is not yet
-							 * vacuumed.  Leave checkRel as the storage-less root
-							 * so the probe finds nothing (not a conflict).
-							 */
 							if (OidIsValid(child_relid))
 							{
 								spanChildRel = table_open(child_relid, AccessShareLock);
 								checkRel = spanChildRel;
 							}
+							else
+							{
+								/*
+								 * A partseq that no longer resolves belongs to a
+								 * detached/dropped partition whose entry has not
+								 * yet been retired.  It no longer enforces
+								 * uniqueness and must NOT be probed: heapRel is the
+								 * storage-less partitioned root (rd_tableam ==
+								 * NULL), so table_index_fetch_tuple_check would
+								 * dereference NULL and crash.  Treat it as
+								 * not-a-conflict and keep scanning.
+								 *
+								 * Do NOT mark it LP_DEAD here: the partseq may be
+								 * unresolvable only because of an uncommitted
+								 * DETACH in this same transaction that could still
+								 * roll back.  The deferred pre-commit retirement in
+								 * spanning_ddl.c performs the durable marking once
+								 * the DETACH/DROP actually commits.
+								 */
+								span_unresolved = true;
+							}
 						}
 					}
 
-					if (table_index_fetch_tuple_check(checkRel, &htid,
+					if (span_unresolved)
+					{
+						/*
+						 * Not a conflict and not probeable; skip the
+						 * storage-less-root fetch and continue the scan.
+						 */
+						all_dead = false;
+					}
+					else if (table_index_fetch_tuple_check(checkRel, &htid,
 													  &SnapshotDirty,
 													  &all_dead))
 					{

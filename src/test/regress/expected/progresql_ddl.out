@@ -238,7 +238,57 @@ SELECT count(*) AS id1_in_parent FROM pgddl_ab WHERE id = 1;  -- 1
 
 DROP TABLE pgddl_ab CASCADE;
 DROP TABLE pgddl_ab_a;  -- detached, now standalone
--- Section 7: CASCADE DROP cleans up all objects.
+-- Section 7: same-txn DETACH/DROP of a partition + a colliding INSERT.
+-- After DETACH/DROP the departed partition's spanning entries are still live
+-- (LP_DEAD retirement is deferred to pre-commit) but its partseq no longer
+-- resolves.  _bt_check_unique must SKIP such an entry, not probe the
+-- storage-less partitioned root (rd_tableam == NULL would crash the backend).
+-- Within the transaction the key is logically free, so the colliding INSERT
+-- succeeds and leaves no cross-partition duplicate.
+CREATE TABLE pgddl_sx (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pgddl_sx_a PARTITION OF pgddl_sx
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pgddl_sx_b PARTITION OF pgddl_sx
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO pgddl_sx VALUES (1, '2024-06-01 00:00:00+00');  -- key 1 -> pgddl_sx_a
+BEGIN;
+ALTER TABLE pgddl_sx DETACH PARTITION pgddl_sx_a;
+INSERT INTO pgddl_sx VALUES (1, '2025-06-01 00:00:00+00');  -- key now free; succeeds
+COMMIT;
+SELECT id, count(*) FROM pgddl_sx GROUP BY id HAVING count(*) > 1;  -- no rows
+ id | count 
+----+-------
+(0 rows)
+
+SELECT count(*) AS sx_id1 FROM pgddl_sx WHERE id = 1;              -- 1 (in pgddl_sx_b)
+ sx_id1 
+--------
+      1
+(1 row)
+
+DROP TABLE pgddl_sx CASCADE;
+DROP TABLE pgddl_sx_a;  -- detached, now standalone
+-- DROP-in-txn variant (heap.c cleanup path), same crash guard.
+CREATE TABLE pgddl_dx (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pgddl_dx_a PARTITION OF pgddl_dx
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pgddl_dx_b PARTITION OF pgddl_dx
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO pgddl_dx VALUES (1, '2024-06-01 00:00:00+00');
+BEGIN;
+DROP TABLE pgddl_dx_a;
+INSERT INTO pgddl_dx VALUES (1, '2025-06-01 00:00:00+00');  -- succeeds; no crash
+COMMIT;
+SELECT count(*) AS dx_id1 FROM pgddl_dx WHERE id = 1;  -- 1
+ dx_id1 
+--------
+      1
+(1 row)
+
+DROP TABLE pgddl_dx CASCADE;
+-- Section 8: CASCADE DROP cleans up all objects.
 DROP TABLE pgddl_data CASCADE;
 SELECT COUNT(*) FROM pg_class WHERE relname LIKE 'pgddl%';
  count 

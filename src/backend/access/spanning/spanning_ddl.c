@@ -55,10 +55,12 @@
  * if the transaction commits.  An aborting (sub)transaction discards its
  * queued entries, leaving the index untouched.
  *
- * Caveats (both conservative -- they over-enforce, never corrupt):
- *  - Marking is deferred to commit, so within the SAME transaction a
- *    DETACH/TRUNCATE followed by reinserting the just-freed key still sees the
- *    old entry and conflicts; it succeeds once committed.
+ * Caveats (both conservative -- they over-enforce or no-op, never corrupt):
+ *  - Marking is deferred to commit, so within the SAME transaction a DETACH/DROP
+ *    leaves the departed partition's entries present-but-unresolvable until the
+ *    pre-commit pass.  _bt_check_unique skips an entry whose partseq no longer
+ *    resolves (nbtinsert.c) rather than probing the storage-less root, so a
+ *    same-transaction reinsert of the freed key succeeds.
  *  - PREPARE TRANSACTION discards the queue (a committed-prepared detach leaves
  *    stale-but-live entries that VACUUM reclaims); like a lost LP_DEAD hint
  *    after a crash, the only effect is a spurious conflict, not lost rows.
