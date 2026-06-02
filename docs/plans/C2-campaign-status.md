@@ -177,19 +177,47 @@ the vanilla error. README updated. 240 green.
 ## Post-campaign extras also DONE: multi-level DDL rejection (`35d1da2cbd`),
 ## review nits m1/m5 (`44adc7b2ca`), ON CONFLICT/MERGE coverage (`fdc30882a8`).
 ##
-## The clean+safe+high-value work is now EXHAUSTED. Every remaining item below
-## carries a tradeoff that needs the user's call (risk appetite / build config),
-## so an autonomous loop should NOT grind them unattended:
-##  - VACUUM <root> sync-drain hook: touches vacuum()'s txn mgmt (critical path
-##    for ALL tables) for a convenience autovacuum already provides. Risk.
-##  - TAP tests (pg_dump|psql, pg_upgrade): need ./configure --enable-tap-tests
-##    (NOT set) → can't run via make check here. Build-config decision.
-##  - P2-2 `\d` partseq-hide: referencing fork-only indnuniqatts in a describe.c
-##    query breaks `\d` against stock-18 servers (parse error). vanilla-compat
-##    decision. Cosmetic gain (one blank-definition row).
-##  - M4 memoize has-spanning-ancestor: relcache change. Risk.
+## === 2026-06-02 update: TAP enabled + a REAL pg_upgrade bug found & fixed ===
+## - TAP tests ENABLED. Only gate was Perl IPC::Run; installed non-sudo to
+##   `~/perl5` (cpanm bootstrap). TAP runs need `PERL5LIB=$HOME/perl5/lib/perl5`.
+##   `--enable-tap-tests` is now in the tree's config.status (only changed the
+##   CONFIGURE_ARGS string in gitignored pg_config.h; no real C-rebuild cost).
+##   Also built+installed contrib/pageinspect for spanning debugging.
+## - `006_spanning_roundtrip.pl` (`50bd15b518`): pg_dump/restore plain+custom — green.
+## - pg_upgrade SILENT-DATA-LOSS bug FOUND (by `007_spanning_upgrade.pl`) & FIXED
+##   (`c99c96213f`): `--binary-upgrade` dropped cross-partition uniqueness (catalog
+##   flag + data survived; spanning index came out EMPTY & unenforced). E2 only
+##   covered the plain-dump path; binary-upgrade is distinct. 3-part fix:
+##     (1) info.c get_rel_infos_query never gathered the spanning index file
+##         (storage index relkind 'i' on partitioned 'p' root ∉ regular_heap)
+##         → its file was never transferred. Now also gathers relfilenode<>0
+##         indexes on partitioned roots.
+##     (2) `ALTER TABLE ONLY ... ADD CONSTRAINT GLOBAL` left it indisvalid=false
+##         (no children ever attach to validate a spanning index) → exempt
+##         spanning from INDEX_CREATE_INVALID (indexcmds.c).
+##     (3) restore-time BuildSpanningIndexFromPartitions re-derived partseqs in
+##         partdesc order ≠ transferred entries (DETACH/ATTACH churn) → skip the
+##         build under IsBinaryUpgrade; pg_dump emits the exact pg_index_partition
+##         map via direct catalog INSERTs. 007 covers PK + standalone + churn.
+## - M4 DROPPED: the "stale leaf relcache" bug it implied was DISPROVEN by repro
+##   (pageinspect: a GLOBAL index added after the leaf cache warms still forces a
+##   NON-HOT spanning-key update → E7 engages). Executor path already memoized
+##   per-statement (es_progresql_partition_cache). Not worth the relcache risk.
+##
+## Remaining (each needs the user's call — risk appetite / vanilla-compat):
+##  - VACUUM <root> sync-drain hook: ERGONOMICS ONLY (autovacuum + the SQL
+##    pg_drain_spanning_index() escape hatch already cover correctness; queue
+##    size is hard-bounded; uniqueness never at risk). The hook is low-risk
+##    (calls the already-tested drain after leaves vacuum); optional.
+##  - P2-2 `\d <spanning_index>` partseq-hide: cosmetic; `\d <table>` already
+##    correct. A fix must reference fork-only indnuniqatts in describe.c, which
+##    breaks fork-psql→stock-18-server `\d` (shared version 180003). A
+##    vanilla-safe fix exists: `to_regclass('pg_index_partition')` capability
+##    probe cached on the connection. Low priority.
 ##  - B3 lock-protocol unify: needs an isolation-spec analysis first (antagonist
 ##    believed it's not-corrupting today; page buffer locks cover it).
+##  - More TAP: pg_dump|psql section ordering, pg_amcheck on upgraded spanning
+##    btree. (isolation specs still need `make -C src/test/isolation check`.)
 ## NEXT (priority order)
 1. **E2 follow-ups (NOT data-loss):** pg_dump|psql TAP + pg_upgrade TAP (binary
    upgrade — covered by the dumpConstraint fix by construction, but unverified;
