@@ -166,11 +166,23 @@ int4/int4_ops/"partseq", uniqueness + VACUUM work, 240 green. No catversion bump
 (runtime-only; old oid_ops indexes still function, REINDEX relabels — optional).
 
 ## NEXT (priority order)
-1. **E1b — retire implicit INHERITS handshake** (IN PROGRESS), migrate all
-   `progresql*.sql` tests + README to `GLOBAL` (drop INHERITS/base, inline cols,
-   add `GLOBAL`). Removes `has_superclass` term at `indexcmds.c` opt-in +
-   `parse_utilcmd` allowance. LARGE test migration — do incrementally, regenerate
-   each expected output, keep make check green.
+1. **E1b — retire implicit INHERITS handshake** (PARTLY DONE). README migrated to
+   `GLOBAL` (`9cd50d8d00`). REMAINING (the code part, LARGE/mechanical — do with
+   fresh capacity, incrementally, green per commit):
+   - Migrate each `progresql*.sql` test from `CREATE TABLE x (PRIMARY KEY(k))
+     INHERITS (x_base) PARTITION BY …` to the inline `CREATE TABLE x (cols…,
+     PRIMARY KEY (k) GLOBAL) PARTITION BY …` form (drop the base table, inline
+     columns, add `GLOBAL`). All `progresql_*` tests + `progresql.sql` +
+     `progresql_drain`/`progresql_dumpdef` (the latter two I wrote also use
+     INHERITS). Regenerate each expected output, keep `make check` green.
+   - THEN remove the `has_superclass(tableId)` term from the opt-in in
+     `indexcmds.c` (~line 786-791, the `progresql_bypass` expr) + the matching
+     `parse_utilcmd.c` allowance, so `stmt->isglobal` is the SOLE opt-in. Verify
+     240 green. The inline `PRIMARY KEY (k) GLOBAL` form (PK excludes the
+     partition key) is already proven by `progresql_global`.
+   - Safe-incremental: migrating tests to GLOBAL while keeping the handshake is
+     green at every step (GLOBAL is additive); only the final handshake removal
+     requires all tests migrated first.
 2. **E2 follow-ups (NOT data-loss):** pg_dump|psql TAP test, pg_upgrade TAP test
    (binary upgrade — should be covered by the dumpConstraint fix but unverified),
    psql `\d` spanning annotation (P2-2).
