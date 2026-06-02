@@ -160,3 +160,25 @@ The flag CANNOT drop until at least #2 (+ its chain #3/#7), #4, #8, and Z are
 resolved, and the concurrency probe (1) is done.  Fixes A and #1 remove the two
 most-reachable bugs (a silent corruption and an easy crash) but do not by
 themselves make the feature trustworthy at scale.
+
+---
+
+## FEATURE GAP — FK cannot reference a spanning (GLOBAL) PK  *(live-verified 2026-06-02)*
+```sql
+CREATE TABLE ref (rid bigint PRIMARY KEY, evt_id bigint REFERENCES evt(id));
+-- ERROR: there is no unique constraint matching given keys for referenced table "evt"
+```
+PG's FK machinery (`transformFkeyCheckAttrs`) requires an index whose key columns
+exactly match the FK columns.  A spanning index's key is `(user_cols..., partseq)`
+(`indnkeyatts` includes the trailing partseq), so it is not recognized as a match
+for `REFERENCES evt(id)`.  **A foreign key cannot point at a spanning PK today.**
+
+This is a FEATURE GAP, not a bug, and is independent of #2/#4/#8/Z.  It is the
+blocker for any "universal `data` table that everything FK-references" design
+(e.g. a downstream consumer's perfectly-referential model).  Supporting it needs: (a)
+`transformFkeyCheckAttrs` to accept a spanning index by its user-facing unique
+prefix (`indnuniqatts`) rather than full `indnkeyatts`; and (b) the RI
+existence-check query to resolve through the spanning index on the storage-less
+root (same storage-less-root hazard as findings #1/Z).  The global-unique-id
+namespace itself works (the spanning PK enforces it); only enforced FK references
+to it are missing.
