@@ -205,9 +205,14 @@ int4/int4_ops/"partseq", uniqueness + VACUUM work, 240 green. No catversion bump
   index from a leaf. Feature gap, not a P0.
 - **partseq allocation race** (concurrent ATTACH): PK backstop turns it into a
   spurious duplicate-key error (retriable), NOT silent corruption.
-- **Multi-level (sub-)partitioning is BROKEN**: partseq allocated for direct
-  children only; INSERT into a grandchild errors "has no partseq for partition".
-  Either hard-error at DDL or support recursively. (Untracked task — add it.)
+- **Multi-level (sub-)partitioning is FAIL-CLOSED (verified 2026-06-02, live
+  repro), NOT a corruption P0**: partseq is allocated for direct children only,
+  so INSERT into a grandchild leaf errors "spanning index … has no partseq for
+  partition" — clean error, no silent uniqueness loss. UX gap only: the
+  sub-partition structure can be CREATED and only fails at INSERT (the README
+  says "excluded" but it's runtime-fail-closed, not DDL-rejected). FUTURE POLISH
+  (not correctness): hard-error at `CREATE TABLE … PARTITION OF <spanning-child>
+  … PARTITION BY …` (DDL time) instead of at INSERT, or support recursively.
 - **Strategic**: C1 (partseq + `pg_index_partition`) ≈ **Dilip Kumar/Google's
   live June-2025 in-core "Global Index" proposal** (msg
   CAFiTN-uyec_y2QS2whUam8Rp1M+PPGuP0Zz45uX_U6mhQ8mtRg), which is Haas-blessed.

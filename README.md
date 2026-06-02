@@ -222,7 +222,10 @@ git rebase upstream/REL_18_STABLE progresql-18
   still accepted, pending removal in favor of `GLOBAL` alone.)
 - The deferred coalesced VACUUM drain is behind `spanning_defer_vacuum` (default
   off) and currently applies to spanning leaves without local indexes.
-- Sub-partitions are intentionally excluded from the spanning-index path.
+- Multi-level (sub-)partitioning is not supported under a spanning index:
+  partseq is allocated for direct children only, so an INSERT routed to a
+  grandchild leaf fails closed with an error (no silent uniqueness loss). A
+  DDL-time rejection is a planned refinement.
 - The per-statement cache is exactly that — per statement; it is rebuilt for
   each top-level DML.
 - This is a research fork, not a supported product.
