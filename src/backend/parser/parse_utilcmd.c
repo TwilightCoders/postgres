@@ -259,12 +259,10 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 
 	if (stmt->partspec)
 	{
-		/*
-		 * ProgreSQL: allow INHERITS + PARTITION BY on the same root table.
-		 * The grammar already prevents a table from being simultaneously a
-		 * PARTITION OF child and an INHERITS child, so the only case this
-		 * guard was catching was the ProgreSQL use case.
-		 */
+		if (stmt->inhRelations && !stmt->partbound)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("cannot create partitioned table as inheritance child")));
 	}
 
 	/*

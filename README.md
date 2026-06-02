@@ -218,8 +218,8 @@ git rebase upstream/REL_18_STABLE progresql-18
 ## Limitations
 
 - The feature is opt-in via the `GLOBAL` keyword; plain partitioned tables are
-  untouched. (A legacy implicit `INHERITS` + `PARTITION BY` handshake is also
-  still accepted, pending removal in favor of `GLOBAL` alone.)
+  untouched. (Combining `INHERITS` with `PARTITION BY` is rejected, exactly as in
+  stock PostgreSQL — `GLOBAL` is the only way to request a spanning index.)
 - The deferred coalesced VACUUM drain is behind `spanning_defer_vacuum` (default
   off) and currently applies to spanning leaves without local indexes.
 - Multi-level (sub-)partitioning is not supported under a spanning index:

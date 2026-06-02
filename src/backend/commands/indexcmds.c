@@ -743,25 +743,13 @@ DefineIndex(Oid tableId,
 	}
 
 	/*
-	 * ProgreSQL spanning index: a PRIMARY KEY or UNIQUE on a table that is
-	 * both partitioned and inherits via INHERITS (not just being a member of
-	 * a partition tree) from another table.  We create a real btree on the
-	 * root instead of a hollow partitioned-index stub.
-	 *
-	 * has_superclass() returns true for both kinds of pg_inherits rows
-	 * (explicit INHERITS and partition membership), so we additionally
-	 * exclude sub-partitions via !relispartition.
-	 */
-	/*
-	 * ProgreSQL: an index becomes a spanning (cross-partition) index either via
-	 * the explicit GLOBAL keyword (stmt->isglobal, the supported opt-in) or via
-	 * the legacy implicit handshake (a partitioned root that also INHERITS a
-	 * base table and declares PK/UNIQUE).  The implicit form is retained for
-	 * backward compatibility and is slated for removal; new DDL should use
-	 * GLOBAL.
-	 *
-	 * When GLOBAL is requested explicitly, validate the target up front so the
-	 * user gets a clear error rather than a confusing downstream failure.
+	 * ProgreSQL spanning index: a cross-partition PRIMARY KEY / UNIQUE built as
+	 * a real btree on the partitioned root (instead of a hollow
+	 * partitioned-index stub), enforcing uniqueness across all partitions.  The
+	 * sole opt-in is the explicit GLOBAL keyword (stmt->isglobal); ordinary
+	 * partitioned tables behave exactly like stock PostgreSQL.  Validate the
+	 * target up front so the user gets a clear error rather than a confusing
+	 * downstream failure.
 	 */
 	if (stmt->isglobal)
 	{
@@ -783,12 +771,7 @@ DefineIndex(Oid tableId,
 					 errmsg("GLOBAL is only supported for UNIQUE or PRIMARY KEY indexes")));
 	}
 
-	progresql_bypass = stmt->isglobal ||
-		(partitioned &&
-		 (stmt->unique || stmt->primary) &&
-		 !exclusion &&
-		 !rel->rd_rel->relispartition &&
-		 has_superclass(tableId));
+	progresql_bypass = stmt->isglobal;
 
 	/*
 	 * Don't try to CREATE INDEX on temp tables of other backends.

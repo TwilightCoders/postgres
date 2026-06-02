@@ -1,28 +1,22 @@
 --
--- ProgreSQL: INHERITS + PARTITION BY with spanning uniqueness indexes
+-- ProgreSQL: cross-partition (spanning) PRIMARY KEY / UNIQUE via GLOBAL
 --
--- A table with both INHERITS and PARTITION BY is permitted.  PRIMARY KEY
--- and UNIQUE constraints whose columns don't match the partition key are
--- implemented as "spanning indexes": a real btree on the root storing
--- (key_cols..., tableoid) entries that enforce cross-partition uniqueness
--- via indnuniqatts in pg_index.
+-- A PRIMARY KEY / UNIQUE declared GLOBAL on a partitioned root whose columns
+-- don't match the partition key is implemented as a "spanning index": a real
+-- btree on the root storing (key_cols..., partseq) entries that enforce
+-- cross-partition uniqueness via indnuniqatts in pg_index.  GLOBAL is the sole
+-- opt-in; ordinary partitioned tables behave exactly like stock PostgreSQL.
 --
--- Section 1: Basic table creation
--- A table with both INHERITS and PARTITION BY must now succeed.
--- (Pure PARTITION BY without INHERITS still enforces the partition-key
--- subset rule.)
-CREATE TABLE progresql_base (
+-- Section 1: Basic table creation with GLOBAL
+CREATE TABLE progresql_data (
     id      bigint,
     kind    text,
-    ts      timestamptz NOT NULL
-);
-CREATE TABLE progresql_data (
-    PRIMARY KEY (id),      -- not the partition key
+    ts      timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL,      -- not the partition key
     CHECK (ts IS NOT NULL)
-) INHERITS (progresql_base)
-  PARTITION BY RANGE (ts);
+) PARTITION BY RANGE (ts);
 -- Section 2: Spanning index catalog state
--- indnuniqatts=1 (just id), indnkeyatts=2 (id + tableoid disambiguation col)
+-- indnuniqatts=1 (just id), indnkeyatts=2 (id + partseq discriminator col)
 SELECT indnuniqatts, indnkeyatts, indnatts
 FROM pg_index
 WHERE indrelid = 'progresql_data'::regclass
@@ -98,7 +92,7 @@ WHERE indrelid = 'progresql_normal'::regclass AND indisprimary;
 
 DROP TABLE progresql_normal;
 -- Section 10: UNIQUE (not just PK) also gets a spanning index
-ALTER TABLE progresql_data ADD CONSTRAINT progresql_data_kind_uniq UNIQUE (kind);
+ALTER TABLE progresql_data ADD CONSTRAINT progresql_data_kind_uniq UNIQUE (kind) GLOBAL;
 SELECT indnuniqatts, indnkeyatts
 FROM pg_index
 WHERE indrelid = 'progresql_data'::regclass
@@ -132,12 +126,21 @@ SELECT id, kind FROM progresql_data WHERE id = 1;
   1 | after_truncate
 (1 row)
 
--- Section 12: Pure PARTITION BY (no INHERITS) still enforces old rule
+-- Section 12: without GLOBAL, a partitioned UNIQUE/PK still enforces the
+-- old "must include the partition key" rule.
 CREATE TABLE partonly (a int, b int) PARTITION BY RANGE (b);
 CREATE UNIQUE INDEX ON partonly (a);  -- should fail: a not in partition key
 ERROR:  unique constraint on partitioned table must include all partitioning columns
 DETAIL:  UNIQUE constraint on table "partonly" lacks column "b" which is part of the partition key.
 DROP TABLE partonly;
+-- Section 13: the legacy implicit handshake is retired -- a partitioned table
+-- can no longer also INHERITS a base table (vanilla PostgreSQL behavior); the
+-- only way to get a spanning index is the explicit GLOBAL keyword.
+CREATE TABLE legacy_base (id bigint, ts timestamptz NOT NULL);
+CREATE TABLE legacy (PRIMARY KEY (id)) INHERITS (legacy_base)
+  PARTITION BY RANGE (ts);            -- ERROR: cannot create partitioned table
+ERROR:  cannot create partitioned table as inheritance child
+                                      --        as inheritance child
+DROP TABLE legacy_base;
 -- Cleanup
 DROP TABLE progresql_data;
-DROP TABLE progresql_base;
