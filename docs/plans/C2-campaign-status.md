@@ -178,7 +178,14 @@ the vanilla error. README updated. 240 green.
 1. **E2 follow-ups (NOT data-loss):** pg_dump|psql TAP + pg_upgrade TAP (binary
    upgrade — covered by the dumpConstraint fix by construction, but unverified;
    **needs `./configure --enable-tap-tests`, NOT currently set** → can't run via
-   `make check` here); psql `\d` spanning annotation (P2-2, small/additive).
+   `make check` here). **P2-2 (psql `\d`): mostly already done** — `\d <table>`
+   shows `PRIMARY KEY, btree (id) GLOBAL` (free from the E2 ruleutils fix), so
+   spanning is clearly indicated. Remaining minor wart: `\d <spanning_index>`
+   lists the internal `partseq` column with a BLANK Definition (E2 clips its def
+   but describe.c still lists it from pg_attribute). Fix = filter the trailing
+   discriminator from describe.c's index-column query, but that needs the same
+   server-version-gated `indnuniqatts` plumbing as pg_dump (describe.c runs vs
+   many server versions). Low priority, cosmetic.
 2. **Sub-partition DDL hard-error:** multi-level partitioning is fail-closed at
    INSERT (verified, not a P0); a DDL-time rejection (at `CREATE TABLE … PARTITION
    OF <spanning-child> … PARTITION BY …`) is cleaner UX. Self-contained.
