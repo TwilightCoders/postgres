@@ -64,7 +64,31 @@ Full design: `docs/plans/C2-deferred-vacuum-DHR-design.md`. 5 increments.
   whole heap-reap is deferred → skip `lazy_vacuum_heap_rel`, don't bump
   `num_index_scans`/M3), :2769 (bypass; already no heap reap), :2785 (normal;
   skip the paired `lazy_vacuum_heap_rel` for spanning leaves under DHR).
-- inc3 coalesced drain; inc4 autovacuum trigger; inc5 tests+perf. See design doc.
+- **inc2 DONE** `c20f8b09bf` — GUC `spanning_defer_vacuum` (default off); enqueue
+  + reap-suppression at all 3 `lazy_vacuum` sites; `SpanningDrainqEnqueue`/
+  `SpanningDrainqHasPending`. 238 green (GUC off = byte-identical eager path).
+- **inc3 DONE** `6d68f86e7f` — the coalesced drain: `bt_spanning_drain` +
+  `BTSpanningDrainKill` (multi-partseq btree gate), `progresql_drain_spanning_index`
+  (SUEL index + per-partition SUEL in OID order; ONE index scan; drain-driven
+  reap; index-before-heap in one txn), SQL `pg_drain_spanning_index(regclass)
+  -> bigint`, catalog readers `SpanningDrainqListDirty`/`DeleteList`. Verified:
+  single + multi-partition coalesced drain retire all stale entries in one scan,
+  cross-partition uniqueness airtight pre/post drain, reuse trap closed, 238
+  green. **Bug caught & fixed: the deletion loop must also run when
+  `spanning_kill` is set (drain passes callback==NULL) else drain deletes
+  nothing.** **Audit result (LP_DEAD->LP_UNUSED sweep): inc2 reap-suppression is
+  the ONLY new gate needed — on-access prune never marks LP_DEAD unused
+  (pruneheap.c:263,374), PageAddItemExtended reuses only LP_UNUSED
+  (bufpage.c:273); the drain is the sole reaper of spanning-leaf slots.**
+- **inc4 NEXT** — autovacuum `AVW_SpanningIndexDrain` work-item + launcher sweep;
+  `VACUUM <root>` end-of-command drain hook; failsafe skips enqueue (M2). M3
+  (don't bump num_index_scans) already done for the nindexes==0 path in inc2.
+- **inc5 IN PROGRESS** — committed regress (single/multi/reuse-trap/sibling),
+  isolation (drain vs DML / vs vacuum), TAP (crash between enqueue & drain),
+  perf characterization (N=4..64 buffer-hit collapse = the user's #1 proof).
+  Note: pre-drain reinsert of a deleted key SUCCEEDS (correct — `_bt_check_unique`
+  heap-liveness probe treats a stale-over-dead entry as non-conflict); the drain's
+  job is to retire the entry before its held slot can be reused.
 
 ## NEXT after E5 (priority order)
 2. **E2 / P0-2 — dump + `pg_upgrade`.** The ONE real silent-data-loss path:
