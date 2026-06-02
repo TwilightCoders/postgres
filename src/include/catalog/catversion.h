@@ -59,6 +59,7 @@
 /*							yyyymmddN */
 /* ProgreSQL: bumped to add indnuniqatts column to pg_index (spanning indexes) */
 /* ProgreSQL: bumped to add pg_index_partition catalog (C1 partseq map) */
-#define CATALOG_VERSION_NO	202605311
+/* ProgreSQL: bumped to add pg_spanning_drainq catalog (E5 deferred-vacuum queue) */
+#define CATALOG_VERSION_NO	202606011
 
 #endif

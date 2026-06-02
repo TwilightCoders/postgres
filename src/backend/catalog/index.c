@@ -45,6 +45,7 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_index_partition.h"
+#include "catalog/pg_spanning_drainq.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
@@ -2400,6 +2401,13 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	 * indexes, which have no pg_index_partition rows.
 	 */
 	RemoveSpanningPartitionMapForIndex(indexId);
+
+	/*
+	 * ProgreSQL: drop this index's deferred-drain queue rows too, for the same
+	 * reason --- an orphaned sdq_idxid would dangle against a recycled OID and
+	 * leave an undrainable obligation.  No-op for ordinary indexes.
+	 */
+	RemoveSpanningDrainqForIndex(indexId);
 
 	/*
 	 * fix INHERITS relation

@@ -44,6 +44,7 @@ OBJS = \
 	pg_publication.o \
 	pg_range.o \
 	pg_shdepend.o \
+	pg_spanning_drainq.o \
 	pg_subscription.o \
 	pg_type.o \
 	storage.o \

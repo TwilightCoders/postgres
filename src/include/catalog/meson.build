@@ -14,6 +14,7 @@ catalog_headers = [
   'pg_inherits.h',
   'pg_index.h',
   'pg_index_partition.h',
+  'pg_spanning_drainq.h',
   'pg_operator.h',
   'pg_opfamily.h',
   'pg_opclass.h',
