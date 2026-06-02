@@ -174,6 +174,22 @@ Section 13 asserts the retired handshake errors; `create_table.out` restored to
 the vanilla error. README updated. 240 green.
 
 ## ALL LETTERED PRIORITIES DONE (E1, E2, E5, E6, E7, E1b). Remaining = polish.
+## Post-campaign extras also DONE: multi-level DDL rejection (`35d1da2cbd`),
+## review nits m1/m5 (`44adc7b2ca`), ON CONFLICT/MERGE coverage (`fdc30882a8`).
+##
+## The clean+safe+high-value work is now EXHAUSTED. Every remaining item below
+## carries a tradeoff that needs the user's call (risk appetite / build config),
+## so an autonomous loop should NOT grind them unattended:
+##  - VACUUM <root> sync-drain hook: touches vacuum()'s txn mgmt (critical path
+##    for ALL tables) for a convenience autovacuum already provides. Risk.
+##  - TAP tests (pg_dump|psql, pg_upgrade): need ./configure --enable-tap-tests
+##    (NOT set) → can't run via make check here. Build-config decision.
+##  - P2-2 `\d` partseq-hide: referencing fork-only indnuniqatts in a describe.c
+##    query breaks `\d` against stock-18 servers (parse error). vanilla-compat
+##    decision. Cosmetic gain (one blank-definition row).
+##  - M4 memoize has-spanning-ancestor: relcache change. Risk.
+##  - B3 lock-protocol unify: needs an isolation-spec analysis first (antagonist
+##    believed it's not-corrupting today; page buffer locks cover it).
 ## NEXT (priority order)
 1. **E2 follow-ups (NOT data-loss):** pg_dump|psql TAP + pg_upgrade TAP (binary
    upgrade — covered by the dumpConstraint fix by construction, but unverified;
