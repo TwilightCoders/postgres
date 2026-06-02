@@ -371,8 +371,9 @@ typedef struct BTVacState
 	 * sibling partition's live entry.  Deletion still flows through the
 	 * WAL-logged _bt_delitems_vacuum path, so it is crash-safe.
 	 *
-	 * Kept at the end of the struct so the offsets of the fields above stay
-	 * stable for the rest of nbtree.
+	 * Appended at the end of the struct only as a code-churn convenience (this
+	 * is a private in-process struct, not an on-disk/ABI layout, so field order
+	 * is not load-bearing; the benefit is just smaller diffs against upstream).
 	 */
 	bool		spanning;
 	int32		spanning_partseq;

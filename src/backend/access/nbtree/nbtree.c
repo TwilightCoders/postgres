@@ -36,6 +36,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 
 
 /*
@@ -1117,6 +1118,8 @@ bt_spanning_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	Relation	rel = info->index;
 	BTCycleId	cycleid;
 
+	Assert(RelationIsSpanning(rel));
+
 	/* allocate stats if first time through, else re-use existing struct */
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -1156,6 +1159,8 @@ bt_spanning_drain(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 {
 	Relation	rel = info->index;
 	BTCycleId	cycleid;
+
+	Assert(RelationIsSpanning(rel));
 
 	/* allocate stats if first time through, else re-use existing struct */
 	if (stats == NULL)
