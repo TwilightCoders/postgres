@@ -140,6 +140,7 @@
 #include "access/tidstore.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/partition.h"
@@ -2753,6 +2754,14 @@ spanning_drain_build_lpdead_store(Relation rel, BufferAccessStrategy bstrategy)
  * Must run AFTER the index entries have been removed (WAL-logged): the index
  * delitems records precede these reap records in the WAL stream, so redo can
  * never reap a slot before its spanning entry is gone.
+ *
+ * Like lazy_vacuum_heap_page's second pass this takes only an exclusive (not
+ * cleanup) buffer lock and logs a cleanup_lock=false PRUNE_VACUUM_CLEANUP
+ * record --- valid because storage-less LP_DEAD slots can't be referenced by a
+ * live scan.  Unlike lazy_vacuum_heap_page it does NOT update the visibility
+ * map: a page that held LP_DEAD items was never PD_ALL_VISIBLE, so no VM bit is
+ * stale after reaping; a later full VACUUM promotes the page if it became
+ * all-visible.
  */
 static void
 spanning_drain_reap_partition(Relation rel, TidStore *dead,
@@ -2830,19 +2839,26 @@ spanning_drain_reap_partition(Relation rel, TidStore *dead,
  * reap the now-safe LP_DEAD heap slots.  This is the O(N^2)->O(N) win --- N
  * per-leaf full index scans collapse to one.
  *
- * Steps (index-before-heap, all in the caller's transaction):
- *   1. ShareUpdateExclusiveLock the spanning index (serializes drains; respects
- *      _bt_start_vacuum's one-active-vacuum rule).
- *   2. Snapshot the dirty partseqs from pg_spanning_drainq.
- *   3. Resolve each to its partition; sort by OID; ShareUpdateExclusiveLock each
- *      (serializes vs that partition's VACUUM, so the reap can't double-fire and
- *      no concurrent enqueue mutates the rows we will delete); build each
- *      partition's LP_DEAD TidStore (kill set + reap set).
- *   4. ONE multi-partseq btvacuumscan removes the matching index entries
+ * Lock order (index-before-heap for WAL; partition-before-index for locks):
+ *   1. Verify spanning + snapshot dirty partseqs (syscache, no locks held).
+ *   2. Resolve partseqs -> partition OIDs by index OID (syscache; no index lock).
+ *   3. ShareUpdateExclusiveLock each partition IN OID ORDER.  This matches the
+ *      eager spanning-vacuum path (which holds the partition's VACUUM lock, then
+ *      opens the spanning index) -- both acquire partition-before-index, so a
+ *      drain and a concurrent eager VACUUM of an enqueued partition cannot
+ *      AB-BA deadlock.  OID order also makes drains of different spanning indexes
+ *      that share partitions deadlock-free.  Holding the partition lock
+ *      serializes vs that partition's VACUUM (so the reap can't double-fire and
+ *      no concurrent enqueue mutates the rows we will delete) and blocks the
+ *      only enqueuer, so the queue rows are stable.  Build each partition's
+ *      LP_DEAD TidStore (kill set + reap set).
+ *   4. NOW ShareUpdateExclusiveLock the index (after partitions): serializes
+ *      drains, respects _bt_start_vacuum's one-active-vacuum rule.
+ *   5. ONE multi-partseq btvacuumscan removes the matching index entries
  *      (WAL-logged _bt_delitems_vacuum).
- *   5. Reap the now-safe LP_DEAD slots in each partition (WAL-logged, AFTER the
+ *   6. Reap the now-safe LP_DEAD slots in each partition (WAL-logged, AFTER the
  *      index removals in the WAL stream).
- *   6. Delete the drained pg_spanning_drainq rows.
+ *   7. Delete the drained pg_spanning_drainq rows.
  *
  * Returns the number of spanning index entries retired.
  */
@@ -2850,6 +2866,8 @@ int64
 progresql_drain_spanning_index(Oid spanningIndexOid)
 {
 	Relation	idxRel;
+	HeapTuple	idxtup;
+	bool		isspanning;
 	List	   *dirty;
 	ListCell   *lc;
 	int			ndirty;
@@ -2863,25 +2881,37 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 	IndexBulkDeleteResult *istat;
 	int64		retired = 0;
 
-	/* 1. Serialize drains on this index. */
-	idxRel = index_open(spanningIndexOid, ShareUpdateExclusiveLock);
-	if (!RelationIsSpanning(idxRel))
+	/* The drain writes WAL (index delitems + heap reap); not legal in recovery. */
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot drain a spanning index during recovery")));
+
+	/*
+	 * 1. Verify this is a spanning index via the syscache, taking NO lock on it
+	 * yet --- we must lock partitions before the index (see lock-order note).
+	 */
+	idxtup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(spanningIndexOid));
+	if (!HeapTupleIsValid(idxtup))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a spanning index",
-						RelationGetRelationName(idxRel))));
+						get_rel_name(spanningIndexOid))));
+	isspanning = IndexFormIsSpanning((Form_pg_index) GETSTRUCT(idxtup));
+	ReleaseSysCache(idxtup);
+	if (!isspanning)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a spanning index",
+						get_rel_name(spanningIndexOid))));
 
-	/* 2. Snapshot the dirty partseqs. */
+	/* 2. Snapshot the dirty partseqs; resolve them by index OID (no index lock). */
 	dirty = SpanningDrainqListDirty(spanningIndexOid);
 	if (dirty == NIL)
-	{
-		index_close(idxRel, ShareUpdateExclusiveLock);
 		return 0;
-	}
 
 	bstrategy = GetAccessStrategy(BAS_VACUUM);
 
-	/* 3a. Resolve partseqs -> partitions; record them. */
 	ndirty = list_length(dirty);
 	entries = (SpanningDrainEntry *) palloc0(ndirty * sizeof(SpanningDrainEntry));
 	i = 0;
@@ -2890,7 +2920,7 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 		int32		ps = lfirst_int(lc);
 
 		entries[i].partseq = ps;
-		entries[i].partOid = SpanningResolvePartseqRelid(idxRel, ps);
+		entries[i].partOid = SpanningResolvePartseqRelidByOid(spanningIndexOid, ps);
 		entries[i].partRel = NULL;
 		entries[i].dead = NULL;
 		if (ps > maxpartseq)
@@ -2898,7 +2928,7 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 		i++;
 	}
 
-	/* 3b. Lock partitions in OID order (deadlock-free) and build kill sets. */
+	/* 3. Lock partitions in OID order (before the index) and build kill sets. */
 	qsort(entries, ndirty, sizeof(SpanningDrainEntry), spanning_drain_entry_cmp);
 
 	kill.maxpartseq = maxpartseq;
@@ -2910,8 +2940,12 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 		if (!OidIsValid(entries[i].partOid))
 			continue;			/* partition gone; just drop its drainq row */
 
-		entries[i].partRel = table_open(entries[i].partOid,
-										ShareUpdateExclusiveLock);
+		/* try_table_open: a partition dropped since resolve opens as NULL. */
+		entries[i].partRel = try_table_open(entries[i].partOid,
+											ShareUpdateExclusiveLock);
+		if (entries[i].partRel == NULL)
+			continue;
+
 		entries[i].dead =
 			spanning_drain_build_lpdead_store(entries[i].partRel, bstrategy);
 		kill.deadbypartseq[entries[i].partseq] = (struct TidStore *) entries[i].dead;
@@ -2920,8 +2954,11 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 			heaprel = entries[i].partRel;
 	}
 
+	/* 4. Now lock the index (after partitions -> consistent global order). */
+	idxRel = index_open(spanningIndexOid, ShareUpdateExclusiveLock);
+
 	/*
-	 * 4. One coalesced index scan retiring all dirty partseqs' dead entries.
+	 * 5. One coalesced index scan retiring all dirty partseqs' dead entries.
 	 * heaprel is a real leaf (not the partitioned root) so BTPageIsRecyclable's
 	 * relkind assert is satisfied (see bt_spanning_bulkdelete / commit B1).  If
 	 * every dirty partition was dropped there is nothing to scan or reap.
@@ -2944,7 +2981,7 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 			pfree(istat);
 		}
 
-		/* 5. Reap the now-safe LP_DEAD slots (index entries already gone). */
+		/* 6. Reap the now-safe LP_DEAD slots (index entries already gone). */
 		for (i = 0; i < ndirty; i++)
 		{
 			if (entries[i].partRel != NULL && entries[i].dead != NULL)
@@ -2953,7 +2990,7 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 		}
 	}
 
-	/* 6. Drop the drained queue rows (only the partseqs we processed). */
+	/* 7. Drop the drained queue rows (only the partseqs we processed). */
 	SpanningDrainqDeleteList(spanningIndexOid, dirty);
 
 	/* Cleanup; keep all locks until commit (NoLock on close). */

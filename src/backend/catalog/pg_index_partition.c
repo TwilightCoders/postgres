@@ -194,9 +194,8 @@ SpanningGetOrAllocPartseq(Relation spanningIndex, Oid partitionOid)
  * syscache.
  */
 Oid
-SpanningResolvePartseqRelid(Relation spanningIndex, int32 partseq)
+SpanningResolvePartseqRelidByOid(Oid spanningIndexOid, int32 partseq)
 {
-	Oid			spanningIndexOid = RelationGetRelid(spanningIndex);
 	HeapTuple	tup;
 	Oid			partitionOid = InvalidOid;
 
@@ -212,6 +211,13 @@ SpanningResolvePartseqRelid(Relation spanningIndex, int32 partseq)
 	}
 
 	return partitionOid;
+}
+
+Oid
+SpanningResolvePartseqRelid(Relation spanningIndex, int32 partseq)
+{
+	return SpanningResolvePartseqRelidByOid(RelationGetRelid(spanningIndex),
+										   partseq);
 }
 
 /*
