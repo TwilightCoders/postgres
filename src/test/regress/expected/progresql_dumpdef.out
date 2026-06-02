@@ -60,5 +60,28 @@ INSERT INTO dd VALUES (1, '2024-06-01', 'x');
 INSERT INTO dd VALUES (2, '2025-06-01', 'x');   -- ERROR: duplicate key (tag)=(x)
 ERROR:  duplicate key value violates unique constraint "dd_tag_uq"
 DETAIL:  Key (tag)=(x) already exists.
+-- E6: the trailing discriminator key column is an honest int4 "partseq"
+-- (not the oid tableoid system column it physically carries), so its type,
+-- opclass, and the cleanup scankey all agree.
+SELECT a.attname, t.typname
+  FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+  WHERE a.attrelid = 'dd_pkey'::regclass AND a.attnum > 0
+  ORDER BY a.attnum;
+ attname | typname 
+---------+---------
+ id      | int8
+ partseq | int4
+(2 rows)
+
+SELECT oc.opcname
+  FROM pg_index i, unnest(i.indclass) WITH ORDINALITY u(cls, ord)
+  JOIN pg_opclass oc ON oc.oid = u.cls
+  WHERE i.indexrelid = 'dd_pkey'::regclass ORDER BY u.ord;
+ opcname  
+----------
+ int8_ops
+ int4_ops
+(2 rows)
+
 DROP TABLE dd CASCADE;
 DROP TABLE dd_base;

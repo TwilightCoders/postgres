@@ -37,5 +37,17 @@ SELECT indnuniqatts FROM pg_index WHERE indexrelid = 'dd_tag_uq'::regclass;
 INSERT INTO dd VALUES (1, '2024-06-01', 'x');
 INSERT INTO dd VALUES (2, '2025-06-01', 'x');   -- ERROR: duplicate key (tag)=(x)
 
+-- E6: the trailing discriminator key column is an honest int4 "partseq"
+-- (not the oid tableoid system column it physically carries), so its type,
+-- opclass, and the cleanup scankey all agree.
+SELECT a.attname, t.typname
+  FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+  WHERE a.attrelid = 'dd_pkey'::regclass AND a.attnum > 0
+  ORDER BY a.attnum;
+SELECT oc.opcname
+  FROM pg_index i, unnest(i.indclass) WITH ORDINALITY u(cls, ord)
+  JOIN pg_opclass oc ON oc.oid = u.cls
+  WHERE i.indexrelid = 'dd_pkey'::regclass ORDER BY u.ord;
+
 DROP TABLE dd CASCADE;
 DROP TABLE dd_base;
