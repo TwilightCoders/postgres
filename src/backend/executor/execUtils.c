@@ -46,6 +46,7 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "access/spanning.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "executor/executor.h"

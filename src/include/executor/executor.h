@@ -741,13 +741,6 @@ extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 								   bool noDupErr,
 								   bool *specConflict, List *arbiterIndexes,
 								   bool onlySummarizing);
-/* ProgreSQL spanning indexes: cross-partition uniqueness via tableoid key col */
-extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
-										   ItemPointer tupleid,
-										   Relation partition,
-										   EState *estate,
-										   ResultRelInfo *resultRelInfo);
-extern void ProgresqlReleasePartitionCache(EState *estate);
 extern bool ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo,
 									  TupleTableSlot *slot,
 									  EState *estate, ItemPointer conflictTid,

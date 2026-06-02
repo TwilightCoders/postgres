@@ -53,6 +53,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/spanning.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "commands/trigger.h"
