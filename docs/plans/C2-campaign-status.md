@@ -155,22 +155,30 @@ pg_upgrade TAP tests; psql `\d` spanning annotation (P2-2). Note the pg_dump
 query gates indnuniqatts at remoteVersion>=180000 — fork pg_dump targets fork
 servers (vanilla-18 dump would need a feature probe; documented).
 
-## NEXT after E2 (priority order)
-2. **E2 / P0-2 — dump + `pg_upgrade`.** The ONE real silent-data-loss path:
-   `pg_get_indexdef` (ruleutils.c ~1398 loop over `indnatts`) emits the trailing
-   discriminator → logical restore silently downgrades to a plain index. Fix:
-   ruleutils clip trailing col + emit `GLOBAL` (now that P1-1 exists);
-   `binary_upgrade_set_index_partition_map(...)` in pg_upgrade_support.c (mirror
-   `binary_upgrade_add_sub_rel_state`), gate `SpanningGetOrAllocPartseq` off under
-   `IsBinaryUpgrade`; pg_dump `getIndexes` SELECT `indnuniqatts` + emit the calls;
-   TAP for pg_dump round-trip + pg_upgrade re-checking cross-partition uniqueness.
-   Plan: `docs/plans/P0-2-dump-upgrade.md`.
-3. **E6 / M1 — real `int4` discriminator column** (retire `tableoid`-carrier).
-   Recipe: `docs/plans/M1-int4-discriminator-recipe.md` (option b1, M-effort).
-   Upstream type-honesty gate; aligns with Dilip-2025.
-4. **E1b — retire implicit INHERITS handshake**, migrate all `progresql*.sql`
-   tests + README to `GLOBAL` (drop INHERITS/base, inline cols, add `GLOBAL`).
-   Removes `has_superclass` term at `indexcmds.c:755` + `parse_utilcmd` allowance.
+## E6 / M1 — DONE `bc90284b69` (honest int4 discriminator)
+The trailing spanning key column was the tableoid system slot (oid/oid_ops) but
+held an int32 partseq (scankey F_INT4EQ) — a type lie `\d` exposed as "tableoid".
+Fixed (option b1, no on-disk change — int4≡oid byte layout): indexcmds.c uses
+int4_ops + name "partseq"; index.c `ConstructTupleDescriptor` stamps the trailing
+spanning column's pg_attribute as INT4OID (gated on ii_NumUniqKeyAtts>0 + last key
+col == attno -6, so normal indexes untouched); genam comment. Verified: column is
+int4/int4_ops/"partseq", uniqueness + VACUUM work, 240 green. No catversion bump
+(runtime-only; old oid_ops indexes still function, REINDEX relabels — optional).
+
+## NEXT (priority order)
+1. **E1b — retire implicit INHERITS handshake** (IN PROGRESS), migrate all
+   `progresql*.sql` tests + README to `GLOBAL` (drop INHERITS/base, inline cols,
+   add `GLOBAL`). Removes `has_superclass` term at `indexcmds.c` opt-in +
+   `parse_utilcmd` allowance. LARGE test migration — do incrementally, regenerate
+   each expected output, keep make check green.
+2. **E2 follow-ups (NOT data-loss):** pg_dump|psql TAP test, pg_upgrade TAP test
+   (binary upgrade — should be covered by the dumpConstraint fix but unverified),
+   psql `\d` spanning annotation (P2-2).
+3. **E5 inc5b (task #27):** isolation specs (drain∥DML, drain∥eager-VACUUM) +
+   TAP crash test (drainq durable across crash).
+4. **DHR follow-ups:** `VACUUM <root>` end-of-command drain hook; launcher
+   periodic sweep; extend deferral to local-index leaves; antagonist standalone
+   TODOs (B3 lock protocol, M4 memoize has-spanning-ancestor).
 
 ## VERIFIED findings (live repros, not assumptions)
 - **HOT key-change = P0** (fixed, E7). Repro is `progresql_hot`.
