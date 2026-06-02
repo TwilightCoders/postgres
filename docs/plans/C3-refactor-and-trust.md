@@ -50,6 +50,34 @@ HARD one — do it as a FOCUSED pass, AFTER (B) testing exists as the net:
 - Verify: build + 240 + the new isolation/recovery tests + progresql_drain regress.
 
 ## (B) Trust-testing — what drops the README flag
+
+### PROGRESS 2026-06-02 (night)
+Trust-testing started AND turned up real bugs. Done this pass:
+- Isolation specs: `spanning-unique` (cross-partition uniqueness under
+  concurrency — the core "correct by reuse of `_bt_check_unique`" proof) and
+  `spanning-detach` (DETACH vs concurrent DML). Both green, in `isolation_schedule`.
+- Crash-recovery TAP: `src/test/recovery/t/049_spanning_crash.pl` (11 assertions:
+  committed rows survive WAL replay, uncommitted rolled back with no phantom
+  entry, uniqueness preserved, map intact). Green.
+- **Bugs found + fixed** (commit-verified): (A) abort-unsafe DETACH/DROP/TRUNCATE
+  cleanup left LP_DEAD across ROLLBACK → silent corruption — `b0caff8cf2`;
+  (1) colliding INSERT vs unresolvable partseq probed the storage-less root →
+  SIGSEGV — `d6bc169300`.
+- **Bugs found, VERIFIED, DEFERRED** (design/review needed — do NOT rush
+  overnight): partseq reuse on highest-partition detach (#2, needs a persisted
+  high-water mark + pg_dump/pg_upgrade work), its reuse-chains (#3/#4/#7),
+  TRUNCATE hint crash-durability (#8), amcheck heapallindexed crash on the
+  storage-less root (Z).  **See `docs/plans/C3-spanning-bug-hunt-findings.md`**
+  for repros, mechanisms, recommended fixes, and the unverified follow-up probes
+  (concurrent DETACH races, sub-partition trees, multiple spanning indexes, etc).
+- amcheck `bt_index_check(idx)` (structural) WORKS on a spanning index;
+  `bt_index_check(idx, true)` (heapallindexed) CRASHES (item Z).
+
+Remaining for the flag: fix #2 + chain, #4, #8, Z; the concurrency-race probe;
+then the perf fix + soak. The two fixes above remove the most-reachable bugs but
+are NOT by themselves sufficient to drop the flag.
+
+### Original audit / plan
 Audit (2026-06-02): we have ZERO concurrency + ZERO crash-recovery tests; amcheck
 can't validate a spanning index. Reassurance: we wrote NO custom WAL / resource
 managers (all standard btree+heap WAL) and uniqueness uses btree's own
@@ -76,9 +104,19 @@ DEFAULT + cover local-index partitions — currently DHR is off-by-default AND o
 covers `nindexes==0` leaves; see C2-campaign-status.md), a soak run (concurrent
 load for hours + periodic amcheck, zero corruption), and ideally outside review.
 
-## Recommended next-session order
-1. (B) testing #1 concurrency, #2 recovery, #3 amcheck — each verified.
-2. (A) BLOCK 5 vacuumlazy extraction, with the new tests as the safety net.
-3. Then perf fix → soak → relax the flag.
-A Workflow fits (B) well (parallel authoring of isolation specs / recovery tests
-/ amcheck), but keep it surgical — these are tests, not new core subsystems.
+## Recommended next-session order (revised 2026-06-02 night)
+1. **Fix the deferred bug-hunt findings** (`C3-spanning-bug-hunt-findings.md`),
+   highest-leverage first: #2 partseq-no-reuse (a reviewed catalog/pg_dump change —
+   defuses #3/#7 and most of #4), then #4 `RemoveSpanningDrainqForPartition`
+   (surgical), then Z amcheck guard (and ideally full partition-aware support =
+   the verifiability item), then #8 TRUNCATE crash-durable retirement (with a
+   kill-9 TAP). Each: live repro → fix → regression test → full suite → commit.
+2. Run the unverified follow-up probes (concurrency races, sub-partition trees,
+   multiple spanning indexes, partition-key UPDATE) — extend the hunt.
+3. (A) BLOCK 5 vacuumlazy extraction, with the now-substantial test net.
+4. Then perf fix → soak → relax the flag.
+NOTE: do NOT rush #2/#8 — they touch the catalog / pg_dump / pg_upgrade and
+crash-durability; my abort-safety fix (A) itself introduced crash #1, the lesson
+being that complex spanning fixes need careful verification + review, not 2am
+surgery. A Workflow fits the read-only HUNT well (it found these); keep fixes solo
++ live-verified.
