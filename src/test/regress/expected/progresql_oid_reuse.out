@@ -9,8 +9,8 @@
 -- never alias a spanning entry.  This test asserts NO false conflict.
 --
 -- It is intentionally NOT in parallel_schedule until C1-D makes it pass.
-CREATE TABLE oir_base (id bigint NOT NULL, ts timestamptz NOT NULL);
-CREATE TABLE oir (PRIMARY KEY (id)) INHERITS (oir_base) PARTITION BY RANGE (ts);
+CREATE TABLE oir (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
 CREATE TABLE oir_2024 PARTITION OF oir FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 CREATE TABLE oir_2025 PARTITION OF oir FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 INSERT INTO oir VALUES (1, '2025-06-01');   -- lands in oir_2025
@@ -31,4 +31,3 @@ SELECT count(*) AS rows_with_id_1 FROM oir WHERE id = 1;
 (1 row)
 
 DROP TABLE oir CASCADE;
-DROP TABLE oir_base;

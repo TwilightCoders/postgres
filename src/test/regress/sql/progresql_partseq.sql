@@ -10,8 +10,8 @@
 --   * never reused: a partition joining after a DETACH gets a fresh number;
 --   * preserved across REINDEX.
 
-CREATE TABLE psq_base (id bigint NOT NULL, ts timestamptz NOT NULL);
-CREATE TABLE psq (PRIMARY KEY (id)) INHERITS (psq_base) PARTITION BY RANGE (ts);
+CREATE TABLE psq (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
 
 -- PARTITION OF path: each new partition gets the next partseq.
 CREATE TABLE psq_2024 PARTITION OF psq FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
@@ -69,5 +69,4 @@ FROM pg_index_partition
 WHERE indpartidxid NOT IN (SELECT oid FROM pg_class)
    OR indpartrelid NOT IN (SELECT oid FROM pg_class);
 
-DROP TABLE psq_base;
 DROP TABLE psq_2025;  -- the detached partition, now standalone

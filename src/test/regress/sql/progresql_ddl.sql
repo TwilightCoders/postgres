@@ -18,12 +18,12 @@
 --
 
 -- Setup
-CREATE TABLE pgddl_base (id bigint, kind text, ts timestamptz NOT NULL);
-
 CREATE TABLE pgddl_data (
-    PRIMARY KEY (id)
-) INHERITS (pgddl_base)
-  PARTITION BY RANGE (ts);
+    id   bigint,
+    kind text,
+    ts   timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL
+) PARTITION BY RANGE (ts);
 
 CREATE TABLE pgddl_2023 PARTITION OF pgddl_data
     FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
@@ -152,6 +152,5 @@ ROLLBACK;
 
 -- Section 6: CASCADE DROP cleans up all objects.
 DROP TABLE pgddl_data CASCADE;
-DROP TABLE pgddl_base;
 
 SELECT COUNT(*) FROM pg_class WHERE relname LIKE 'pgddl%';

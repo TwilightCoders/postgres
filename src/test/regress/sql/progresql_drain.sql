@@ -13,8 +13,8 @@
 
 SET spanning_defer_vacuum = on;
 
-CREATE TABLE dr_base (id bigint NOT NULL, ts timestamptz NOT NULL);
-CREATE TABLE dr (PRIMARY KEY (id)) INHERITS (dr_base) PARTITION BY RANGE (ts);
+CREATE TABLE dr (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
 CREATE TABLE dr_a PARTITION OF dr FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')
   WITH (autovacuum_enabled = false);
 CREATE TABLE dr_b PARTITION OF dr FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')
@@ -57,12 +57,11 @@ SELECT id, count(*) FROM dr GROUP BY id ORDER BY id;
 SELECT pg_drain_spanning_index('dr_pkey'::regclass) AS retired_again;
 
 DROP TABLE dr CASCADE;
-DROP TABLE dr_base;
 
 -- Multi-partition coalescing: dead entries in several partitions are retired in
 -- a SINGLE index scan.
-CREATE TABLE mc_base (id bigint NOT NULL, k int NOT NULL);
-CREATE TABLE mc (PRIMARY KEY (id)) INHERITS (mc_base) PARTITION BY LIST (k);
+CREATE TABLE mc (id bigint NOT NULL, k int NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY LIST (k);
 CREATE TABLE mc0 PARTITION OF mc FOR VALUES IN (0) WITH (autovacuum_enabled = false);
 CREATE TABLE mc1 PARTITION OF mc FOR VALUES IN (1) WITH (autovacuum_enabled = false);
 CREATE TABLE mc2 PARTITION OF mc FOR VALUES IN (2) WITH (autovacuum_enabled = false);
@@ -88,7 +87,6 @@ SELECT count(*) AS rows, count(*) FILTER (WHERE cnt > 1) AS dups
   FROM (SELECT id, count(*) cnt FROM mc GROUP BY id) s;
 
 DROP TABLE mc CASCADE;
-DROP TABLE mc_base;
 
 -- Negative: draining a non-spanning index is an error.
 CREATE TABLE drq_plain (x int PRIMARY KEY);
@@ -99,8 +97,8 @@ DROP TABLE drq_plain;
 -- reaps every LP_DEAD slot, which would orphan a live local-index entry.  Such
 -- leaves use the eager path (no enqueue), so the drain never touches them and
 -- the local index stays consistent with the heap.
-CREATE TABLE li_base (id bigint NOT NULL, v int NOT NULL);
-CREATE TABLE li (PRIMARY KEY (id)) INHERITS (li_base) PARTITION BY LIST ((id % 1));
+CREATE TABLE li (id bigint NOT NULL, v int NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY LIST ((id % 1));
 CREATE TABLE li0 PARTITION OF li FOR VALUES IN (0) WITH (autovacuum_enabled = false);
 CREATE INDEX li0_v ON li0 (v);
 INSERT INTO li SELECT g, g FROM generate_series(1, 500) g;
@@ -116,13 +114,12 @@ SET enable_indexscan = off; SET enable_bitmapscan = off;
 SELECT count(*) AS li_seq_rows FROM li0 WHERE v BETWEEN 1 AND 250;
 RESET enable_indexscan; RESET enable_bitmapscan;
 DROP TABLE li CASCADE;
-DROP TABLE li_base;
 
 -- Dup-key churn against a spanning index must not crash: the heap-probing
 -- pre-split deletion passes are skipped for spanning indexes (their heapRel is
 -- the AM-less partitioned root).  Reaching the end without a crash is the test.
-CREATE TABLE ch_base (id bigint NOT NULL, pad text);
-CREATE TABLE ch (PRIMARY KEY (id)) INHERITS (ch_base) PARTITION BY RANGE (id);
+CREATE TABLE ch (id bigint NOT NULL, pad text,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (id);
 CREATE TABLE ch0 PARTITION OF ch FOR VALUES FROM (0) TO (100000)
   WITH (autovacuum_enabled = false);
 DO $$
@@ -134,6 +131,5 @@ BEGIN
 END $$;
 SELECT count(*) AS ch_survived FROM ch;
 DROP TABLE ch CASCADE;
-DROP TABLE ch_base;
 
 RESET spanning_defer_vacuum;

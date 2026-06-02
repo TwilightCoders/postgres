@@ -11,8 +11,8 @@
 --
 -- It is intentionally NOT in parallel_schedule until C1-D makes it pass.
 
-CREATE TABLE vc_base (id bigint NOT NULL, ts timestamptz NOT NULL);
-CREATE TABLE vc (PRIMARY KEY (id)) INHERITS (vc_base) PARTITION BY RANGE (ts);
+CREATE TABLE vc (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
 CREATE TABLE vc_2024 PARTITION OF vc FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 CREATE TABLE vc_2025 PARTITION OF vc FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 
@@ -34,4 +34,3 @@ VACUUM vc_2024;
 INSERT INTO vc VALUES (20, '2025-08-01');   -- expect ERROR: duplicate key (id)=(20)
 
 DROP TABLE vc CASCADE;
-DROP TABLE vc_base;

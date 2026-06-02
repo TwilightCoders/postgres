@@ -10,8 +10,8 @@
 -- are eligible.  This test asserts the sibling's uniqueness entry survives.
 --
 -- It is intentionally NOT in parallel_schedule until C1-D makes it pass.
-CREATE TABLE vc_base (id bigint NOT NULL, ts timestamptz NOT NULL);
-CREATE TABLE vc (PRIMARY KEY (id)) INHERITS (vc_base) PARTITION BY RANGE (ts);
+CREATE TABLE vc (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
 CREATE TABLE vc_2024 PARTITION OF vc FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 CREATE TABLE vc_2025 PARTITION OF vc FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 -- Make each partition's first live row share heap TID (0,1): a single insert
@@ -30,4 +30,3 @@ INSERT INTO vc VALUES (20, '2025-08-01');   -- expect ERROR: duplicate key (id)=
 ERROR:  duplicate key value violates unique constraint "vc_pkey"
 DETAIL:  Key (id)=(20) already exists.
 DROP TABLE vc CASCADE;
-DROP TABLE vc_base;

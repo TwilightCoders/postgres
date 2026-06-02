@@ -7,8 +7,8 @@
 -- (the discriminator differs per partition, so the composite key is always
 -- "unique").  This test pins the round-trippable definitions.
 
-CREATE TABLE dd_base (id bigint NOT NULL, ts timestamptz NOT NULL, tag text);
-CREATE TABLE dd (PRIMARY KEY (id)) INHERITS (dd_base) PARTITION BY RANGE (ts);
+CREATE TABLE dd (id bigint NOT NULL, ts timestamptz NOT NULL, tag text,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
 CREATE TABLE dd1 PARTITION OF dd FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 CREATE TABLE dd2 PARTITION OF dd FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 -- a standalone spanning UNIQUE index too (covers pg_get_indexdef directly)
@@ -50,4 +50,3 @@ SELECT oc.opcname
   WHERE i.indexrelid = 'dd_pkey'::regclass ORDER BY u.ord;
 
 DROP TABLE dd CASCADE;
-DROP TABLE dd_base;
