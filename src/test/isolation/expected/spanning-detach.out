@@ -1,0 +1,28 @@
+Parsed test spec with 3 sessions
+
+starting permutation: d1 i2 c1 c2 show
+step d1: ALTER TABLE spans DETACH PARTITION spans_a;
+step i2: INSERT INTO spans VALUES (1, '2025-06-01'); <waiting ...>
+step c1: COMMIT;
+step i2: <... completed>
+step c2: COMMIT;
+step show: SELECT id, ts FROM spans ORDER BY id, ts;
+id|ts                          
+--+----------------------------
+ 1|Sun Jun 01 00:00:00 2025 PDT
+(1 row)
+
+
+starting permutation: d1 i2 a1 c2 show
+step d1: ALTER TABLE spans DETACH PARTITION spans_a;
+step i2: INSERT INTO spans VALUES (1, '2025-06-01'); <waiting ...>
+step a1: ABORT;
+step i2: <... completed>
+ERROR:  duplicate key value violates unique constraint "spans_pkey"
+step c2: COMMIT;
+step show: SELECT id, ts FROM spans ORDER BY id, ts;
+id|ts                          
+--+----------------------------
+ 1|Sat Jun 01 00:00:00 2024 PDT
+(1 row)
+
