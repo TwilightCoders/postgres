@@ -31,4 +31,9 @@ extern void progresql_clean_spanning_indexes_for_partition(Relation partRel,
 extern void progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel);
 extern void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
 
+/* spanning_relcache.c — HOT-blocking attrs for spanning keys on leaves (E7) */
+extern void progresql_add_spanning_hotblocking_attrs(Relation relation,
+													 Bitmapset **hotblockingattrs);
+extern bool progresql_leaf_has_spanning_ancestor(Relation relation);
+
 #endif							/* SPANNING_H */

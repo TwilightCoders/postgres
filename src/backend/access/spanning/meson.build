@@ -3,4 +3,5 @@
 backend_sources += files(
   'spanning_ddl.c',
   'spanning_exec.c',
+  'spanning_relcache.c',
 )
