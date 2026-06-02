@@ -38,10 +38,35 @@
 - Earlier in session (pre-ultracode): C1-D2 crash-safe partseq VACUUM
   (`bc49f971c8`, `66c9c0a3d9`), perf characterization (`a4cd26e2b1`).
 
-## NEXT (priority order)
-1. **E5 / DHR — deferred spanning VACUUM, O(N²)→O(N). USER #1. XL.** Full design:
-   `docs/plans/C2-deferred-vacuum-DHR-design.md`. Now unblocked by E7. Subsumes
-   antagonist B2 (leaf-only delete primitive) and the per-leaf full-scan.
+## E5 / DHR build progress (USER #1, in progress)
+Full design: `docs/plans/C2-deferred-vacuum-DHR-design.md`. 5 increments.
+- **inc1 DONE** `cd857bbeb0` — `pg_spanning_drainq` catalog (OID 563, PK index
+  564, syscache SPANNINGDRAINQ), `RemoveSpanningDrainqForIndex` wired into
+  `index_drop`. Empty/unconsulted; clean rebuild; 238/238 green; schema
+  smoke-tested on a scratch cluster. **Two deliberate deviations from the design
+  appendix, both toward upstream-legibility (doc updated to match):** (a)
+  `sdq_enqueue_xid` is `TransactionId`/`xid` (32-bit, as `relfrozenxid`), NOT
+  `xid8` — drainq rows are transient (drained within a drain-interval by the age
+  trigger) so 32-bit + `TransactionIdPrecedes` is sufficient and idiomatic, and
+  avoids a `Catalog.pm` type-map addition + being the first xid8 catalog column;
+  (b) ONE PK index `(sdq_idxid, sdq_partseq)`, NOT two — the PK's leading column
+  already serves the drain's "all pending for this root" range scan (as
+  `spanning_max_partseq` range-scans `pg_index_partition`'s PK), so a separate
+  `(sdq_idxid)` index is pure redundancy.
+- **inc2 NEXT** — enqueue + reap-suppression. KEY: a spanning leaf's *entire*
+  dead set is spanning-relevant (root index references every partition row), so
+  DHR defers ALL heap reaping to the drain. inc2-without-drain would leave
+  spanning entries un-retired → false cross-partition conflicts → would BREAK
+  `progresql_vacuum_collision`. Therefore **DHR must land behind a default-OFF
+  GUC** (eager path preserved) so each increment is `make check` green; flip the
+  GUC on for new tests in inc5, and make it the default once the full drain is
+  validated. The 3 `lazy_vacuum` sites are vacuumlazy.c:2678 (nindexes==0, the
+  whole heap-reap is deferred → skip `lazy_vacuum_heap_rel`, don't bump
+  `num_index_scans`/M3), :2769 (bypass; already no heap reap), :2785 (normal;
+  skip the paired `lazy_vacuum_heap_rel` for spanning leaves under DHR).
+- inc3 coalesced drain; inc4 autovacuum trigger; inc5 tests+perf. See design doc.
+
+## NEXT after E5 (priority order)
 2. **E2 / P0-2 — dump + `pg_upgrade`.** The ONE real silent-data-loss path:
    `pg_get_indexdef` (ruleutils.c ~1398 loop over `indnatts`) emits the trailing
    discriminator → logical restore silently downgrades to a plain index. Fix:

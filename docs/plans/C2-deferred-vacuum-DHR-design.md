@@ -92,6 +92,25 @@ These were the non-HOT residual holes; the implementation MUST address each:
    `heaprel` already applied in `de985525d8`, and call `btvacuumcleanup` at the
    end so the metapage bookkeeping is finalized).
 
+## AS-BUILT deviations from the appendix below (read this)
+The appendix is the original design-panel output. The implementation deviates in
+two places, both toward upstream-legibility (see C2-campaign-status.md):
+- **`sdq_enqueue_xid` is `TransactionId`/`xid` (32-bit), not `xid8`.** Drainq
+  rows are transient — drained within a drain-interval by the age trigger — so a
+  32-bit witness compared with the standard `TransactionIdPrecedes` is sufficient
+  and idiomatic (cf. `pg_class.relfrozenxid`). Avoids a `Catalog.pm` type-map
+  addition and being the first-ever `xid8` catalog column.
+- **One PK index `(sdq_idxid, sdq_partseq)`, not two.** Its leading column serves
+  the drain's "all pending for this root" range scan (as `spanning_max_partseq`
+  range-scans `pg_index_partition`'s PK), so a dedicated `(sdq_idxid)` index is
+  redundant.
+- **DHR lands behind a default-OFF GUC** (the appendix's `defer_spanning_reap`
+  becomes a user-facing GUC defaulting off). A spanning leaf's entire dead set is
+  spanning-relevant, so DHR defers ALL heap reaping to the drain; enqueue-without-
+  drain would un-retire spanning entries and break cross-partition uniqueness.
+  The GUC keeps each increment `make check` green (eager path preserved) until the
+  full drain exists; flip default on once validated.
+
 ## Suggested implementation increments (each compiles + `make check` green)
 1. **Catalog `pg_spanning_drainq`** (genbki, fixed oids, PK (sdq_idxid,
    sdq_partseq) + index on sdq_idxid, syscache). Empty; dumps. Mirror
