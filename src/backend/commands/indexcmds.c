@@ -1223,10 +1223,19 @@ DefineIndex(Oid tableId,
 	{
 		int			N = indexInfo->ii_NumIndexKeyAttrs;
 
-		/* Record how many columns are truly unique (excludes tableoid). */
+		/* Record how many columns are truly unique (excludes the discriminator). */
 		indexInfo->ii_NumUniqKeyAtts = N;
 
-		/* Append tableoid (system column -6) as the (N+1)th key column. */
+		/*
+		 * Append the partseq discriminator as the (N+1)th key column.  The value
+		 * carrier is the tableoid system attribute slot (attno -6): its trailing
+		 * value is always overwritten with the int32 partseq after FormIndexDatum
+		 * (see execIndexing.c / FormSpanningPartseq), so the heap's actual
+		 * tableoid is never stored.  The column is presented as an honest int4
+		 * (int4_ops, name "partseq") --- ConstructTupleDescriptor stamps its
+		 * pg_attribute as INT4OID --- so introspection, opclass, and the
+		 * comparator all agree (the value really is an int32 partseq).
+		 */
 		Assert(N < INDEX_MAX_KEYS);
 		indexInfo->ii_IndexAttrNumbers[N] = TableOidAttributeNumber;
 		indexInfo->ii_NumIndexKeyAttrs = N + 1;
@@ -1239,12 +1248,12 @@ DefineIndex(Oid tableId,
 		opclassOptions = repalloc(opclassOptions, (N + 1) * sizeof(Datum));
 
 		collationIds[N] = InvalidOid;
-		opclassIds[N] = GetDefaultOpClass(OIDOID, BTREE_AM_OID);
+		opclassIds[N] = GetDefaultOpClass(INT4OID, BTREE_AM_OID);
 		coloptions[N] = 0;
 		opclassOptions[N] = (Datum) 0;
 
-		/* Add a column name for the appended tableoid key column. */
-		indexColNames = lappend(indexColNames, "tableoid");
+		/* Add a column name for the appended partseq discriminator key column. */
+		indexColNames = lappend(indexColNames, "partseq");
 	}
 
 	/* Is index safe for others to ignore?  See set_indexsafe_procflags() */

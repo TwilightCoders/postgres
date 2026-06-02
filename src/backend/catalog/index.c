@@ -345,32 +345,57 @@ ConstructTupleDescriptor(Relation heapRelation,
 			/* Simple index column */
 			const FormData_pg_attribute *from;
 
-			if (atnum < 0)
+			/*
+			 * ProgreSQL: the spanning index's trailing key column carries the
+			 * int32 partseq discriminator in the tableoid system-attribute slot
+			 * (attno -6).  Present it as an honest int4 "partseq" column rather
+			 * than copying the oid type from SystemAttributeDefinition: the value
+			 * stored is an int32 partseq, the opclass is int4_ops, and the DDL
+			 * cleanup scankey uses F_INT4EQ, so the catalog attribute type must
+			 * agree.  int4 and oid are byte-identical on disk (4-byte, byval,
+			 * int-aligned), so the index tuple layout is unchanged.
+			 */
+			if (atnum == TableOidAttributeNumber &&
+				indexInfo->ii_NumUniqKeyAtts > 0 &&
+				i == numkeyatts - 1)
 			{
-				/*
-				 * ProgreSQL spanning indexes use system attributes (e.g.
-				 * tableoid) as appended disambiguation columns.  Look up the
-				 * canonical system-attribute definition rather than the heap
-				 * tupdesc, since system columns have no heap entry.
-				 */
-				from = SystemAttributeDefinition(atnum);
+				to->atttypid = INT4OID;
+				to->attlen = sizeof(int32);
+				to->attndims = 0;
+				to->atttypmod = -1;
+				to->attbyval = true;
+				to->attalign = TYPALIGN_INT;
+				to->attstorage = TYPSTORAGE_PLAIN;
+				to->attcompression = InvalidCompressionMethod;
 			}
 			else
 			{
-				if (atnum > natts)	/* safety check */
-					elog(ERROR, "invalid column number %d", atnum);
-				from = TupleDescAttr(heapTupDesc,
-									 AttrNumberGetAttrOffset(atnum));
-			}
+				if (atnum < 0)
+				{
+					/*
+					 * Other system-attribute index columns: look up the
+					 * canonical system-attribute definition rather than the heap
+					 * tupdesc, since system columns have no heap entry.
+					 */
+					from = SystemAttributeDefinition(atnum);
+				}
+				else
+				{
+					if (atnum > natts)	/* safety check */
+						elog(ERROR, "invalid column number %d", atnum);
+					from = TupleDescAttr(heapTupDesc,
+										 AttrNumberGetAttrOffset(atnum));
+				}
 
-			to->atttypid = from->atttypid;
-			to->attlen = from->attlen;
-			to->attndims = from->attndims;
-			to->atttypmod = from->atttypmod;
-			to->attbyval = from->attbyval;
-			to->attalign = from->attalign;
-			to->attstorage = from->attstorage;
-			to->attcompression = from->attcompression;
+				to->atttypid = from->atttypid;
+				to->attlen = from->attlen;
+				to->attndims = from->attndims;
+				to->atttypmod = from->atttypmod;
+				to->attbyval = from->attbyval;
+				to->attalign = from->attalign;
+				to->attstorage = from->attstorage;
+				to->attcompression = from->attcompression;
+			}
 		}
 		else
 		{

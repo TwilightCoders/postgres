@@ -241,7 +241,7 @@ BuildIndexValueDescription(Relation indexRelation,
 	/*
 	 * Build the column-name list.  For ProgreSQL spanning indexes
 	 * (indnuniqatts > 0), indnkeyatts has been reduced to indnuniqatts so we
-	 * exclude the appended tableoid disambiguation column from the message.
+	 * exclude the appended partseq discriminator column from the message.
 	 * Spanning indexes never have expression columns, so a manual loop using
 	 * column names suffices.  For ordinary indexes we fall back to
 	 * pg_get_indexdef_columns to preserve full expression rendering.
