@@ -2813,6 +2813,22 @@ _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 	Assert(!simpleonly || (!checkingunique && !uniquedup && !indexUnchanged));
 
 	/*
+	 * ProgreSQL: a spanning index's heapRel is the partitioned root, which has
+	 * no table access method (rd_tableam is NULL), and its heap TIDs are
+	 * partition-local.  The heap-probing pre-split deletion passes (simple and
+	 * bottom-up) call table_index_delete_tuples on heapRel, which would
+	 * dereference that NULL AM and crash; they also cannot be correct against a
+	 * single "heap" when the TIDs span many partitions.  Deduplication is also
+	 * skipped: a spanning index carries the trailing partseq key column, so its
+	 * posting-list/natts accounting is not exercised elsewhere, and avoiding
+	 * posting lists keeps the spanning vacuum/drain paths simpler.  So a spanning
+	 * leaf about to split just splits; VACUUM and the spanning drain retire dead
+	 * entries instead.
+	 */
+	if (RelationIsSpanning(rel))
+		return;
+
+	/*
 	 * Scan over all items to see which ones need to be deleted according to
 	 * LP_DEAD flags.  We'll usually manage to delete a few extra items that
 	 * are not marked LP_DEAD in passing.  Often the extra items that actually
