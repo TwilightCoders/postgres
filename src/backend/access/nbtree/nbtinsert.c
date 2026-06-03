@@ -605,8 +605,24 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 
 							if (OidIsValid(child_relid))
 							{
-								spanChildRel = table_open(child_relid, AccessShareLock);
-								checkRel = spanChildRel;
+								/*
+								 * Open the resolved partition defensively.  Cross-
+								 * backend safety rests on the partition-parent
+								 * AccessExclusiveLock: every path that removes a
+								 * partition takes it, while a spanning-maintaining
+								 * INSERT holds AccessShareLock on the root, so they
+								 * serialize and this syscache resolution cannot name
+								 * a relation that has already vanished.  Use
+								 * try_table_open rather than table_open so that if a
+								 * future path ever weakens that locking, we degrade to
+								 * a clean skip (treat as unresolved) instead of an
+								 * elog/crash on the storage-less root.
+								 */
+								spanChildRel = try_table_open(child_relid, AccessShareLock);
+								if (spanChildRel != NULL)
+									checkRel = spanChildRel;
+								else
+									span_unresolved = true;
 							}
 							else
 							{
