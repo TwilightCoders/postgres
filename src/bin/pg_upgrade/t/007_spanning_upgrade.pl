@@ -46,6 +46,18 @@ ALTER TABLE c DETACH PARTITION c_2024;
 ALTER TABLE c ATTACH PARTITION c_2024
     FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 INSERT INTO c VALUES (10, '2024-06-01'), (20, '2025-06-01');
+
+-- No-reuse case: DETACH the HIGHEST-numbered partition (s_2025, partseq 2)
+-- WITHOUT re-attaching, so the partseq counter (high-water mark = 3) now sits
+-- strictly above the surviving maximum (s_2024 = partseq 1).  pg_upgrade must
+-- preserve the counter, not re-derive it from the surviving map, or a post-
+-- upgrade ATTACH would reuse the freed number 2.
+CREATE TABLE s (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE s_2024 PARTITION OF s FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE s_2025 PARTITION OF s FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+ALTER TABLE s DETACH PARTITION s_2025;
+INSERT INTO s VALUES (5, '2024-06-01');
 SQL
 
 is( $oldnode->safe_psql('postgres',
@@ -56,6 +68,12 @@ is( $oldnode->safe_psql('postgres',
 my $old_map = $oldnode->safe_psql('postgres',
 	q{SELECT string_agg(indpartseq || ':' || indpartrelid::regclass, ',' ORDER BY indpartseq)
 	  FROM pg_index_partition WHERE indpartidxid = 'c_pkey'::regclass});
+
+# Capture the partseq high-water counter for s_pkey (highest partition detached,
+# so the counter sits above the surviving maximum).
+my $old_counter = $oldnode->safe_psql('postgres',
+	q{SELECT spseqnext FROM pg_spanning_seq WHERE spseqidxid = 's_pkey'::regclass});
+is($old_counter, '3', 'old cluster: s_pkey partseq counter is 3 (highest detached)');
 
 my $newnode = PostgreSQL::Test::Cluster->new('new_node');
 $newnode->init;
@@ -119,5 +137,31 @@ is( $newnode->safe_psql('postgres',
 	q{INSERT INTO c VALUES (10, '2025-07-01')});
 isnt($rc, 0,
 	'upgraded cluster: cross-partition duplicate rejected after DETACH/ATTACH churn');
+
+# 5. no-reuse case: the partseq counter is carried across verbatim, so a fresh
+#    ATTACH on the upgraded cluster gets the high-water number (3) and never
+#    reuses the freed partseq (2) baked into the transferred index file.
+is( $newnode->safe_psql('postgres',
+		q{SELECT spseqnext FROM pg_spanning_seq WHERE spseqidxid = 's_pkey'::regclass}),
+	$old_counter,
+	'upgraded cluster: pg_spanning_seq partseq counter preserved exactly');
+
+$newnode->safe_psql('postgres', <<'SQL');
+CREATE TABLE s_2026 (id bigint NOT NULL, ts timestamptz NOT NULL);
+ALTER TABLE s ATTACH PARTITION s_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+SQL
+
+is( $newnode->safe_psql('postgres',
+		q{SELECT indpartseq FROM pg_index_partition
+		  WHERE indpartrelid = 's_2026'::regclass}),
+	'3',
+	'upgraded cluster: post-upgrade ATTACH gets the high-water partseq (3), not the reused 2');
+
+# the new partition shares the spanning namespace: a duplicate of an existing id
+# inserted into it must still be rejected.
+($rc, $out, $err) = $newnode->psql('postgres',
+	q{INSERT INTO s VALUES (5, '2026-06-01')});
+isnt($rc, 0,
+	'upgraded cluster: cross-partition duplicate rejected in the newly attached partition');
 
 done_testing();
