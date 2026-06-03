@@ -71,6 +71,15 @@ CREATE TABLE pg_ml_2024 PARTITION OF pg_ml
     FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')
     PARTITION BY LIST (region);                                        -- ERROR: cannot sub-partition
 
+-- ATTACHing an already-partitioned table to a spanning root is rejected for the
+-- same reason (its grandchildren would have no partseq and escape the index).
+CREATE TABLE pg_ml2 (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pg_ml2_sub (id bigint NOT NULL, ts timestamptz NOT NULL)
+    PARTITION BY RANGE (ts);
+ALTER TABLE pg_ml2 ATTACH PARTITION pg_ml2_sub
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');                  -- ERROR: cannot attach a partitioned table
+
 -- Cleanup
 DROP TABLE pg_events;
 DROP TABLE pg_codes;
@@ -78,3 +87,5 @@ DROP TABLE pg_sku;
 DROP TABLE pg_alt;
 DROP TABLE pg_plain2;
 DROP TABLE pg_ml;
+DROP TABLE pg_ml2;
+DROP TABLE pg_ml2_sub;

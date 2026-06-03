@@ -17,6 +17,7 @@
 #include "access/genam.h"
 #include "access/gist.h"
 #include "access/relscan.h"
+#include "access/spanning.h"
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -627,6 +628,16 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 			CheckAndReportConflict(resultRelInfo, estate, CT_INSERT_EXISTS,
 								   recheckIndexes, NULL, slot);
 
+		/*
+		 * ProgreSQL: the apply worker writes through this simple path, not
+		 * ExecInsert, so it must maintain any spanning (GLOBAL) index on the
+		 * partitioned root itself -- otherwise a subscriber silently admits
+		 * cross-partition duplicates.  A cross-partition conflict raises a
+		 * unique violation, same as the local executor.
+		 */
+		if (rel->rd_rel->relispartition)
+			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid, rel, estate);
+
 		/* AFTER ROW INSERT Triggers */
 		ExecARInsertTriggers(estate, resultRelInfo, slot,
 							 recheckIndexes, NULL);
@@ -713,6 +724,17 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 		if (conflict)
 			CheckAndReportConflict(resultRelInfo, estate, CT_UPDATE_EXISTS,
 								   recheckIndexes, searchslot, slot);
+
+		/*
+		 * ProgreSQL: maintain spanning (GLOBAL) indexes on the partitioned root,
+		 * keyed on HOT-vs-cold exactly as ExecUpdate does.  A HOT update
+		 * (TU_None/TU_Summarizing) leaves the existing entry valid; a cold
+		 * update (TU_All) relocates the tuple to a fresh root, so a new spanning
+		 * entry for the new TID is required or the apply worker loses the row
+		 * from the spanning index (silent cross-partition duplicates).
+		 */
+		if (rel->rd_rel->relispartition && update_indexes == TU_All)
+			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid, rel, estate);
 
 		/* AFTER ROW UPDATE Triggers */
 		ExecARUpdateTriggers(estate, resultRelInfo,

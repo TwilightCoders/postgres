@@ -20350,6 +20350,34 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 				 errmsg("cannot attach a typed table as partition")));
 
 	/*
+	 * ProgreSQL: a spanning (GLOBAL) index requires every partition to be a
+	 * storage-bearing leaf -- partseq is allocated per direct partition and a
+	 * row is routed to a leaf whose partseq resolves its spanning entry.
+	 * Attaching a partitioned table would introduce grandchildren with no
+	 * partseq of their own: their pre-existing rows would never enter the
+	 * spanning index (silently escaping cross-partition uniqueness) and later
+	 * inserts would fail-closed with "no partseq".  Reject it here, mirroring
+	 * the CREATE TABLE ... PARTITION OF sub-partition guard.
+	 */
+	if (attachrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		ListCell   *cell;
+
+		foreach(cell, RelationGetIndexList(rel))
+		{
+			Relation	idxRel = index_open(lfirst_oid(cell), AccessShareLock);
+
+			if (RelationIsSpanning(idxRel))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot attach a partitioned table as a partition of a table with a spanning (GLOBAL) index"),
+						 errdetail("Spanning index \"%s\" requires every partition to be a leaf.",
+								   RelationGetRelationName(idxRel))));
+			index_close(idxRel, AccessShareLock);
+		}
+	}
+
+	/*
 	 * Table being attached should not already be part of inheritance; either
 	 * as a child table...
 	 */

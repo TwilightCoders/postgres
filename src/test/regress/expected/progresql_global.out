@@ -103,6 +103,16 @@ CREATE TABLE pg_ml_2024 PARTITION OF pg_ml
     PARTITION BY LIST (region);                                        -- ERROR: cannot sub-partition
 ERROR:  cannot sub-partition a partition of a table with a spanning (GLOBAL) index
 DETAIL:  Spanning index "pg_ml_pkey" does not support multi-level partitioning; every partition must be a leaf.
+-- ATTACHing an already-partitioned table to a spanning root is rejected for the
+-- same reason (its grandchildren would have no partseq and escape the index).
+CREATE TABLE pg_ml2 (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pg_ml2_sub (id bigint NOT NULL, ts timestamptz NOT NULL)
+    PARTITION BY RANGE (ts);
+ALTER TABLE pg_ml2 ATTACH PARTITION pg_ml2_sub
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');                  -- ERROR: cannot attach a partitioned table
+ERROR:  cannot attach a partitioned table as a partition of a table with a spanning (GLOBAL) index
+DETAIL:  Spanning index "pg_ml2_pkey" requires every partition to be a leaf.
 -- Cleanup
 DROP TABLE pg_events;
 DROP TABLE pg_codes;
@@ -110,3 +120,5 @@ DROP TABLE pg_sku;
 DROP TABLE pg_alt;
 DROP TABLE pg_plain2;
 DROP TABLE pg_ml;
+DROP TABLE pg_ml2;
+DROP TABLE pg_ml2_sub;
