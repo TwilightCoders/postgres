@@ -132,4 +132,37 @@ END $$;
 SELECT count(*) AS ch_survived FROM ch;
 DROP TABLE ch CASCADE;
 
+-- DETACH/DROP of a partition reaps that partition's pending drain-queue rows,
+-- so the obligation does not outlive its membership.  partseq no-reuse keeps an
+-- orphaned row benign (it would resolve to no partition and be skipped), but a
+-- leaked row would persist until the whole index is dropped; reaping it here is
+-- the hygienic close.
+CREATE TABLE dq (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE dq_a PARTITION OF dq FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')
+  WITH (autovacuum_enabled = false);
+CREATE TABLE dq_b PARTITION OF dq FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')
+  WITH (autovacuum_enabled = false);
+INSERT INTO dq VALUES (1, '2024-06-01'), (2, '2025-06-01');
+
+-- Enqueue a pending-drain row for each partition (delete + deferred VACUUM).
+DELETE FROM dq WHERE id IN (1, 2);
+VACUUM dq_a;
+VACUUM dq_b;
+SELECT count(*) AS drainq_before FROM pg_spanning_drainq
+  WHERE sdq_idxid = 'dq_pkey'::regclass;   -- expect 2
+
+-- DETACH dq_a: its drain-queue row is reaped along with its membership.
+ALTER TABLE dq DETACH PARTITION dq_a;
+SELECT count(*) AS drainq_after_detach FROM pg_spanning_drainq
+  WHERE sdq_idxid = 'dq_pkey'::regclass;   -- expect 1 (only dq_b's remains)
+
+-- DROP dq_b (still attached): its row is reaped too.
+DROP TABLE dq_b;
+SELECT count(*) AS drainq_after_drop FROM pg_spanning_drainq
+  WHERE sdq_idxid = 'dq_pkey'::regclass;   -- expect 0
+
+DROP TABLE dq CASCADE;
+DROP TABLE dq_a;   -- the detached partition, now standalone
+
 RESET spanning_defer_vacuum;

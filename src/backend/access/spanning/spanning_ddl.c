@@ -28,6 +28,7 @@
 #include "catalog/index.h"
 #include "catalog/partition.h"
 #include "catalog/pg_index_partition.h"
+#include "catalog/pg_spanning_drainq.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "partitioning/partdesc.h"
@@ -304,6 +305,15 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 			 * not survive a rollback of this command (spanning_queue_retire).
 			 */
 			spanning_queue_retire(indexOid, partseq);
+
+			/*
+			 * For DROP/DETACH, also reap this partition's deferred-drain queue
+			 * row so the obligation does not outlive its membership.  (A
+			 * transactional catalog delete --- safe inline, unlike the LP_DEAD
+			 * hint above.)  TRUNCATE keeps the partition, so it keeps its row.
+			 */
+			if (drop_map)
+				RemoveSpanningDrainqForPartseq(indexOid, partseq);
 		}
 
 		list_free(indexoidlist);

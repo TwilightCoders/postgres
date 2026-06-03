@@ -88,6 +88,7 @@ extern void SpanningDrainqEnqueue(Relation spanningIndex, int32 partseq,
 								  int64 ndead);
 extern List *SpanningDrainqListDirty(Oid spanningIndexOid);
 extern void SpanningDrainqDeleteList(Oid spanningIndexOid, List *partseqs);
+extern void RemoveSpanningDrainqForPartseq(Oid spanningIndexOid, int32 partseq);
 extern void RemoveSpanningDrainqForIndex(Oid spanningIndexOid);
 
 #endif							/* PG_SPANNING_DRAINQ_H */

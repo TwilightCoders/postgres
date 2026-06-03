@@ -189,6 +189,49 @@ SpanningDrainqDeleteList(Oid spanningIndexOid, List *partseqs)
 }
 
 /*
+ * RemoveSpanningDrainqForPartseq
+ *		Drop the pg_spanning_drainq row for one (spanning index, partseq), if
+ *		present.  Called from the DETACH/DROP partition-cleanup path so a
+ *		departing partition's pending-drain obligation does not outlive its
+ *		membership.  Otherwise the orphaned (idxid, partseq) row would describe
+ *		a partition that is gone: a later drain would resolve it to no partition
+ *		(harmless skip), but the row would leak until the index itself is
+ *		dropped.  This is a transactional catalog delete --- it rolls back with
+ *		an aborted DETACH, unlike the deferred LP_DEAD retirement.
+ *
+ * No-op if the partition had no pending drain row (the common case).  Scans the
+ * (sdq_idxid, sdq_partseq) primary-key index with both keys.
+ */
+void
+RemoveSpanningDrainqForPartseq(Oid spanningIndexOid, int32 partseq)
+{
+	Relation	catalog;
+	ScanKeyData skey[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	catalog = table_open(SpanningDrainqRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&skey[0],
+				Anum_pg_spanning_drainq_sdq_idxid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(spanningIndexOid));
+	ScanKeyInit(&skey[1],
+				Anum_pg_spanning_drainq_sdq_partseq,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(partseq));
+
+	scan = systable_beginscan(catalog, SpanningDrainqIdxidSeqIndexId,
+							  true, NULL, 2, skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		CatalogTupleDelete(catalog, &tup->t_self);
+
+	systable_endscan(scan);
+	table_close(catalog, RowExclusiveLock);
+}
+
+/*
  * RemoveSpanningDrainqForIndex
  *		Drop all pg_spanning_drainq rows belonging to a spanning index.  Called
  *		from index_drop so the drain queue does not outlive the index it
