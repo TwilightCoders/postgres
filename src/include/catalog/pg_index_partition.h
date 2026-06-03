@@ -9,9 +9,14 @@
  * spanning index stores partseq --- not the partition's tableoid --- as the
  * trailing discriminator key column, so this catalog is the authoritative
  * (index, partseq) -> partition resolution used when an index entry must be
- * traced back to the heap that owns its tuple.  partseq is index-local,
- * stable for the life of the partition's membership, and never reused, which
- * is what makes spanning indexes survive OID reuse and pg_upgrade.
+ * traced back to the heap that owns its tuple.  partseq is index-local and
+ * never reused (a persistent counter, pg_spanning_seq, guarantees it).  It is
+ * stable for the life of a partition's membership with one deliberate exception:
+ * TRUNCATE re-allocates a fresh partseq for the (still-attached) partition, so
+ * the truncated heap's stale spanning entries --- keyed on the old number ---
+ * become unresolvable and cannot resurrect after a crash to alias a reused heap
+ * TID (the durable analogue of how DETACH retires a partition).  Never-reuse is
+ * what makes spanning indexes survive OID reuse and pg_upgrade.
  *
  * At this point the catalog is defined but not yet populated or consulted by
  * any code path; allocation (writer) and resolution (reader) are added in
@@ -65,5 +70,6 @@ extern Oid	SpanningResolvePartseqRelid(Relation spanningIndex, int32 partseq);
 extern Oid	SpanningResolvePartseqRelidByOid(Oid spanningIndexOid, int32 partseq);
 extern void RemoveSpanningPartitionMapForIndex(Oid spanningIndexOid);
 extern void RemoveSpanningPartitionMapForPartition(Oid partitionOid);
+extern void RemoveSpanningPartitionMapEntry(Oid spanningIndexOid, Oid partitionOid);
 
 #endif							/* PG_INDEX_PARTITION_H */

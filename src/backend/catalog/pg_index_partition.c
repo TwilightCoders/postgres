@@ -220,6 +220,44 @@ spanning_delete_partition_rows(AttrNumber keyAttno, Oid indexId, Oid targetOid)
 }
 
 /*
+ * RemoveSpanningPartitionMapEntry
+ *		Drop the single pg_index_partition row mapping one spanning index to one
+ *		partition, if present.  Used by the TRUNCATE cleanup path to retire a
+ *		partition's current partseq so it can be re-allocated a fresh one: the
+ *		partition stays attached, but its truncated heap's stale spanning entries
+ *		(keyed on the old partseq) must become unresolvable, which they do once
+ *		the old (index, partition) map row is gone.
+ *
+ * Scans the (indpartidxid, indpartrelid) unique index with both keys.
+ */
+void
+RemoveSpanningPartitionMapEntry(Oid spanningIndexOid, Oid partitionOid)
+{
+	Relation	catalog;
+	ScanKeyData skey[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	catalog = table_open(IndexPartitionRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&skey[0], Anum_pg_index_partition_indpartidxid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(spanningIndexOid));
+	ScanKeyInit(&skey[1], Anum_pg_index_partition_indpartrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(partitionOid));
+
+	scan = systable_beginscan(catalog, IndexPartitionIdxidRelidIndexId,
+							  true, NULL, 2, skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		CatalogTupleDelete(catalog, &tup->t_self);
+
+	systable_endscan(scan);
+	table_close(catalog, RowExclusiveLock);
+}
+
+/*
  * RemoveSpanningPartitionMapForIndex
  *		Drop all pg_index_partition rows belonging to a spanning index.  Called
  *		from index_drop so the partseq map does not outlive the index (which

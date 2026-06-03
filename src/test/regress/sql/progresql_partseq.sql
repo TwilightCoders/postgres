@@ -82,6 +82,24 @@ ORDER BY indpartseq;
 -- The counter persists the high-water mark independent of surviving rows.
 SELECT spseqnext FROM pg_spanning_seq WHERE spseqidxid = 'psq_pkey'::regclass;
 
+-- TRUNCATE re-maps the (still-attached) partition to a FRESH partseq, retiring
+-- the old number: the truncated heap's stale spanning entries become
+-- unresolvable, which is what makes TRUNCATE crash-durable (a lost LP_DEAD hint
+-- can no longer resurrect a *resolving* entry that would alias a reused TID).
+-- psq_2024 holds partseq 1; after TRUNCATE it must get 6 (the counter), not keep 1.
+TRUNCATE psq_2024;
+SELECT indpartseq, indpartrelid::regclass
+FROM pg_index_partition
+WHERE indpartidxid = 'psq_pkey'::regclass
+ORDER BY indpartseq;
+
+SELECT spseqnext FROM pg_spanning_seq WHERE spseqidxid = 'psq_pkey'::regclass;
+
+-- Uniqueness still holds after the re-map: a new key routes to psq_2024 under
+-- its fresh partseq and a cross-partition duplicate is still rejected.
+INSERT INTO psq VALUES (100, '2024-03-01');
+INSERT INTO psq VALUES (100, '2026-03-01');  -- duplicate across partitions: ERROR
+
 -- Dropping the whole tree removes every map row (no dangling pg_class refs),
 -- and the counter row too (no dangling spseqidxid).
 DROP TABLE psq CASCADE;

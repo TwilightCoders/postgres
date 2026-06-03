@@ -295,9 +295,11 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 			 * clean.
 			 */
 			partseq = SpanningLookupPartseqByRelid(idxRel, partOid);
-			index_close(idxRel, RowExclusiveLock);
 			if (partseq < 0)
+			{
+				index_close(idxRel, RowExclusiveLock);
 				continue;
+			}
 
 			/*
 			 * Queue the LP_DEAD marking for pre-commit rather than doing it
@@ -307,13 +309,40 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 			spanning_queue_retire(indexOid, partseq);
 
 			/*
-			 * For DROP/DETACH, also reap this partition's deferred-drain queue
-			 * row so the obligation does not outlive its membership.  (A
-			 * transactional catalog delete --- safe inline, unlike the LP_DEAD
-			 * hint above.)  TRUNCATE keeps the partition, so it keeps its row.
+			 * Reap this (now-retired) partseq's deferred-drain queue row: its
+			 * pending obligation is satisfied by the retirement above and the
+			 * number is leaving (DROP/DETACH) or being superseded (TRUNCATE
+			 * re-maps below).  A transactional catalog delete --- safe inline,
+			 * unlike the LP_DEAD hint.
 			 */
-			if (drop_map)
-				RemoveSpanningDrainqForPartseq(indexOid, partseq);
+			RemoveSpanningDrainqForPartseq(indexOid, partseq);
+
+			if (!drop_map)
+			{
+				/*
+				 * TRUNCATE (#8): the partition stays attached, but its heap is
+				 * now a fresh relfilenode whose TIDs restart at (0,1).  The old
+				 * spanning entries are retired above only by a non-durable
+				 * LP_DEAD page hint; a crash that loses it would resurrect them,
+				 * and because the partition kept its partseq they would still
+				 * RESOLVE to the refilled partition and alias a reused TID --- a
+				 * spurious unique violation or silently lost enforcement.
+				 *
+				 * Make TRUNCATE crash-safe by the same mechanism as DETACH:
+				 * re-map the partition to a FRESH partseq.  Deleting the old
+				 * (index, partition) map row is a WAL-logged, crash-durable
+				 * catalog change, after which the old entries are unresolvable
+				 * and safely skipped by _bt_check_unique (the LP_DEAD hint is
+				 * then only a space optimisation).  The still-attached partition
+				 * gets a new partseq from the no-reuse counter for future
+				 * inserts.
+				 */
+				RemoveSpanningPartitionMapEntry(indexOid, partOid);
+				CommandCounterIncrement();	/* make the delete visible below */
+				(void) SpanningGetOrAllocPartseq(idxRel, partOid);
+			}
+
+			index_close(idxRel, RowExclusiveLock);
 		}
 
 		list_free(indexoidlist);
@@ -330,8 +359,10 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 	 * partseq.  Removing the rows keeps indpartrelid from dangling (or aliasing
 	 * a future OID reuse).
 	 *
-	 * TRUNCATE passes drop_map=false: the partition stays attached, so its
-	 * partseq must persist for subsequent inserts to be discriminated.
+	 * TRUNCATE (drop_map=false) keeps the partition attached but has already
+	 * re-mapped it to a fresh partseq per index inside the loop above (so the
+	 * truncated heap's stale entries become unresolvable, the crash-safe
+	 * analogue of DETACH); there is nothing left to drop here.
 	 */
 	if (drop_map)
 		RemoveSpanningPartitionMapForPartition(partOid);

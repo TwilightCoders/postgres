@@ -12,6 +12,11 @@
 #   3. an in-flight (uncommitted) insert is rolled back by recovery and leaves
 #      no phantom entry that blocks or duplicates a later insert of that key;
 #   4. the pg_index_partition discriminator map is intact after recovery.
+#
+# A second scenario covers finding #8: TRUNCATE of a spanning partition re-maps
+# it to a fresh partseq (a WAL-logged catalog change), so after a crash that may
+# lose the non-durable LP_DEAD retirement hint, the truncated heap's stale
+# entries are unresolvable and cannot alias a reused TID in the refilled heap.
 
 use strict;
 use warnings FATAL => 'all';
@@ -96,5 +101,73 @@ is( $node->safe_psql('postgres',
 	'5000', 'post-crash: distinct new key insertable');
 
 $bg->quit;
+
+# ---------------------------------------------------------------------------
+# Finding #8: TRUNCATE retirement is crash-durable.
+#
+# TRUNCATE of a spanning partition resets the partition's relfilenode (heap TIDs
+# restart at (0,1)) and must retire the partition's old spanning entries.  If
+# retirement were only a non-durable LP_DEAD page hint AND the partition kept its
+# partseq, a crash that lost the hint would resurrect a stale entry that still
+# RESOLVED to the refilled partition and aliased a reused TID -> a spurious
+# duplicate-key error (or silently lost enforcement).  The fix re-maps the
+# partition to a fresh partseq -- a WAL-logged catalog change -- so any
+# resurrected stale entry (keyed on the old, now-unmapped partseq) is
+# unresolvable and is harmlessly skipped by _bt_check_unique.
+# ---------------------------------------------------------------------------
+$node->safe_psql(
+	'postgres', q{
+    CREATE TABLE t (id bigint NOT NULL, ts timestamptz NOT NULL,
+        PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+    CREATE TABLE t_a PARTITION OF t
+        FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+    CREATE TABLE t_b PARTITION OF t
+        FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+    INSERT INTO t SELECT g, '2024-06-01'::timestamptz FROM generate_series(1, 100) g;
+    INSERT INTO t SELECT g, '2025-06-01'::timestamptz FROM generate_series(101, 200) g;
+});
+
+my $partseq_before = $node->safe_psql(
+	'postgres', q{
+    SELECT indpartseq FROM pg_index_partition
+     WHERE indpartidxid = 't_pkey'::regclass AND indpartrelid = 't_a'::regclass});
+
+# TRUNCATE t_a (commits the re-map to a fresh partseq), then crash with no
+# shutdown checkpoint so the deferred LP_DEAD retirement hint is not guaranteed
+# on disk -- exactly the window finding #8 depends on.
+$node->safe_psql('postgres', 'TRUNCATE t_a');
+$node->stop('immediate');
+$node->start;
+
+# The re-map to a fresh partseq is a committed catalog change, so it survived
+# WAL replay (the old number is retired, never reused).
+my $partseq_after = $node->safe_psql(
+	'postgres', q{
+    SELECT indpartseq FROM pg_index_partition
+     WHERE indpartidxid = 't_pkey'::regclass AND indpartrelid = 't_a'::regclass});
+isnt($partseq_after, $partseq_before,
+	'post-crash: TRUNCATE re-mapped the partition to a fresh partseq (durable)');
+
+is($node->safe_psql('postgres', 'SELECT count(*) FROM t_a'),
+	'0', 'post-crash: truncated partition is empty');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM t_b'),
+	'100', 'post-crash: sibling partition intact');
+
+# THE TEST: refilling the previously-truncated keys must succeed.  A resurrected
+# stale entry (if the LP_DEAD hint was lost) is keyed on the old, now-unmapped
+# partseq, so it is unresolvable and cannot alias the reused (0,1..) TIDs.
+my ($ti_ret, $ti_out, $ti_err) = $node->psql('postgres',
+	q{INSERT INTO t SELECT g, '2024-07-01'::timestamptz FROM generate_series(1, 100) g});
+is($ti_ret, 0,
+	'post-crash: refill of truncated keys succeeds (no spurious unique violation)');
+
+# Cross-partition uniqueness is still enforced on the refilled partition.
+my ($tu_ret, $tu_out, $tu_err) = $node->psql('postgres',
+	q{INSERT INTO t VALUES (1, '2025-08-01')});
+isnt($tu_ret, 0,
+	'post-crash: cross-partition duplicate rejected after truncate+refill');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM t'),
+	'200', 'post-crash: row counts correct after truncate+refill');
+
 $node->stop;
 done_testing();
