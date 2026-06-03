@@ -207,68 +207,29 @@ ProgresqlReleasePartitionCache(EState *estate)
 }
 
 /*
- * spanning_unique_unchanged
- *
- * Returns true if none of the spanning index's "unique" key columns (i.e.
- * all key columns except the trailing partseq disambiguator) overlap with
- * the set of columns updated by the current statement.  Used to skip
- * spanning index work for in-partition UPDATEs that don't touch the
- * unique key, where the existing index entry continues to be valid via
- * the heap HOT chain.
- */
-static bool
-spanning_unique_unchanged(IndexInfo *indexInfo, ResultRelInfo *resultRelInfo,
-						  EState *estate)
-{
-	Bitmapset  *updatedCols;
-	Bitmapset  *extraUpdatedCols;
-	int			ncheck = indexInfo->ii_NumIndexKeyAttrs - 1;	/* skip partseq */
-
-	if (ncheck <= 0)
-		return false;			/* defensive: nothing to compare */
-
-	updatedCols = ExecGetUpdatedCols(resultRelInfo, estate);
-	extraUpdatedCols = ExecGetExtraUpdatedCols(resultRelInfo, estate);
-
-	for (int attr = 0; attr < ncheck; attr++)
-	{
-		int			keycol = indexInfo->ii_IndexAttrNumbers[attr];
-
-		if (keycol <= 0)
-			return false;		/* expression - assume changed */
-
-		if (bms_is_member(keycol - FirstLowInvalidHeapAttributeNumber,
-						  updatedCols) ||
-			bms_is_member(keycol - FirstLowInvalidHeapAttributeNumber,
-						  extraUpdatedCols))
-			return false;
-	}
-
-	return true;
-}
-
-/*
  * ExecInsertSpanningIndexTuples
  *
- * After inserting (or in-place updating) a tuple in a leaf partition,
- * update any ProgreSQL spanning indexes that exist on the partitioned
- * root.
+ * Insert an entry for the given tuple into every ProgreSQL spanning index on
+ * the partitioned root above this leaf partition.
  *
- * slot           - the just-inserted/updated tuple slot (in the partition)
- * tupleid        - the physical TID of the new tuple in the partition
- * partition      - the leaf partition relation
- * estate         - executor estate
- * resultRelInfo  - if non-NULL, the leaf partition's ResultRelInfo for an
- *                  UPDATE; spanning indexes whose unique key columns are
- *                  unchanged by the statement will be skipped.  Pass NULL
- *                  for INSERT (every spanning index is updated).
+ * Callers invoke this exactly where a leaf-local index would receive a new
+ * entry for a new physical tuple version: on INSERT, and on a COLD (non-HOT)
+ * UPDATE.  A HOT UPDATE must NOT call this -- its existing spanning entry stays
+ * valid because heap_hot_search_buffer follows the on-page HOT chain from the
+ * original root TID to the live tuple, and inserting a duplicate-key entry would
+ * self-conflict.  (Spanning-key changes are forced cold via HOT-blocking on
+ * leaves, so they too arrive here as cold updates.)
+ *
+ * slot       - the just-inserted/updated tuple slot (in the partition)
+ * tupleid    - the physical TID of the new tuple in the partition
+ * partition  - the leaf partition relation
+ * estate     - executor estate
  */
 void
 ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 							   ItemPointer tupleid,
 							   Relation partition,
-							   EState *estate,
-							   ResultRelInfo *resultRelInfo)
+							   EState *estate)
 {
 	ProgresqlPartitionCacheEntry *pe;
 	Oid			partOid = RelationGetRelid(partition);
@@ -282,16 +243,6 @@ ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 	for (int i = 0; i < pe->nEntries; i++)
 	{
 		ProgresqlSpanningEntry *se = &pe->entries[i];
-
-		/*
-		 * For in-partition UPDATEs whose unique key columns didn't change,
-		 * the existing spanning index entry continues to point to the
-		 * (possibly updated) heap chain via t_ctid.  Inserting a new entry
-		 * with the same key would self-conflict.
-		 */
-		if (resultRelInfo != NULL &&
-			spanning_unique_unchanged(se->indexInfo, resultRelInfo, estate))
-			continue;
 
 		FormIndexDatum(se->indexInfo, slot, estate, values, isnull);
 

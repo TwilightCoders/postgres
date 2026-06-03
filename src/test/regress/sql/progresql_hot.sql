@@ -50,3 +50,31 @@ INSERT INTO hot_span VALUES (22, 'b2', '2025-08-01');  -- must ERROR (b2 live)
 SELECT id, code, tableoid::regclass FROM hot_span ORDER BY id;
 
 DROP TABLE hot_span;
+
+-- Heavy NON-key UPDATE churn must not lose the spanning entry.  Once the heap
+-- page fills, a non-key UPDATE can no longer be HOT and relocates the live tuple
+-- to another page (a "cold" update); heap_hot_search_buffer cannot reach the new
+-- page from the original entry's chain root.  The spanning maintenance must then
+-- insert a fresh entry for the new tuple -- exactly as a local index would on a
+-- cold update.  Before the fix it keyed the skip on "did the unique key change?"
+-- instead of HOT-vs-cold, so a page-full cold UPDATE of a non-key column was
+-- misclassified as HOT and dropped, silently losing cross-partition enforcement
+-- and admitting duplicates.
+CREATE TABLE hot_churn (id bigint NOT NULL, ts timestamptz NOT NULL, payload text,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE hot_churn_a PARTITION OF hot_churn FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE hot_churn_b PARTITION OF hot_churn FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO hot_churn VALUES (1, '2024-06-01', 'v0');
+-- Enough non-key updates to overflow the heap page and force an off-page move.
+DO $$ BEGIN FOR i IN 1..300 LOOP UPDATE hot_churn SET payload = 'v'||i WHERE id = 1; END LOOP; END $$;
+-- Uniqueness for id=1 must still be enforced, same- AND cross-partition.
+INSERT INTO hot_churn VALUES (1, '2024-09-01', 'dup-same');   -- must ERROR
+INSERT INTO hot_churn VALUES (1, '2025-09-01', 'dup-cross');  -- must ERROR
+SELECT count(*) AS churn_dups
+  FROM (SELECT id FROM hot_churn GROUP BY id HAVING count(*) > 1) d;  -- must be 0
+-- The live row is intact and still updatable.
+SELECT id, payload FROM hot_churn WHERE id = 1;
+UPDATE hot_churn SET payload = 'final' WHERE id = 1;
+SELECT id, payload FROM hot_churn WHERE id = 1;
+
+DROP TABLE hot_churn;

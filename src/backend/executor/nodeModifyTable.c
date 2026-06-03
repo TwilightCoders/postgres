@@ -1250,8 +1250,7 @@ ExecInsert(ModifyTableContext *context,
 		 */
 		if (resultRelationDesc->rd_rel->relispartition)
 			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid,
-										  resultRelationDesc, estate,
-										  NULL);
+										  resultRelationDesc, estate);
 	}
 
 	if (canSetTag)
@@ -2356,46 +2355,35 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	list_free(recheckIndexes);
 
 	/*
-	 * For ProgreSQL spanning indexes: if this is an in-partition UPDATE on a
-	 * leaf partition, propagate the new key values into any spanning indexes
-	 * on the partitioned root.  Cross-partition UPDATEs are handled as
-	 * DELETE + INSERT and the INSERT path already calls
-	 * ExecInsertSpanningIndexTuples.
+	 * For ProgreSQL spanning indexes: maintain them on an in-partition UPDATE
+	 * exactly as a leaf-local index is maintained, keying the decision on
+	 * HOT-vs-cold (updateCxt->updateIndexes), NOT on whether the spanning key
+	 * changed.  Cross-partition UPDATEs are handled as DELETE + INSERT and the
+	 * INSERT path already calls ExecInsertSpanningIndexTuples.
 	 *
-	 * HOT updates do not move the tuple to a new TID from the partition's
-	 * perspective (updateIndexes != TU_All), but they do create a
-	 * HEAP_ONLY_TUPLE at the new TID that is not a valid chain root.
-	 * heap_hot_search_buffer skips HEAP_ONLY_TUPLE at chain start, so
-	 * storing a HOT-only TID in the spanning index would make uniqueness
-	 * checks always treat the entry as dead.  Use the OLD tuple's TID
-	 * (tupleid) as the chain root so heap_hot_search_buffer can follow
-	 * t_ctid to the live version.
+	 * - HOT update (updateIndexes != TU_All, i.e. TU_None/TU_Summarizing): the
+	 *   existing spanning entry stays valid.  heap_update keeps the HOT chain
+	 *   rooted at the original TID and on a single page, so
+	 *   heap_hot_search_buffer follows it to the live tuple; there is nothing
+	 *   to do, and inserting a duplicate-key entry would self-conflict.
+	 *
+	 * - Cold update (TU_All): the new tuple is a fresh chain root, possibly on
+	 *   a different heap page that the existing entry's root cannot reach
+	 *   (heap_hot_search_buffer never crosses pages).  A new spanning entry for
+	 *   the new TID is required, regardless of whether the spanning key columns
+	 *   changed -- spanning-key changes are forced cold (HOT-blocking on
+	 *   leaves), so this covers them too.
+	 *
+	 * Gating on "did the key change?" was a silent uniqueness-loss bug: a
+	 * page-full cold UPDATE of a NON-key column was misclassified as HOT and
+	 * its new entry dropped, so once the live tuple moved off its original page
+	 * the spanning index could no longer find it and admitted duplicates.
 	 */
-	if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
-	{
-		/*
-		 * Choose the TID that uniqueness checks should follow.  For HOT-style
-		 * in-place updates, heap_update keeps the chain root at the OLD TID
-		 * and a HEAP_ONLY_TUPLE at the new TID is unreachable from a fresh
-		 * heap_hot_search_buffer; storing the new TID would make the entry
-		 * appear dead.  For non-HOT updates, the new TID is the live root.
-		 *
-		 * We delegate the "did the spanning unique key actually change?"
-		 * decision to ExecInsertSpanningIndexTuples (via resultRelInfo),
-		 * because the partition's local index situation does not always
-		 * tell us: a ProgreSQL leaf partition typically has NO local
-		 * indexes, so heap_update always reports updateIndexes=TU_None
-		 * regardless of whether the spanning key columns changed.
-		 */
-		ItemPointer span_tid = (updateCxt->updateIndexes != TU_All)
-			? tupleid
-			: &slot->tts_tid;
-
-		ExecInsertSpanningIndexTuples(slot, span_tid,
+	if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition &&
+		updateCxt->updateIndexes == TU_All)
+		ExecInsertSpanningIndexTuples(slot, &slot->tts_tid,
 									  resultRelInfo->ri_RelationDesc,
-									  context->estate,
-									  resultRelInfo);
-	}
+									  context->estate);
 
 	/*
 	 * Check any WITH CHECK OPTION constraints from parent views.  We are

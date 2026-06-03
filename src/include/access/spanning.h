@@ -21,8 +21,7 @@
 extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 										  ItemPointer tupleid,
 										  Relation partition,
-										  EState *estate,
-										  ResultRelInfo *resultRelInfo);
+										  EState *estate);
 extern void ProgresqlReleasePartitionCache(EState *estate);
 
 /* spanning_ddl.c — partition-lifecycle maintenance (ATTACH/DETACH/DROP/TRUNCATE) */
