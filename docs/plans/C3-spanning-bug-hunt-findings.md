@@ -20,12 +20,24 @@
 |---|-------|----------|--------|
 | A | DETACH/DROP/TRUNCATE + ROLLBACK left LP_DEAD → unenforced uniqueness | corruption | **FIXED** `b0caff8cf2` |
 | 1 | Colliding INSERT vs unresolvable partseq probed storage-less root → SIGSEGV | crash | **FIXED** `d6bc169300` |
-| 2 | partseq reused when the highest-numbered partition is detached/dropped | wrong-result | **VERIFIED — deferred** (catalog design) |
-| 3 | Reused partseq + un-retired stale entry → wrong-heap probe | corruption | code-verified, gated on #2 + PREPARE/crash |
-| 4 | Orphaned `pg_spanning_drainq` row + reused partseq → drain reaps live entries | corruption | code-verified, gated on #2 + DHR-on |
-| 7 | Same-txn DETACH-highest + ATTACH-new reuses partseq mid-txn | spurious-error | code-verified, gated on #2 |
-| 8 | TRUNCATE LP_DEAD not crash-durable + map kept → resurrected entry aliases reused TID | wrong-result | hypothesis (needs crash harness) |
-| Z | amcheck `bt_index_check(idx, heapallindexed=>true)` crashes on a spanning index | crash | **VERIFIED — deferred** (amcheck support) |
+| 2 | partseq reused when the highest-numbered partition is detached/dropped | wrong-result | **FIXED** `eb8b088684` (pg_spanning_seq counter) |
+| 3 | Reused partseq + un-retired stale entry → wrong-heap probe | corruption | **CLOSED by #2** (no reuse → stale entry unresolvable → skipped) |
+| 4 | Orphaned `pg_spanning_drainq` row + reused partseq → drain reaps live entries | corruption | **FIXED** `247bd65b13` (reap on DETACH/DROP) + closed by #2 |
+| 7 | Same-txn DETACH-highest + ATTACH-new reuses partseq mid-txn | spurious-error | **CLOSED by #2** |
+| 8 | TRUNCATE LP_DEAD not crash-durable + map kept → resurrected entry aliases reused TID | wrong-result | **FIXED** `893be61b00` (TRUNCATE re-maps to fresh partseq) |
+| Z | amcheck `bt_index_check(idx, heapallindexed=>true)` crashes on a spanning index | crash | **FIXED** `021aa3734e` (reject heapallindexed, no crash) |
+| R | REINDEX [INDEX] CONCURRENTLY on a spanning index crashed / built an empty index (silent loss of uniqueness) | crash/corruption | **FIXED** `9f30fd8d1d` (rejected; CONCURRENTLY unsupported for spanning) |
+| C1 | Cross-backend INSERT racing DETACH/DROP/TRUNCATE | (probe) | **VERIFIED SAFE** — serialized by the partition-parent AccessExclusiveLock vs the INSERT's AccessShareLock on the root; probe `31a5b6a9aa` hardens the resolve to `try_table_open` |
+
+> Update (2026-06-03): the full gate below was closed in a focused C3 pass.  Every
+> corruption/crash finding is fixed (commits `eb8b088684`, `a1f7dd9789`,
+> `247bd65b13`, `021aa3734e`, `9f30fd8d1d`, `31a5b6a9aa`, `893be61b00`), each fix
+> live-verified and regression/TAP-tested, and an adversarial verification pass
+> (4 read-only lenses) confirmed the no-reuse invariant is unbreakable and the
+> concurrency path is safe.  Remaining items are coverage/feature, not
+> open-correctness: a DETACH … CONCURRENTLY isolation spec (the path is verified
+> correct by lock analysis but lacks an empirical spec), the broader unverified
+> probes below, and FK-to-spanning (a separate feature, not a bug).
 
 Two distinct **root causes** generate most of this:
 1. **Probing the storage-less partitioned root.** A spanning index's `indrelid`
@@ -156,10 +168,24 @@ critic's "missing" list still warrant probing:
    delete+insert) vs spanning uniqueness; MERGE / INSERT ... ON CONFLICT.
 
 ## Effect on the experimental-flag gate
-The flag CANNOT drop until at least #2 (+ its chain #3/#7), #4, #8, and Z are
-resolved, and the concurrency probe (1) is done.  Fixes A and #1 remove the two
-most-reachable bugs (a silent corruption and an easy crash) but do not by
-themselves make the feature trustworthy at scale.
+**Update (2026-06-03): the correctness gate is closed.**  Every finding it named
+is resolved: #2 (+ its chain #3/#7) via the pg_spanning_seq no-reuse counter, #4
+via per-partition drainq reaping, #8 via TRUNCATE partseq re-mapping, Z via the
+amcheck guard, plus R (REINDEX CONCURRENTLY) found and fixed in the same pass; the
+concurrency probe (1) was discharged by a rigorous lock analysis (verified safe)
+and hardened defensively.  All fixes are live-verified and covered by regress +
+isolation + crash/dump/upgrade TAP + amcheck suites (all green), and an
+adversarial verification pass could not break the no-reuse invariant.
+
+What still stands between here and dropping the README flag is **confidence
+coverage, not known-open correctness**:
+- A `DETACH … CONCURRENTLY` isolation spec (the path is verified correct by lock
+  analysis; an empirical interleaving spec would lock it down).
+- The broader unverified probes below (multi-level trees, partition-key UPDATE /
+  MERGE / INSERT…ON CONFLICT, multiple spanning indexes per root, etc.).
+- A soak/scale run on a real workload.
+
+FK-to-spanning (below) is a **feature gap**, independent of the flag.
 
 ---
 

@@ -77,6 +77,34 @@ Remaining for the flag: fix #2 + chain, #4, #8, Z; the concurrency-race probe;
 then the perf fix + soak. The two fixes above remove the most-reachable bugs but
 are NOT by themselves sufficient to drop the flag.
 
+### PROGRESS 2026-06-03 (correctness gate CLOSED)
+Every deferred correctness finding is now fixed, live-verified, and covered by
+tests (240 regress + 121 isolation + crash/dump/upgrade TAP + amcheck all green):
+- **#2 partseq no-reuse** — new `pg_spanning_seq` counter catalog (OID 565/566);
+  monotonic, never lowered by DETACH/DROP; binary-upgrade preserves it. `eb8b088684`,
+  pg_upgrade TAP `a1f7dd9789`. This also **closes #3 and #7** (no reuse → a stale
+  entry stays unresolvable and is skipped, never re-resolves to a later joiner).
+- **#4** — `RemoveSpanningDrainqForPartseq`, reap the drain-queue row on
+  DETACH/DROP. `247bd65b13`.
+- **Z amcheck** — reject `heapallindexed` on a spanning index (clean error, no
+  crash); structural check still works. `021aa3734e`.
+- **R (new, found this pass)** — `REINDEX [INDEX] CONCURRENTLY` on a spanning index
+  crashed / built an empty index (silent loss of uniqueness); now rejected.
+  `9f30fd8d1d`.
+- **#8 TRUNCATE crash-durability** — TRUNCATE re-maps the partition to a fresh
+  partseq (a WAL-logged catalog change), so the truncated heap's stale entries are
+  unresolvable and a lost LP_DEAD hint can't resurrect a resolving entry. Crash TAP
+  extended. `893be61b00`.
+- **#1 concurrency** — an adversarial verification pass proved cross-backend INSERT
+  vs DETACH/DROP/TRUNCATE is serialized by the partition-parent AccessExclusiveLock
+  (vs the INSERT's AccessShareLock on the root); the resolve was hardened to
+  `try_table_open` (`31a5b6a9aa`). The reuse-breaker lens could not defeat no-reuse.
+
+The gate is now **coverage-bound, not correctness-bound.** Before dropping the
+flag: a `DETACH … CONCURRENTLY` isolation spec (path verified by lock analysis,
+spec still TODO), the broader unverified probes, the DHR-default perf work, and a
+soak run. FK-to-spanning (#33) is a separate feature, not a flag blocker.
+
 ### Original audit / plan
 Audit (2026-06-02): we have ZERO concurrency + ZERO crash-recovery tests; amcheck
 can't validate a spanning index. Reassurance: we wrote NO custom WAL / resource
