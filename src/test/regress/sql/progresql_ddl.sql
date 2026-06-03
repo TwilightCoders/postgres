@@ -120,6 +120,12 @@ ROLLBACK;
 
 SELECT count(*) FROM pgddl_data;
 
+-- REINDEX CONCURRENTLY is rejected for a spanning index: it would build the
+-- replacement on the storage-less partitioned root (an empty index, silently
+-- dropping cross-partition uniqueness) and skip BuildSpanningIndexFromPartitions.
+-- The plain REINDEX above is the supported path.
+REINDEX INDEX CONCURRENTLY pgddl_data_pkey;  -- ERROR: cannot reindex spanning index concurrently
+
 -- Section 5: ATTACH PARTITION backfills spanning index
 -- AttachPartitionEnsureIndexes correctly skips spanning indexes (they live
 -- only on the root), and ATExecAttachPartition then walks the attaching
