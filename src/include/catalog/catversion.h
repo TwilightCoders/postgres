@@ -61,6 +61,7 @@
 /* ProgreSQL: bumped to add pg_index_partition catalog (C1 partseq map) */
 /* ProgreSQL: bumped to add pg_spanning_drainq catalog (E5 deferred-vacuum queue) */
 /* ProgreSQL: bumped to add pg_drain_spanning_index() (E5 coalesced drain) */
-#define CATALOG_VERSION_NO	202606021
+/* ProgreSQL: bumped to add pg_spanning_seq catalog (C1 partseq no-reuse counter) */
+#define CATALOG_VERSION_NO	202606031
 
 #endif

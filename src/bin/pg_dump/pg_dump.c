@@ -18109,7 +18109,8 @@ getAttrName(int attrnum, const TableInfo *tblInfo)
  * dumpSpanningIndexPartitionMap
  *	  ProgreSQL: in binary-upgrade mode, emit SQL to restore the exact
  *	  pg_index_partition mapping (partseq <-> partition) of a spanning
- *	  (GLOBAL) index.
+ *	  (GLOBAL) index, plus its pg_spanning_seq partseq counter (high-water
+ *	  mark).
  *
  * pg_upgrade transfers the spanning index's physical file verbatim, so the
  * partseq discriminators baked into its index entries must continue to resolve
@@ -18158,6 +18159,31 @@ dumpSpanningIndexPartitionMap(Archive *fout, PQExpBuffer q,
 						  indxinfo->dobj.catId.oid,
 						  PQgetvalue(res, i, 0),
 						  PQgetvalue(res, i, 1));
+
+	PQclear(res);
+
+	/*
+	 * Preserve the partseq counter (high-water mark) so ATTACHes on the new
+	 * cluster do not reuse a number that is baked into the transferred index
+	 * file.  Re-deriving it from the surviving map as MAX(indpartseq)+1 would be
+	 * wrong: the highest-numbered partition may have been detached, leaving the
+	 * true counter strictly above the surviving maximum --- which is the exact
+	 * reuse the counter exists to prevent.
+	 */
+	resetPQExpBuffer(query);
+	appendPQExpBuffer(query,
+					  "SELECT spseqnext FROM pg_catalog.pg_spanning_seq "
+					  "WHERE spseqidxid = '%u'::pg_catalog.oid",
+					  indxinfo->dobj.catId.oid);
+	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+
+	if (PQntuples(res) > 0)
+		appendPQExpBuffer(q,
+						  "INSERT INTO pg_catalog.pg_spanning_seq "
+						  "(spseqidxid, spseqnext) "
+						  "VALUES ('%u'::pg_catalog.oid, %s);\n",
+						  indxinfo->dobj.catId.oid,
+						  PQgetvalue(res, 0, 0));
 
 	PQclear(res);
 	destroyPQExpBuffer(query);

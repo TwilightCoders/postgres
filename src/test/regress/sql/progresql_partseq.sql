@@ -61,7 +61,29 @@ FROM pg_index_partition
 WHERE indpartidxid = 'psq_pkey'::regclass
 ORDER BY indpartseq;
 
--- Dropping the whole tree removes every map row (no dangling pg_class refs).
+-- Detaching the HIGHEST-numbered partition must NOT free its number for reuse.
+-- The original MAX(indpartseq)+1 allocator scanned only surviving rows, so
+-- detaching the top partition lowered the maximum and the next joiner reused the
+-- freed number -- silently aliasing a departed partition's stored partseq to a
+-- later one.  The persistent pg_spanning_seq counter is never lowered, so the
+-- number is never reused.  (A non-highest DETACH, exercised above, passes either
+-- way and so does not cover this; this case is the regression guard.)
+ALTER TABLE psq DETACH PARTITION psq_2027;  -- frees the highest partseq (4)
+
+CREATE TABLE psq_2028 (id bigint NOT NULL, ts timestamptz NOT NULL);
+ALTER TABLE psq ATTACH PARTITION psq_2028 FOR VALUES FROM ('2028-01-01') TO ('2029-01-01');
+
+-- psq_2028 must get 5 (the counter's high-water mark), never the freed 4.
+SELECT indpartseq, indpartrelid::regclass
+FROM pg_index_partition
+WHERE indpartidxid = 'psq_pkey'::regclass
+ORDER BY indpartseq;
+
+-- The counter persists the high-water mark independent of surviving rows.
+SELECT spseqnext FROM pg_spanning_seq WHERE spseqidxid = 'psq_pkey'::regclass;
+
+-- Dropping the whole tree removes every map row (no dangling pg_class refs),
+-- and the counter row too (no dangling spseqidxid).
 DROP TABLE psq CASCADE;
 
 SELECT count(*) AS dangling_rows
@@ -69,4 +91,9 @@ FROM pg_index_partition
 WHERE indpartidxid NOT IN (SELECT oid FROM pg_class)
    OR indpartrelid NOT IN (SELECT oid FROM pg_class);
 
-DROP TABLE psq_2025;  -- the detached partition, now standalone
+SELECT count(*) AS dangling_seq_rows
+FROM pg_spanning_seq
+WHERE spseqidxid NOT IN (SELECT oid FROM pg_class);
+
+DROP TABLE psq_2025;  -- a detached partition, now standalone
+DROP TABLE psq_2027;  -- the highest-detached partition, now standalone

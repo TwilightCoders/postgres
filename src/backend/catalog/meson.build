@@ -32,6 +32,7 @@ backend_sources += files(
   'pg_range.c',
   'pg_shdepend.c',
   'pg_spanning_drainq.c',
+  'pg_spanning_seq.c',
   'pg_subscription.c',
   'pg_type.c',
   'storage.c',

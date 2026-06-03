@@ -35,6 +35,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_index_partition.h"
+#include "catalog/pg_spanning_seq.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -69,47 +70,6 @@ spanning_lookup_partseq(Oid spanningIndexOid, Oid partitionOid)
 }
 
 /*
- * spanning_max_partseq
- *		Return the largest partseq currently assigned to this spanning index,
- *		or 0 if it has no partitions mapped yet.
- *
- * Scans pg_index_partition via the (indpartidxid, indpartseq) index.  A plain
- * forward scan suffices --- the maps are small (one row per partition) --- and
- * a systable scan (rather than the syscache) guarantees we observe rows this
- * transaction inserted earlier in a multi-partition build, provided the caller
- * has issued CommandCounterIncrement after each insert (see
- * SpanningGetOrAllocPartseq).
- */
-static int32
-spanning_max_partseq(Relation catalog, Oid spanningIndexOid)
-{
-	ScanKeyData skey;
-	SysScanDesc scan;
-	HeapTuple	tup;
-	int32		maxseq = 0;
-
-	ScanKeyInit(&skey,
-				Anum_pg_index_partition_indpartidxid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(spanningIndexOid));
-
-	scan = systable_beginscan(catalog, IndexPartitionIdxidSeqIndexId,
-							  true, NULL, 1, &skey);
-
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-	{
-		Form_pg_index_partition form = (Form_pg_index_partition) GETSTRUCT(tup);
-
-		if (form->indpartseq > maxseq)
-			maxseq = form->indpartseq;
-	}
-
-	systable_endscan(scan);
-
-	return maxseq;
-}
-
-/*
  * SpanningLookupPartseqByRelid
  *		Exposed read-only lookup: return the partseq mapping spanningIndex to
  *		partitionOid, or -1 if the partition is not in this index's map.  Used
@@ -131,9 +91,11 @@ SpanningLookupPartseqByRelid(Relation spanningIndex, Oid partitionOid)
  * If the partition is already mapped (e.g. during REINDEX, or a re-run of the
  * build), its existing partseq is returned unchanged --- partseq must be
  * stable across rebuilds so that stored index entries keep resolving to the
- * right partition.  Otherwise a fresh partseq = max+1 is allocated and a
+ * right partition.  Otherwise a fresh partseq is drawn from the persistent
+ * per-index counter (pg_spanning_seq; see SpanningSeqNextval) and a
  * pg_index_partition row is inserted.  partseq numbers are monotonic per
- * spanning index and are never reused, even after DETACH/DROP removes a row.
+ * spanning index and are never reused, even after DETACH/DROP removes a row ---
+ * the counter is the durable high-water mark that guarantees it.
  *
  * Caller must hold a lock on the spanning index that serializes concurrent
  * joiners (index build and ATTACH both do); the unique (indpartidxid,
@@ -156,9 +118,18 @@ SpanningGetOrAllocPartseq(Relation spanningIndex, Oid partitionOid)
 	if (partseq >= 0)
 		return partseq;
 
-	catalog = table_open(IndexPartitionRelationId, RowExclusiveLock);
+	/*
+	 * Allocate a fresh partseq from the persistent per-index counter.  Unlike
+	 * the old MAX(indpartseq)+1 scan over surviving rows, the counter is never
+	 * lowered by DETACH/DROP, so a freed number is never reused --- a stale
+	 * index entry keyed on a departed partition's partseq therefore stays
+	 * unresolvable (and is safely skipped) rather than re-resolving to a later
+	 * joiner.  Done before opening pg_index_partition so we never hold locks on
+	 * both catalogs at once.
+	 */
+	partseq = SpanningSeqNextval(spanningIndexOid);
 
-	partseq = spanning_max_partseq(catalog, spanningIndexOid) + 1;
+	catalog = table_open(IndexPartitionRelationId, RowExclusiveLock);
 
 	memset(nulls, 0, sizeof(nulls));
 	values[Anum_pg_index_partition_indpartidxid - 1] =
