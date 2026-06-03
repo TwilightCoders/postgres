@@ -28,6 +28,7 @@ extern void ProgresqlReleasePartitionCache(EState *estate);
 extern void progresql_clean_spanning_indexes_for_partition(Relation partRel,
 														   bool drop_map);
 extern void progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel);
+extern void progresql_rebuild_spanning_for_rewritten_partition(Oid relid);
 extern void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
 
 /* spanning_relcache.c — HOT-blocking attrs for spanning keys on leaves (E7) */

@@ -482,6 +482,47 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 }
 
 /*
+ * progresql_rebuild_spanning_for_rewritten_partition
+ *
+ * A table rewrite (CLUSTER, VACUUM FULL, or an ALTER TABLE that rewrites the
+ * heap) of a LEAF partition gives it a new relfilenode and relocates every live
+ * tuple to a new TID.  The spanning (GLOBAL) index lives on the partitioned
+ * ROOT, not as a local index of the leaf, so the rewrite's reindex_relation
+ * (which only rebuilds the leaf's own indexes) leaves the spanning index full of
+ * entries pointing at the freed old storage -- stale TIDs that alias dead/other
+ * rows AND the relocated tuples missing entirely.  Either way cross-partition
+ * uniqueness is silently broken.
+ *
+ * Rebuild the leaf's spanning entries with the same crash-safe re-map mechanism
+ * TRUNCATE/DETACH use: drop the leaf's (now-stale) partseq map rows so its old
+ * entries become unresolvable (and are skipped by _bt_check_unique), then
+ * backfill fresh entries for the relocated tuples under a freshly-allocated
+ * partseq.  No-op for non-partition relations and for partitions with no
+ * spanning ancestor.  Called from finish_heap_swap after the swap+reindex.
+ */
+void
+progresql_rebuild_spanning_for_rewritten_partition(Oid relid)
+{
+	Relation	rel;
+
+	/* The rewrite holds AccessExclusiveLock on relid already. */
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return;
+
+	/* Only a storage-bearing leaf partition can sit under a spanning root. */
+	if (rel->rd_rel->relispartition &&
+		rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		RemoveSpanningPartitionMapForPartition(relid);
+		CommandCounterIncrement();	/* make the delete visible to the backfill */
+		progresql_backfill_spanning_indexes_for_attached_partition(rel);
+	}
+
+	table_close(rel, AccessShareLock);
+}
+
+/*
  * BuildSpanningIndexFromPartitions
  *
  * After creating a ProgreSQL spanning index on a partitioned root, populate

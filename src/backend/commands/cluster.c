@@ -21,6 +21,7 @@
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
+#include "access/spanning.h"
 #include "access/tableam.h"
 #include "access/toast_internals.h"
 #include "access/transam.h"
@@ -1513,6 +1514,18 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 								 PROGRESS_CLUSTER_PHASE_REBUILD_INDEX);
 
 	reindex_relation(NULL, OIDOldHeap, reindex_flags, &reindex_params);
+
+	/*
+	 * ProgreSQL: rebuild the spanning (GLOBAL) index entries for a rewritten
+	 * leaf partition.  reindex_relation above only rebuilt the leaf's own local
+	 * indexes; the spanning index lives on the partitioned root and is left
+	 * pointing at the freed old storage (stale TIDs) with the relocated tuples
+	 * unindexed.  This re-maps the leaf to a fresh partseq and backfills entries
+	 * for the new TIDs.  No-op for non-partitions and non-spanning trees; skipped
+	 * for system catalogs (never partitions of a spanning root).
+	 */
+	if (!is_system_catalog)
+		progresql_rebuild_spanning_for_rewritten_partition(OIDOldHeap);
 
 	/* Report that we are now doing clean up */
 	pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,

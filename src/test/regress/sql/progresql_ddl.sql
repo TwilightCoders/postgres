@@ -288,6 +288,34 @@ COMMIT;
 SELECT count(*) AS dx_id1 FROM pgddl_dx WHERE id = 1;  -- 1
 DROP TABLE pgddl_dx CASCADE;
 
+-- Section 7b: a table rewrite of a leaf partition (VACUUM FULL / CLUSTER /
+-- ALTER COLUMN TYPE) relocates every tuple to a new TID.  The spanning index on
+-- the root is not a local index of the leaf, so it must be rebuilt for the
+-- rewritten leaf; otherwise its entries dangle at the freed storage and the
+-- relocated rows go unindexed -> silent cross-partition duplicates.
+CREATE TABLE pgddl_rw (id bigint NOT NULL, ts timestamptz NOT NULL, v int,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pgddl_rw_a PARTITION OF pgddl_rw FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pgddl_rw_b PARTITION OF pgddl_rw FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO pgddl_rw SELECT g, '2024-06-01', g FROM generate_series(1, 20) g;
+INSERT INTO pgddl_rw SELECT g, '2025-06-01', g FROM generate_series(21, 40) g;
+
+VACUUM FULL pgddl_rw_a;                       -- rewrites leaf a
+INSERT INTO pgddl_rw VALUES (5, '2025-03-01', 0);   -- id 5 in a, dup into b: ERROR
+
+CREATE INDEX pgddl_rw_b_v ON pgddl_rw_b (v);
+CLUSTER pgddl_rw_b USING pgddl_rw_b_v;        -- rewrites leaf b
+INSERT INTO pgddl_rw VALUES (25, '2024-03-01', 0);  -- id 25 in b, dup into a: ERROR
+
+ALTER TABLE pgddl_rw ALTER COLUMN v TYPE bigint;    -- rewrites every leaf
+INSERT INTO pgddl_rw VALUES (10, '2025-04-01', 0);  -- id 10 in a, dup into b: ERROR
+
+-- a genuinely new key still inserts; no duplicates anywhere
+INSERT INTO pgddl_rw VALUES (500, '2024-05-01', 0);
+SELECT count(*) AS total, count(*) FILTER (WHERE cnt > 1) AS dup_keys
+  FROM (SELECT id, count(*) cnt FROM pgddl_rw GROUP BY id) s;
+DROP TABLE pgddl_rw;
+
 -- Section 8: CASCADE DROP cleans up all objects.
 DROP TABLE pgddl_data CASCADE;
 
