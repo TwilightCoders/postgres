@@ -102,6 +102,36 @@ BEGIN;
 INSERT INTO pgddl_data VALUES (10, 'dup-copy', '2025-09-01 00:00:00+00');
 ROLLBACK;
 
+-- Section 3b: COPY enforces cross-partition uniqueness (single, batch, and a
+-- post-COPY INSERT).  COPY has two insert paths -- per-row and multi-insert
+-- batching -- and both must maintain the spanning index.  Before they did, a
+-- COPYed row was absent from the spanning index and a later duplicate (same- or
+-- cross-partition) was silently accepted under a PRIMARY KEY.
+CREATE TABLE pgddl_copy (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE pgddl_copy_a PARTITION OF pgddl_copy
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE pgddl_copy_b PARTITION OF pgddl_copy
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+-- distinct keys across partitions load fine (exercises multi-insert batching)
+COPY pgddl_copy (id, ts) FROM STDIN;
+1	2024-06-01 00:00:00+00
+2	2025-06-01 00:00:00+00
+\.
+-- a COPYed key is now in the spanning index: a cross-partition duplicate INSERT
+-- is rejected
+INSERT INTO pgddl_copy VALUES (1, '2025-07-01 00:00:00+00');   -- ERROR (cross-part dup)
+-- a COPY batch that itself contains a cross-partition duplicate is rejected and
+-- the whole COPY rolls back (key 9 must not survive)
+COPY pgddl_copy (id, ts) FROM STDIN;
+9	2024-03-01 00:00:00+00
+9	2025-03-01 00:00:00+00
+\.
+SELECT count(*) AS copy_dups
+  FROM (SELECT id FROM pgddl_copy GROUP BY id HAVING count(*) > 1) d;  -- 0
+SELECT id FROM pgddl_copy ORDER BY id;  -- 1, 2 (no 9)
+DROP TABLE pgddl_copy;
+
 -- Section 4: REINDEX repopulates the spanning index from partitions
 -- index_build leaves the rebuilt index empty (the partitioned root has no
 -- storage), so reindex_index calls BuildSpanningIndexFromPartitions to

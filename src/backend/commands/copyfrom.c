@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 
 #include "access/heapam.h"
+#include "access/spanning.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
@@ -561,6 +562,21 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 
 		for (i = 0; i < nused; i++)
 		{
+			/*
+			 * ProgreSQL: maintain any spanning (GLOBAL) indexes on the
+			 * partitioned root for this leaf's row.  This must run independently
+			 * of the leaf's own indexes -- a spanning leaf typically has NO local
+			 * indexes, so the ri_NumIndices branch below is skipped, and COPY
+			 * would otherwise bypass cross-partition uniqueness enforcement
+			 * entirely (heap row written, no spanning entry).  Done first so a
+			 * cross-partition conflict errors before AFTER ROW triggers fire.
+			 */
+			if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
+				ExecInsertSpanningIndexTuples(buffer->slots[i],
+											  &buffer->slots[i]->tts_tid,
+											  resultRelInfo->ri_RelationDesc,
+											  estate);
+
 			/*
 			 * If there are any indexes, update them for all the inserted
 			 * tuples, and run AFTER ROW INSERT triggers.
@@ -1436,6 +1452,18 @@ CopyFrom(CopyFromState cstate)
 																   NULL,
 																   NIL,
 																   false);
+
+						/*
+						 * ProgreSQL: maintain spanning (GLOBAL) indexes on the
+						 * partitioned root for this leaf's row.  Independent of
+						 * the leaf's own indexes (a spanning leaf usually has
+						 * none); without this, plain (non-batched) COPY would
+						 * bypass cross-partition uniqueness enforcement.
+						 */
+						if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
+							ExecInsertSpanningIndexTuples(myslot, &myslot->tts_tid,
+														  resultRelInfo->ri_RelationDesc,
+														  estate);
 					}
 
 					/* AFTER ROW INSERT Triggers */
