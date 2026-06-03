@@ -77,9 +77,31 @@ Remaining for the flag: fix #2 + chain, #4, #8, Z; the concurrency-race probe;
 then the perf fix + soak. The two fixes above remove the most-reachable bugs but
 are NOT by themselves sufficient to drop the flag.
 
-### PROGRESS 2026-06-03 (correctness gate CLOSED)
-Every deferred correctness finding is now fixed, live-verified, and covered by
-tests (240 regress + 121 isolation + crash/dump/upgrade TAP + amcheck all green):
+### PROGRESS 2026-06-03 (single-session + write-path fixed; CONCURRENCY race OPEN)
+> CORRECTION: an earlier draft of this section said "correctness gate CLOSED."
+> That was premature.  An empirical probe + write-path audit + concurrency soak
+> (run after that draft) fixed a whole class of write-path bypasses AND found an
+> OPEN architectural concurrency race.  Accurate status below; full detail in
+> `docs/plans/C3-spanning-bug-hunt-findings.md` (read its top banner first).
+
+**Write-path bypasses — FIXED & shipped** (the audit found spanning enforcement
+was bolted onto ExecInsert/ExecUpdate and bypassed elsewhere): non-key UPDATE
+HOT/cold `6cba71e23b`, COPY `4711f4c7ac`, ATTACH-of-partitioned + logical
+replication apply `cd064cc2cd`, CLUSTER/VACUUM FULL/ALTER leaf rewrite
+`7e9e45739e`.  Each live-verified, regress/TAP/isolation green.
+
+**OPEN — the gating blocker: cross-partition uniqueness is racy under
+concurrency.**  A 12-client soak admits silent duplicates when concurrent INSERT
+races a DELETE or cross-partition UPDATE of the same key (INSERT+MOVE ~73–116
+dups; INSERT-only and INSERT+churn = 0).  Mechanism: same-user-key inserts into
+different partitions sort to different btree keys (different partseq) → no shared
+page → no page-level value lock → check-and-insert not atomic.  A partial
+insert-side value lock cut it 20–95× but did not eliminate it (delete/move side
+also needs to lock); reverted as a half-fix.  Full fix = value/predicate locking
+on the user key across insert AND delete/move paths — a real concurrency feature.
+WORM/append (insert-only + DETACH) is soak-clean and dodges it.
+
+**Earlier deferred findings — also fixed, live-verified, tested:**
 - **#2 partseq no-reuse** — new `pg_spanning_seq` counter catalog (OID 565/566);
   monotonic, never lowered by DETACH/DROP; binary-upgrade preserves it. `eb8b088684`,
   pg_upgrade TAP `a1f7dd9789`. This also **closes #3 and #7** (no reuse → a stale

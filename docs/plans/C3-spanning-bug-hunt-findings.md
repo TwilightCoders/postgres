@@ -1,5 +1,29 @@
 # C3 — Spanning-index correctness findings (adversarial hunt + verification)
 
+> ## ⚠️ 2026-06-03 UPDATE — read this first
+>
+> A second, EMPIRICAL pass (probe agents running adversarial SQL on live
+> clusters + a write-path audit + a concurrency soak) found materially more than
+> the 2026-06-02 hunt.  **My earlier "correctness gate is closed" note below was
+> premature** — it was true only for the classes tested at the time.  Net state
+> now:
+>
+> - **FIXED + tested (single-session) & shipped:** partseq no-reuse (#2/#3/#7),
+>   drainq partition reap (#4), amcheck guard (Z), REINDEX-CONCURRENTLY reject
+>   (R), TRUNCATE crash-durability (#8), and a whole class of **write-path
+>   bypasses** the audit found — non-key-UPDATE HOT/cold (silent uniqueness loss
+>   under churn), **COPY**, **ATTACH of a partitioned table**, **logical
+>   replication apply**, and **table rewrite (CLUSTER / VACUUM FULL / ALTER)**.
+>   Each was live-verified and is covered by regress/TAP/isolation (all green).
+> - **OPEN — architectural, the gating blocker:** **cross-partition uniqueness is
+>   racy under concurrency** (concurrent INSERT racing a DELETE or a
+>   cross-partition UPDATE of the same key admits silent duplicates).  See the
+>   "CONCURRENCY" section below.  This is NOT a surgical bypass; it needs a
+>   value/predicate-locking feature.
+> - **Workload impact:** append-only / WORM (insert-only + drop-oldest via
+>   DETACH) is soak-clean and dodges the open race; general concurrent workloads
+>   with deletes / cross-partition updates are affected.
+
 > Produced 2026-06-02 during the C3 trust-testing pass.  An adversarial,
 > read-only multi-agent hunt (8 failure-mode lenses; 3 emitted structured
 > output, 5 did analysis without structured results) generated bug hypotheses;
@@ -167,23 +191,73 @@ critic's "missing" list still warrant probing:
 7. partition-key UPDATE that moves a row between partitions (cross-leaf
    delete+insert) vs spanning uniqueness; MERGE / INSERT ... ON CONFLICT.
 
-## Effect on the experimental-flag gate
-**Update (2026-06-03): the correctness gate is closed.**  Every finding it named
-is resolved: #2 (+ its chain #3/#7) via the pg_spanning_seq no-reuse counter, #4
-via per-partition drainq reaping, #8 via TRUNCATE partseq re-mapping, Z via the
-amcheck guard, plus R (REINDEX CONCURRENTLY) found and fixed in the same pass; the
-concurrency probe (1) was discharged by a rigorous lock analysis (verified safe)
-and hardened defensively.  All fixes are live-verified and covered by regress +
-isolation + crash/dump/upgrade TAP + amcheck suites (all green), and an
-adversarial verification pass could not break the no-reuse invariant.
+## CONCURRENCY (soak-discovered 2026-06-03) — cross-partition uniqueness is racy  **[OPEN, architectural]**
+A 12-client pgbench soak (mixed INSERT / non-key-UPDATE / DELETE / cross-
+partition-UPDATE over a contended key space on a spanning PK) admits **silent
+cross-partition duplicates**:
 
-What still stands between here and dropping the README flag is **confidence
-coverage, not known-open correctness**:
-- A `DETACH … CONCURRENTLY` isolation spec (the path is verified correct by lock
-  analysis; an empirical interleaving spec would lock it down).
-- The broader unverified probes below (multi-level trees, partition-key UPDATE /
-  MERGE / INSERT…ON CONFLICT, multiple spanning indexes per root, etc.).
-- A soak/scale run on a real workload.
+| op mix (12 clients) | duplicate keys |
+|---|---|
+| INSERT only | 0 |
+| INSERT + non-key UPDATE churn | 0 |
+| INSERT + DELETE | ~23 |
+| INSERT + cross-partition UPDATE (move) | ~73–116 |
+| full mix | ~7 |
+
+**Mechanism.**  A spanning entry sorts by `(user_cols…, partseq)`.  Two
+concurrent inserts of the *same user key* into *different* partitions land at
+*different* btree keys (different partseq), so they never meet on one page and
+never take the btree's page-level value lock that makes a unique
+check-and-insert atomic.  Both can pass `_bt_check_unique` before either entry is
+visible, and both insert → a duplicate.  Pure INSERT rarely triggers it (each key
+races only on first insert, then the committed entry blocks the rest);
+concurrent DELETE / cross-partition MOVE churn frees-and-recreates keys,
+reopening the race window repeatedly.
+
+**Partial fix tested + reverted.**  A transaction-duration value lock keyed on
+`(spanning index, hash(user key))`, taken in `ExecInsertSpanningIndexTuples`
+before the uniqueness check, serializes concurrent same-user-key inserts and cut
+dups 20–95× (INSERT+MOVE 116→6).  It did **not** eliminate them — the DELETE /
+move-delete-half does not participate in the lock, leaving a residual window —
+so it was reverted rather than ship a half-fix that still corrupts.
+
+**Full fix (the gating work).**  Comprehensive value/predicate locking on the
+user key across *every* path that creates or removes a spanning entry (insert AND
+delete / cross-partition move), with proper per-column type hashing so equal
+keys lock equal.  This is a real concurrency-control feature, not a surgical
+patch — it is why a native cross-partition unique index is hard.
+
+**Workload impact.**  Append-only / WORM (insert-only + drop-oldest via DETACH)
+is **soak-clean** (0 dups) and dodges this entirely; general concurrent
+workloads with deletes or cross-partition updates are affected.
+
+## Write-path bypasses (audit 2026-06-03) — all FIXED
+Spanning enforcement was bolted onto `ExecInsert`/`ExecUpdate`, so any path that
+bypassed them bypassed enforcement.  A read-only write-path audit enumerated them;
+each was live-verified and fixed:
+
+| Path | Effect | Fix |
+|---|---|---|
+| non-key `UPDATE` (HOT→cold off-page) | silent dup after churn | `6cba71e23b` |
+| `COPY` (both insert paths) | COPYed rows unindexed → dup | `4711f4c7ac` |
+| `ATTACH PARTITION <partitioned table>` | grandchildren unindexed → dup | `cd064cc2cd` |
+| logical replication apply (INSERT/UPDATE) | subscriber dup | `cd064cc2cd` |
+| `CLUSTER`/`VACUUM FULL`/`ALTER` leaf rewrite | stale TIDs + unindexed rows | `7e9e45739e` |
+
+Confirmed SAFE (audit + re-probe): all interactive DML (`INSERT`,
+`ON CONFLICT`/`MERGE` route through `ExecInsert`), build/backfill, CTAS/matview,
+FDW.  (`ON CONFLICT`/`MERGE` arbiter usability on a spanning key, and `LIKE
+INCLUDING INDEXES`, are fail-safe medium gaps — see below.)
+
+## Effect on the experimental-flag gate
+The single-session and write-path correctness work is done and shipped.  The
+flag **cannot** drop while the **concurrency race above is open** — it is silent
+data corruption under ordinary concurrent DML.  Remaining for the flag:
+1. The cross-partition-uniqueness value-locking feature (the blocker).
+2. `DETACH … CONCURRENTLY` isolation coverage (path verified safe by analysis).
+3. The fail-safe medium gaps (`ON CONFLICT`/`MERGE` arbiter, `LIKE INCLUDING
+   INDEXES` — the latter shows the tableoid-carrier from #19 is still present).
+4. DHR-default perf + a sustained soak after the concurrency fix.
 
 FK-to-spanning (below) is a **feature gap**, independent of the flag.
 
