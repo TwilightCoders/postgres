@@ -164,6 +164,20 @@ INSERT INTO varlena_bug VALUES (repeat('Test', 250));
 ALTER TABLE varlena_bug ALTER COLUMN v SET STORAGE extended;
 SELECT bt_index_check('varlena_bug_idx', true);
 
+-- ProgreSQL: heapallindexed verification of a spanning (GLOBAL) index must be
+-- rejected cleanly, not crash.  The index's table is the storage-less
+-- partitioned root, so the heap-scan fingerprint pass cannot run on it; the
+-- structural check (heapallindexed => false) is still supported.
+CREATE TABLE amspan (id bigint NOT NULL, ts timestamptz NOT NULL,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE amspan_2024 PARTITION OF amspan FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE amspan_2025 PARTITION OF amspan FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO amspan VALUES (1, '2024-06-01'), (2, '2025-06-01');
+SELECT bt_index_check('amspan_pkey', heapallindexed => false);  -- supported
+SELECT bt_index_check('amspan_pkey', heapallindexed => true);   -- rejected, not a crash
+SELECT bt_index_parent_check('amspan_pkey', heapallindexed => true); -- rejected too
+DROP TABLE amspan;
+
 -- cleanup
 DROP TABLE bttest_a;
 DROP TABLE bttest_b;

@@ -411,6 +411,23 @@ bt_check_every_level(Relation rel, Relation heaprel, bool heapkeyspace,
 	state->checkunique = checkunique;
 	state->snapshot = InvalidSnapshot;
 
+	/*
+	 * ProgreSQL: heapallindexed verification cannot run on a spanning (GLOBAL)
+	 * index.  Its "table" is the storage-less partitioned root (rd_tableam ==
+	 * NULL), so the heap scan that fingerprints table tuples would dereference a
+	 * NULL table AM and crash the backend.  Validating that every heap tuple is
+	 * indexed would require following the partseq -> partition indirection down
+	 * to each leaf, which amcheck does not yet implement.  Reject cleanly rather
+	 * than crash; the structural check (heapallindexed => false) is supported.
+	 */
+	if (state->heapallindexed && RelationIsSpanning(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot verify heap presence for spanning (GLOBAL) index \"%s\"",
+						RelationGetRelationName(rel)),
+				 errdetail("Its table is the storage-less partitioned root, so heapallindexed verification cannot scan it."),
+				 errhint("Run the check with heapallindexed => false to verify index structure.")));
+
 	if (state->heapallindexed)
 	{
 		int64		total_pages;
