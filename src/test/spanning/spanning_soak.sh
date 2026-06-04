@@ -36,6 +36,7 @@ set -uo pipefail
 # collisions (the #34 race).  At these settings the pre-fix code fails within
 # ~30s; widen --idspace / drop --clients for a milder, more "realistic" soak.
 CLIENTS=16; JOBS=4; SECS=60; PARTS=4; IDSPACE=500; CRASH=0; KEEP=0
+AUTOVAC=off; ROUND_SECS=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINDIR="$SCRIPT_DIR/../../../build/install/bin"
 
@@ -46,12 +47,15 @@ while [ $# -gt 0 ]; do
     --secs) SECS=$2; shift 2;;
     --partitions) PARTS=$2; shift 2;;
     --idspace) IDSPACE=$2; shift 2;;
+    --autovacuum) AUTOVAC=$2; shift 2;;   # on|off (off = corruption detector)
+    --round-secs) ROUND_SECS=$2; shift 2;; # verify every N secs (long runs)
     --crash) CRASH=1; shift;;
     --keep) KEEP=1; shift;;
     --bindir) BINDIR=$2; shift 2;;
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
+[ "$ROUND_SECS" = "0" ] && ROUND_SECS=$SECS
 
 BINDIR="$(cd "$BINDIR" && pwd)" || { echo "bindir not found"; exit 2; }
 PG_CTL="$BINDIR/pg_ctl"; INITDB="$BINDIR/initdb"; PSQL="$BINDIR/psql"; PGBENCH="$BINDIR/pgbench"
@@ -82,16 +86,22 @@ start_cluster() {
   else
     durable_opts="-c fsync=off -c synchronous_commit=off"
   fi
-  # autovacuum OFF on purpose: under heavy churn a spanning user-key's dead
-  # entries must be allowed to accumulate so the run grows across btree pages --
-  # that is exactly the geometry the cross-partition uniqueness race needs.  With
-  # aggressive autovacuum the run is kept on one page (where the stock page lock
-  # already serializes), masking the bug.  A real workload hits this transiently
-  # between vacuum cycles; the harness just makes it reliable.
+  # autovacuum OFF (default) on purpose: under heavy churn a spanning user-key's
+  # dead entries must be allowed to accumulate so the run grows across btree
+  # pages -- exactly the geometry the cross-partition uniqueness race needs.
+  # Aggressive autovacuum keeps the run on one page (where the stock page lock
+  # already serializes), masking the bug -- so --autovacuum off is the detector.
+  # For a multi-HOUR realistic soak use --autovacuum on so the heap/index do not
+  # bloat unboundedly; the value lock is still stressed hard by a tight key space.
+  local av_opts
+  if [ "$AUTOVAC" = "on" ]; then
+    av_opts="-c autovacuum=on -c autovacuum_naptime=10s -c autovacuum_vacuum_scale_factor=0.02"
+  else
+    av_opts="-c autovacuum=off"
+  fi
   "$PG_CTL" -D "$DATA" \
     -o "-c unix_socket_directories=$SOCK -c listen_addresses='' $durable_opts \
-        -c deadlock_timeout=50ms -c max_connections=64 \
-        -c autovacuum=off" \
+        -c deadlock_timeout=50ms -c max_connections=64 $av_opts" \
     -l "$LOG" start -w >/dev/null 2>&1
 }
 
@@ -208,8 +218,21 @@ if [ "$CRASH" = "1" ]; then
   echo "  recovered; verifying..."
   verify || RC=1
 else
-  run_load "$SECS"
-  verify || RC=1
+  # Run in rounds so a long soak verifies periodically (catching corruption WHEN
+  # it happens, not only at the end), is observable, and fails fast.
+  NROUNDS=$(( (SECS + ROUND_SECS - 1) / ROUND_SECS ))
+  echo "--- soak: $NROUNDS round(s) x ${ROUND_SECS}s (autovacuum=$AUTOVAC) ---"
+  for r in $(seq 1 "$NROUNDS"); do
+    echo "--- round $r/$NROUNDS (t=$((r*ROUND_SECS))s/${SECS}s) ---"
+    run_load "$ROUND_SECS"
+    if ! verify; then
+      echo "  >>> corruption detected in round $r; stopping early <<<"; RC=1; break
+    fi
+    CR=$(grep -cE "was terminated by signal (11|6)|TRAP: failed" "$LOG" 2>/dev/null); CR=${CR:-0}
+    DL=$(grep -c "deadlock detected" "$LOG" 2>/dev/null); DL=${DL:-0}
+    echo "  cumulative: deadlocks=$DL crashes=$CR rows=$(psql_q -c 'SELECT count(*) FROM st;') size=$(psql_q -c "SELECT pg_size_pretty(pg_total_relation_size('st'));")"
+    [ "$CR" = "0" ] || { echo "  >>> backend crash; stopping <<<"; RC=1; break; }
+  done
 fi
 
 DEADLOCKS=$(grep -c "deadlock detected" "$LOG" 2>/dev/null); DEADLOCKS=${DEADLOCKS:-0}
