@@ -1551,7 +1551,12 @@ backtrack:
 		}
 	}
 
-	if (!opaque || BTPageIsRecyclable(page, heaprel))
+	/*
+	 * ProgreSQL: for a spanning index heaprel is the storage-less partitioned
+	 * root, which the GlobalVis horizon machinery rejects; pass NULL (the
+	 * conservative, always-safe horizon) for the recyclability check.
+	 */
+	if (!opaque || BTPageIsRecyclable(page, RelationIsSpanning(rel) ? NULL : heaprel))
 	{
 		/* Okay to recycle this page (which could be leaf or internal) */
 		RecordFreeIndexPage(rel, blkno);

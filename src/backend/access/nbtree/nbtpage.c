@@ -35,6 +35,7 @@
 #include "storage/procarray.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 static BTMetaPageData *_bt_getmeta(Relation rel, Buffer metabuf);
@@ -922,7 +923,14 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 				return buf;
 			}
 
-			if (BTPageIsRecyclable(page, heaprel))
+			/*
+			 * ProgreSQL: a spanning index's heap is the partitioned root, which
+			 * is storage-less (relkind RELKIND_PARTITIONED_TABLE) and not a valid
+			 * input to the GlobalVis horizon machinery (it asserts on relkind).
+			 * Pass NULL, which GlobalVis* explicitly accept as the most
+			 * conservative (always-safe, never-too-aggressive) horizon.
+			 */
+			if (BTPageIsRecyclable(page, RelationIsSpanning(rel) ? NULL : heaprel))
 			{
 				/*
 				 * If we are generating WAL for Hot Standby then create a WAL
@@ -2997,6 +3005,12 @@ _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate)
 {
 	IndexBulkDeleteResult *stats = vstate->stats;
 	Relation	heaprel = vstate->info->heaprel;
+	/*
+	 * ProgreSQL: a spanning index's heap is the storage-less partitioned root,
+	 * which the GlobalVis horizon machinery rejects; use NULL (conservative,
+	 * always-safe horizon) for the page-recycle visibility checks below.
+	 */
+	Relation	visrel = RelationIsSpanning(rel) ? NULL : heaprel;
 
 	Assert(stats->pages_newly_deleted >= vstate->npendingpages);
 	Assert(heaprel != NULL);
@@ -3030,7 +3044,7 @@ _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate)
 	 * essential; GlobalVisCheckRemovableFullXid() will not reliably recognize
 	 * that it is now safe to recycle newly deleted pages without this step.
 	 */
-	GetOldestNonRemovableTransactionId(heaprel);
+	GetOldestNonRemovableTransactionId(visrel);
 
 	for (int i = 0; i < vstate->npendingpages; i++)
 	{
@@ -3045,7 +3059,7 @@ _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate)
 		 * must be non-recyclable too, since _bt_pendingfsm_add() adds pages
 		 * to the array in safexid order.
 		 */
-		if (!GlobalVisCheckRemovableFullXid(heaprel, safexid))
+		if (!GlobalVisCheckRemovableFullXid(visrel, safexid))
 			break;
 
 		RecordFreeIndexPage(rel, target);

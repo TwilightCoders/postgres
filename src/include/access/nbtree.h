@@ -294,7 +294,15 @@ BTPageIsRecyclable(Page page, Relation heaprel)
 	BTPageOpaque opaque;
 
 	Assert(!PageIsNew(page));
-	Assert(heaprel != NULL);
+
+	/*
+	 * heaprel is normally the index's table, used only to compute the
+	 * recyclability visibility horizon below.  ProgreSQL: it may be NULL for a
+	 * spanning index, whose "heap" is the storage-less partitioned root and so
+	 * is not a valid input to the GlobalVis machinery; NULL selects the most
+	 * conservative (always-safe, never-too-aggressive) horizon, which is exactly
+	 * what GlobalVisCheckRemovableFullXid() documents for a NULL relation.
+	 */
 
 	/* Recycling okay iff page is deleted and safexid is old enough */
 	opaque = BTPageGetOpaque(page);
