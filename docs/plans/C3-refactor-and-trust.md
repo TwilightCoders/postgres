@@ -95,11 +95,22 @@ isolation (`spanning-unique`, `spanning-detach`), recovery/subscription/pg_upgra
 spanning TAP. ~11% TPS overhead on the pathological all-MOVE workload, far less on
 normal mixes (lock only touches spanning inserts).
 
-Soak harness (scratch, reproducible): a partitioned table with a spanning PK over
-4 LIST partitions and a bounded id space (forces collisions); a plpgsql `op()`
-doing a random INSERT / DELETE / HOT-update / cross-partition `UPDATE … SET part`;
-`pgbench -n -f op.sql -c 12 -j 4 -T <secs>`; verdict
-`SELECT count(*) FROM (SELECT id FROM s GROUP BY id HAVING count(*)>1)`.
+**Soak harness — now committed: `src/test/spanning/spanning_soak.sh`** (+ README).
+Stress + dual-oracle verification (the PostgreSQL way): hammer a spanning-indexed
+partitioned table (int PK + text UNIQUE, both GLOBAL) with concurrent
+INSERT/MOVE/DELETE/batch/HOT via pgbench, then check (1) the app invariant — no
+cross-partition dup on either key — and (2) amcheck on every spanning index;
+`--crash` adds kill-9-mid-load + recovery. Two findings worth keeping:
+  - **amcheck alone is insufficient** for spanning uniqueness: it validates btree
+    order on `(user_cols…, partseq)`, and a cross-partition duplicate is
+    well-ordered at that level, so amcheck reports OK *with duplicates present*.
+    The app invariant is the load-bearing oracle; amcheck catches the ordering
+    corruption a bad insert-positioning fix would cause. Both are needed.
+  - The harness runs **autovacuum off**: the race needs a hot key's dead entries
+    to accumulate so its run spans btree pages; aggressive autovacuum masks it.
+  Validated as a real oracle: pre-fix `9d92004062` → 24–43 dups (FAIL); fix
+  `1d94d3320e` at the same brutal settings (idspace 100–300, 16–24 clients) and
+  under `--crash` → 0 dups, 0 deadlocks, amcheck clean.
 
 ### PROGRESS 2026-06-02 (night)
 Trust-testing started AND turned up real bugs. Done this pass:
