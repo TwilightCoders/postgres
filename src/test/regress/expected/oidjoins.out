@@ -106,6 +106,7 @@ NOTICE:  checking pg_index {indrelid,indkey} => pg_attribute {attrelid,attnum}
 NOTICE:  checking pg_index_partition {indpartidxid} => pg_class {oid}
 NOTICE:  checking pg_index_partition {indpartrelid} => pg_class {oid}
 NOTICE:  checking pg_spanning_drainq {sdq_idxid} => pg_class {oid}
+NOTICE:  checking pg_spanning_seq {spseqidxid} => pg_class {oid}
 NOTICE:  checking pg_operator {oprnamespace} => pg_namespace {oid}
 NOTICE:  checking pg_operator {oprowner} => pg_authid {oid}
 NOTICE:  checking pg_operator {oprleft} => pg_type {oid}
