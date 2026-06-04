@@ -124,6 +124,7 @@ test: plancache limit plpgsql copy2 temp domain rangefuncs prepare conversion tr
 # this group.
 # ----------
 test: partition_join partition_prune reloptions hash_part indexing partition_aggregate partition_info tuplesort explain memoize stats predicate numa progresql progresql_ddl progresql_partseq progresql_vacuum_collision progresql_oid_reuse progresql_global progresql_hot
+test: progresql_concurrency
 # progresql_drain runs serially: it queries the global pg_spanning_drainq catalog
 # and toggles spanning_defer_vacuum, so it must not overlap other vacuum tests.
 test: progresql_drain

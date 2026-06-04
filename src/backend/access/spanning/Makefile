@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	spanning_ddl.o \
 	spanning_exec.o \
+	spanning_lock.o \
 	spanning_relcache.o
 
 include $(top_srcdir)/src/backend/common.mk

@@ -51,6 +51,56 @@ HARD one — do it as a FOCUSED pass, AFTER (B) testing exists as the net:
 
 ## (B) Trust-testing — what drops the README flag
 
+### PROGRESS 2026-06-04 (#34 FIXED — concurrency gating blocker CLOSED)
+The cross-partition uniqueness race (#34), the last data-safety blocker, is fixed
+and verified. README flag softened "Highly experimental / don't trust your data"
+→ "Beta".
+
+**Root cause (two defects, both at the same seam).** Stock btree serializes
+same-key inserters by the leaf-page write lock and descends with the scantid
+omitted so the rightward `_bt_check_unique` scan covers the whole equal-key run.
+A spanning index breaks BOTH invariants because entries sort by
+`(user_cols…, partseq)`:
+  1. **Concurrency:** two inserts of the same user key into different partitions
+     form different full keys `(uk, partseq_a)`/`(uk, partseq_b)` that can sit on
+     different pages → no shared buffer lock → check-and-insert not atomic →
+     silent duplicate (soak: INSERT+cross-partition-MOVE ~73–116 dups).
+  2. **Serial page-boundary:** the descent used the FULL key, so inserting
+     `(uk, partseq_hi)` could land PAST a live `(uk, partseq_lo)` on a left
+     sibling, which the rightward-only scan never revisits → a duplicate with NO
+     concurrency at all. (Independent of #1; both had to be fixed.)
+
+**Fix — one choke point, the btree AM (`_bt_doinsert`).** An adversarial design
+panel confirmed `_bt_doinsert` is the single point ALL concurrent spanning-entry
+inserts funnel through (ExecInsert / cold UPDATE / cross-partition UPDATE / COPY /
+logical-repl apply → `index_insert` → `btinsert` → `_bt_doinsert`; the only
+bypass, bulk `_bt_load`, only runs under a strong lock). So the fix lives there,
+no per-executor-path interception:
+  - **Value lock** (`LOCKTAG_SPANNING_KEY`, new heavyweight lock type): a
+    short-duration exclusive lock keyed on `(db, index, hash(user_cols))`, taken
+    before the descent and released after the physical insert — the
+    cross-partition analogue of the leaf-page write lock. Logic in the owned
+    module `src/backend/access/spanning/spanning_lock.c`; only a thin guarded call
+    in `_bt_doinsert`. Released across `XactLockTableWait` (re-taken on retry),
+    exactly like the buffer lock, so a waiter can't deadlock the txn it waits on.
+  - **Page-boundary fix:** descend the check with the user-key prefix only (lands
+    on the leftmost page of the run); after uniqueness is established, re-descend
+    with the full key and insert as an ordinary non-unique insert.
+
+**Verification (all green):** pgbench soak `-c 12..24` over all op mixes
+(insert-only, HOT-churn, insert+delete, insert+cross-partition-move, mixed):
+**0 duplicates, 0 deadlocks, 0 crashes**; `bt_index_check` + `bt_index_parent_check`
+clean post-soak. 241 regress (new deterministic `progresql_concurrency`), 121
+isolation (`spanning-unique`, `spanning-detach`), recovery/subscription/pg_upgrade
+spanning TAP. ~11% TPS overhead on the pathological all-MOVE workload, far less on
+normal mixes (lock only touches spanning inserts).
+
+Soak harness (scratch, reproducible): a partitioned table with a spanning PK over
+4 LIST partitions and a bounded id space (forces collisions); a plpgsql `op()`
+doing a random INSERT / DELETE / HOT-update / cross-partition `UPDATE … SET part`;
+`pgbench -n -f op.sql -c 12 -j 4 -T <secs>`; verdict
+`SELECT count(*) FROM (SELECT id FROM s GROUP BY id HAVING count(*)>1)`.
+
 ### PROGRESS 2026-06-02 (night)
 Trust-testing started AND turned up real bugs. Done this pass:
 - Isolation specs: `spanning-unique` (cross-partition uniqueness under
@@ -90,16 +140,16 @@ HOT/cold `6cba71e23b`, COPY `4711f4c7ac`, ATTACH-of-partitioned + logical
 replication apply `cd064cc2cd`, CLUSTER/VACUUM FULL/ALTER leaf rewrite
 `7e9e45739e`.  Each live-verified, regress/TAP/isolation green.
 
-**OPEN — the gating blocker: cross-partition uniqueness is racy under
-concurrency.**  A 12-client soak admits silent duplicates when concurrent INSERT
-races a DELETE or cross-partition UPDATE of the same key (INSERT+MOVE ~73–116
-dups; INSERT-only and INSERT+churn = 0).  Mechanism: same-user-key inserts into
-different partitions sort to different btree keys (different partseq) → no shared
-page → no page-level value lock → check-and-insert not atomic.  A partial
-insert-side value lock cut it 20–95× but did not eliminate it (delete/move side
-also needs to lock); reverted as a half-fix.  Full fix = value/predicate locking
-on the user key across insert AND delete/move paths — a real concurrency feature.
-WORM/append (insert-only + DETACH) is soak-clean and dodges it.
+**[RESOLVED 2026-06-04 — see the PROGRESS 2026-06-04 section above.]** The
+gating blocker: cross-partition uniqueness is racy under concurrency.  A 12-client
+soak admits silent duplicates when concurrent INSERT races a DELETE or
+cross-partition UPDATE of the same key (INSERT+MOVE ~73–116 dups; INSERT-only and
+INSERT+churn = 0).  Mechanism: same-user-key inserts into different partitions
+sort to different btree keys (different partseq) → no shared page → no page-level
+value lock → check-and-insert not atomic.  (The earlier note "delete/move side
+also needs to lock" was a mis-diagnosis: the real fix is the value lock at the
+`_bt_doinsert` choke point, which all insert paths funnel through, PLUS the
+separate serial page-boundary descent fix.  Fixed and soak-verified to zero dups.)
 
 **Earlier deferred findings — also fixed, live-verified, tested:**
 - **#2 partseq no-reuse** — new `pg_spanning_seq` counter catalog (OID 565/566);

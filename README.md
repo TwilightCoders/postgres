@@ -4,8 +4,15 @@
 `PRIMARY KEY` / `UNIQUE` enforcement on partitioned tables, without forcing the
 partition key into the constraint.**
 
-> ⚠️ **Highly experimental.** This is a research fork. Don't run it anywhere you
-> care about your data.
+> ⚠️ **Beta.** Cross-partition uniqueness is now tested for single-node
+> correctness, concurrency, and crash recovery: every write path (INSERT, UPDATE
+> incl. cross-partition moves, COPY, logical-replication apply, table rewrite)
+> maintains the spanning index, the cross-partition uniqueness race is closed with
+> a dedicated value lock, and the regression, isolation, crash-recovery,
+> logical-replication, and `pg_upgrade` suites pass (plus a multi-client pgbench
+> soak: zero duplicates, zero deadlocks). It is **not yet** battle-tested at scale
+> or independently reviewed — keep backups and validate against your own workload
+> before trusting production data to it.
 
 Built on [PostgreSQL](https://github.com/postgres/postgres) 18
 (`REL_18_STABLE`). Everything stock Postgres does, ProgreSQL does — plus one

@@ -15,14 +15,15 @@
 >   under churn), **COPY**, **ATTACH of a partitioned table**, **logical
 >   replication apply**, and **table rewrite (CLUSTER / VACUUM FULL / ALTER)**.
 >   Each was live-verified and is covered by regress/TAP/isolation (all green).
-> - **OPEN — architectural, the gating blocker:** **cross-partition uniqueness is
->   racy under concurrency** (concurrent INSERT racing a DELETE or a
->   cross-partition UPDATE of the same key admits silent duplicates).  See the
->   "CONCURRENCY" section below.  This is NOT a surgical bypass; it needs a
->   value/predicate-locking feature.
-> - **Workload impact:** append-only / WORM (insert-only + drop-oldest via
->   DETACH) is soak-clean and dodges the open race; general concurrent workloads
->   with deletes / cross-partition updates are affected.
+> - **FIXED 2026-06-04 (was the gating blocker):** **cross-partition uniqueness
+>   under concurrency** — concurrent INSERT racing a DELETE or cross-partition
+>   UPDATE of the same key admitted silent duplicates.  Fixed with a value lock
+>   (`LOCKTAG_SPANNING_KEY`) at the `_bt_doinsert` choke point plus a serial
+>   page-boundary descent fix; soak-verified to zero duplicates / zero deadlocks
+>   across all op mixes.  See the "CONCURRENCY" section below and
+>   `C3-refactor-and-trust.md` (PROGRESS 2026-06-04).
+> - **Workload impact:** now safe for general concurrent workloads (deletes /
+>   cross-partition updates) as well as append-only / WORM.
 
 > Produced 2026-06-02 during the C3 trust-testing pass.  An adversarial,
 > read-only multi-agent hunt (8 failure-mode lenses; 3 emitted structured
@@ -191,7 +192,7 @@ critic's "missing" list still warrant probing:
 7. partition-key UPDATE that moves a row between partitions (cross-leaf
    delete+insert) vs spanning uniqueness; MERGE / INSERT ... ON CONFLICT.
 
-## CONCURRENCY (soak-discovered 2026-06-03) — cross-partition uniqueness is racy  **[OPEN, architectural]**
+## CONCURRENCY (soak-discovered 2026-06-03) — cross-partition uniqueness is racy  **[FIXED 2026-06-04]**
 A 12-client pgbench soak (mixed INSERT / non-key-UPDATE / DELETE / cross-
 partition-UPDATE over a contended key space on a spanning PK) admits **silent
 cross-partition duplicates**:
@@ -214,22 +215,30 @@ races only on first insert, then the committed entry blocks the rest);
 concurrent DELETE / cross-partition MOVE churn frees-and-recreates keys,
 reopening the race window repeatedly.
 
-**Partial fix tested + reverted.**  A transaction-duration value lock keyed on
-`(spanning index, hash(user key))`, taken in `ExecInsertSpanningIndexTuples`
-before the uniqueness check, serializes concurrent same-user-key inserts and cut
-dups 20–95× (INSERT+MOVE 116→6).  It did **not** eliminate them — the DELETE /
-move-delete-half does not participate in the lock, leaving a residual window —
-so it was reverted rather than ship a half-fix that still corrupts.
+**Earlier partial fix (reverted).**  A first attempt put a value lock in
+`ExecInsertSpanningIndexTuples` (one executor path) and cut dups 20–95× but not to
+zero.  That was mis-read as "the delete side also needs to lock"; the real reason
+it was incomplete is that it sat on ONE of several executor write paths.  Reverted
+rather than ship a half-fix.
 
-**Full fix (the gating work).**  Comprehensive value/predicate locking on the
-user key across *every* path that creates or removes a spanning entry (insert AND
-delete / cross-partition move), with proper per-column type hashing so equal
-keys lock equal.  This is a real concurrency-control feature, not a surgical
-patch — it is why a native cross-partition unique index is hard.
+**Fix (2026-06-04).**  Two defects, both fixed at the btree-AM choke point
+`_bt_doinsert` (which an adversarial design panel confirmed *every* concurrent
+spanning insert funnels through — ExecInsert / cold UPDATE / cross-partition
+UPDATE / COPY / logical-repl apply, all via `index_insert` → `btinsert`):
+  1. **Value lock** `LOCKTAG_SPANNING_KEY` — a short-duration exclusive lock keyed
+     on `(db, index, hash(user_cols))` (per-column type-hash so equal keys lock
+     equal), taken before the descent and released after the physical insert, and
+     released across `XactLockTableWait` like the buffer lock so it cannot
+     deadlock the txn it waits on.  Body in `src/backend/access/spanning/
+     spanning_lock.c`; thin call in `_bt_doinsert`.
+  2. **Serial page-boundary** — the check now descends with the user-key prefix
+     (lands on the leftmost page of the run so the rightward scan sees the whole
+     run), then re-descends with the full key for the insert.
 
-**Workload impact.**  Append-only / WORM (insert-only + drop-oldest via DETACH)
-is **soak-clean** (0 dups) and dodges this entirely; general concurrent
-workloads with deletes or cross-partition updates are affected.
+**Verified.**  The same soak (now `-c 12..24`, all op mixes) → **0 duplicates, 0
+deadlocks, 0 crashes**; `bt_index_parent_check` clean post-soak; deterministic
+`progresql_concurrency` regress test; 241 regress / 121 isolation / spanning TAP
+all green.  Both general concurrent and WORM workloads are now safe.
 
 ## Write-path bypasses (audit 2026-06-03) — all FIXED
 Spanning enforcement was bolted onto `ExecInsert`/`ExecUpdate`, so any path that

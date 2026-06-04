@@ -148,9 +148,11 @@ typedef enum LockTagType
 	LOCKTAG_ADVISORY,			/* advisory user locks */
 	LOCKTAG_APPLY_TRANSACTION,	/* transaction being applied on a logical
 								 * replication subscriber */
+	LOCKTAG_SPANNING_KEY,		/* ProgreSQL: a user-key value in a spanning
+								 * (cross-partition) unique index */
 } LockTagType;
 
-#define LOCKTAG_LAST_TYPE	LOCKTAG_APPLY_TRANSACTION
+#define LOCKTAG_LAST_TYPE	LOCKTAG_SPANNING_KEY
 
 extern PGDLLIMPORT const char *const LockTagTypeNames[];
 
@@ -286,6 +288,23 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field3 = (xid), \
 	 (locktag).locktag_field4 = (objid), \
 	 (locktag).locktag_type = LOCKTAG_APPLY_TRANSACTION, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
+
+/*
+ * ProgreSQL: ID info for a spanning (cross-partition) unique index user-key
+ * value is: DB OID + spanning-index OID + 32-bit hash of the leading user-key
+ * column values (field4 unused).  This is a short-duration "value lock" that
+ * serializes would-be inserters of the same user key into the index regardless
+ * of which leaf partition (and therefore which (userkey, partseq) btree page)
+ * each one targets -- the cross-partition analogue of the leaf-page write lock
+ * that stock btree relies on for uniqueness.
+ */
+#define SET_LOCKTAG_SPANNING_KEY(locktag,dboid,idxoid,keyhash) \
+	((locktag).locktag_field1 = (dboid), \
+	 (locktag).locktag_field2 = (idxoid), \
+	 (locktag).locktag_field3 = (keyhash), \
+	 (locktag).locktag_field4 = 0, \
+	 (locktag).locktag_type = LOCKTAG_SPANNING_KEY, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 /*

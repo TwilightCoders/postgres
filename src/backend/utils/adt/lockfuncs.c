@@ -37,7 +37,8 @@ const char *const LockTagTypeNames[] = {
 	"object",
 	"userlock",
 	"advisory",
-	"applytransaction"
+	"applytransaction",
+	"spanningkey"
 };
 
 StaticAssertDecl(lengthof(LockTagTypeNames) == (LOCKTAG_LAST_TYPE + 1),

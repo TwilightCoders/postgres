@@ -17,6 +17,7 @@
 
 #include "access/nbtree.h"
 #include "access/nbtxlog.h"
+#include "access/spanning.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -112,6 +113,11 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 	BTScanInsert itup_key;
 	BTStack		stack;
 	bool		checkingunique = (checkUnique != UNIQUE_CHECK_NO);
+	bool		spanning_check = false; /* ProgreSQL: spanning uniqueness path */
+	bool		need_value_lock = false;	/* spanning insert needs the value lock */
+	bool		spanning_locked = false;	/* is the value lock currently held? */
+	int			spanning_saved_keysz = 0;	/* full keysz, while descent is truncated */
+	LOCKTAG		spanning_locktag;
 
 	/* we need an insertion scan key to do our search, so build one */
 	itup_key = _bt_mkscankey(rel, itup);
@@ -142,6 +148,48 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 	}
 
 	/*
+	 * ProgreSQL: a spanning (cross-partition) unique index needs two extra
+	 * things during a uniqueness-checking insert, both because its entries sort
+	 * by (user_cols..., partseq):
+	 *
+	 * 1. Descend the uniqueness CHECK with only the user columns.  Stock btree
+	 *    descends with the scantid omitted so the search lands on the FIRST page
+	 *    the value could be on, and the rightward _bt_check_unique scan then
+	 *    covers the whole equal-key run.  For a spanning index the trailing
+	 *    partseq makes the full key partition-specific, so a descent with the
+	 *    full key can route PAST a live same-user-key entry sitting on a left
+	 *    sibling -- and _bt_check_unique never scans left.  Truncating the
+	 *    descent key to the user columns (done at the search: label below, just
+	 *    around _bt_search_insert, then restored so _bt_check_unique and the
+	 *    insert see the full key) restores the invariant.  Applies to every
+	 *    uniqueness-checking variant, including UNIQUE_CHECK_EXISTING, which also
+	 *    descends and rechecks.
+	 *
+	 * 2. Serialize concurrent inserters of the same user key with a value lock.
+	 *    Two such inserters can target different (user_key, partseq) pages and
+	 *    so never contend on a shared buffer lock; the value lock (keyed on the
+	 *    user columns only) is the cross-partition analogue of the leaf-page
+	 *    write lock stock btree relies on.  Only UNIQUE_CHECK_YES both waits and
+	 *    inserts a new entry, so only it needs the lock; UNIQUE_CHECK_EXISTING
+	 *    inserts nothing (no new conflict marker to protect) and
+	 *    UNIQUE_CHECK_PARTIAL is non-blocking and rechecked later.
+	 *
+	 * The value lock is taken at the search: label BEFORE the first buffer lock
+	 * (ordering invariant: spanning-key value lock -> buffer) and held through
+	 * the check and insert.  Like the leaf-page lock it stands in for, it is
+	 * RELEASED if we must wait on another transaction (the conflicting entry is
+	 * already in the tree and serves as the SnapshotDirty marker meanwhile) and
+	 * re-taken when we retry, so a waiter never holds it across XactLockTableWait
+	 * (which would let it deadlock against the very transaction it waits for).
+	 */
+	if (checkingunique && RelationIsSpanning(rel))
+	{
+		spanning_check = true;
+		spanning_saved_keysz = itup_key->keysz;
+		need_value_lock = (checkUnique == UNIQUE_CHECK_YES);
+	}
+
+	/*
 	 * Fill in the BTInsertState working area, to track the current page and
 	 * position within the page to insert on.
 	 *
@@ -167,8 +215,26 @@ search:
 	 * Find and lock the leaf page that the tuple should be added to by
 	 * searching from the root page.  insertstate.buf will hold a buffer that
 	 * is locked in exclusive mode afterwards.
+	 *
+	 * ProgreSQL: take the spanning value lock here, before _bt_search_insert
+	 * acquires the first buffer lock (ordering: value lock -> buffer), and only
+	 * if not already held (a goto-search retry after waiting re-takes it).  Then
+	 * descend with the user-key prefix only (drop the trailing partseq) so we
+	 * land on the leftmost page of the user-key run -- see the note above.
+	 * Restore the full key immediately afterwards so _bt_check_unique (which
+	 * detects spanning from the full key width and reads the partseq as the last
+	 * key column) and the eventual insert both see the complete key.
 	 */
+	if (need_value_lock && !spanning_locked)
+	{
+		SpanningLockUserKey(rel, itup, &spanning_locktag);
+		spanning_locked = true;
+	}
+	if (spanning_check)
+		itup_key->keysz = IndexRelationGetNumberOfUniqueAttributes(rel);
 	stack = _bt_search_insert(rel, heapRel, &insertstate);
+	if (spanning_check)
+		itup_key->keysz = spanning_saved_keysz;
 
 	/*
 	 * checkingunique inserts are not allowed to go ahead when two tuples with
@@ -221,6 +287,21 @@ search:
 			insertstate.buf = InvalidBuffer;
 
 			/*
+			 * ProgreSQL: drop the spanning value lock before waiting; it is
+			 * re-taken at the search: label on retry.  The conflicting entry is
+			 * already in the tree and remains the SnapshotDirty marker, so
+			 * releasing it opens no race window -- whereas holding it across
+			 * XactLockTableWait could deadlock against the very transaction we
+			 * wait on, were it to need the same value lock.  Mirrors the buffer
+			 * lock released just above.
+			 */
+			if (spanning_locked)
+			{
+				SpanningUnlockUserKey(&spanning_locktag);
+				spanning_locked = false;
+			}
+
+			/*
 			 * If it's a speculative insertion, wait for it to finish (ie. to
 			 * go ahead with the insertion, or kill the tuple).  Otherwise
 			 * wait for the transaction to finish as usual.
@@ -239,6 +320,28 @@ search:
 		/* Uniqueness is established -- restore heap tid as scantid */
 		if (itup_key->heapkeyspace)
 			itup_key->scantid = &itup->t_tid;
+
+		/*
+		 * ProgreSQL: for a spanning index the uniqueness check above ran on the
+		 * leftmost page of the user-key run -- we descended with the user-key
+		 * prefix so the rightward scan would cover the whole run.  That page is
+		 * not necessarily where the full (user_key, partseq) key belongs, and
+		 * the binary-search bounds cached during the check bracket the user-key
+		 * prefix rather than the full key, so they cannot drive
+		 * _bt_findinsertloc.  Release the check page and re-descend with the full
+		 * key (scantid is set now) to position the actual insert.  Uniqueness is
+		 * already established and is protected by the value lock, so the insert
+		 * below proceeds as an ordinary non-unique insert (checkingunique=false).
+		 */
+		if (spanning_check && checkUnique != UNIQUE_CHECK_EXISTING)
+		{
+			_bt_relbuf(rel, insertstate.buf);
+			insertstate.buf = InvalidBuffer;
+			insertstate.bounds_valid = false;
+			if (stack)
+				_bt_freestack(stack);
+			stack = _bt_search_insert(rel, heapRel, &insertstate);
+		}
 	}
 
 	if (checkUnique != UNIQUE_CHECK_EXISTING)
@@ -257,9 +360,13 @@ search:
 		/*
 		 * Do the insertion.  Note that insertstate contains cached binary
 		 * search bounds established within _bt_check_unique when insertion is
-		 * checkingunique.
+		 * checkingunique.  (ProgreSQL: a spanning insert re-descended with the
+		 * full key just above and carries no reusable bounds, so it inserts as a
+		 * non-unique insert -- uniqueness was already enforced under the value
+		 * lock.)
 		 */
-		newitemoff = _bt_findinsertloc(rel, &insertstate, checkingunique,
+		newitemoff = _bt_findinsertloc(rel, &insertstate,
+									   checkingunique && !spanning_check,
 									   indexUnchanged, stack, heapRel);
 		_bt_insertonpg(rel, heapRel, itup_key, insertstate.buf, InvalidBuffer,
 					   stack, itup, insertstate.itemsz, newitemoff,
@@ -270,6 +377,16 @@ search:
 		/* just release the buffer */
 		_bt_relbuf(rel, insertstate.buf);
 	}
+
+	/*
+	 * ProgreSQL: release the spanning value lock now that the new entry is
+	 * physically in the tree (it now serves as the SnapshotDirty conflict
+	 * marker for the next inserter of this user key).  This is the only normal
+	 * exit of _bt_doinsert; the conflict-error path raises ERROR and the
+	 * aborting transaction releases the lock for us.
+	 */
+	if (spanning_locked)
+		SpanningUnlockUserKey(&spanning_locktag);
 
 	/* be tidy */
 	if (stack)
