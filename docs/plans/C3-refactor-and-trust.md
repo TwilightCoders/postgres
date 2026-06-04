@@ -112,6 +112,22 @@ cross-partition dup on either key — and (2) amcheck on every spanning index;
   `1d94d3320e` at the same brutal settings (idspace 100–300, 16–24 clients) and
   under `--crash` → 0 dups, 0 deadlocks, amcheck clean.
 
+**#35 (found by the soak, fixed `c58f3fb064`) — btree page-recycle crash under
+autovacuum.** The first long soak with `--autovacuum on` crashed in ~44s: a
+spanning btree page split that recycles a deleted page (`_bt_allocbuf`), and the
+btree vacuum recyclability checks, fed the index's "heap" (the storage-less
+partitioned root, relkind PARTITIONED_TABLE) to the GlobalVis horizon machinery,
+which asserts on relkind (procarray.c). Autovacuum-OFF detector soaks never
+created recyclable pages, so this was invisible until the autovacuum-ON run.
+Fixed by passing NULL (the documented conservative horizon) for spanning at
+`_bt_allocbuf` / `_bt_pendingfsm_finalize` (nbtpage.c) and `btvacuumpage`
+(nbtree.c), and relaxing `BTPageIsRecyclable`'s `Assert(heaprel != NULL)`.
+Re-verified: autovacuum-ON soak ~3M txns → 0 dups/deadlocks/crashes, amcheck
+clean, bounded size; 241 regress + 121 isolation green. (Lesson: a header-only
+edit + `objfiles.txt`-based incremental make shipped a STALE binary for ~4 verify
+cycles; `touch` the consuming `.c` and `rm src/backend/postgres` after header
+changes — see memory `progresql-build-and-agent-hazards`.)
+
 ### PROGRESS 2026-06-02 (night)
 Trust-testing started AND turned up real bugs. Done this pass:
 - Isolation specs: `spanning-unique` (cross-partition uniqueness under
