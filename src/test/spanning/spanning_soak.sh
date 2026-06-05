@@ -36,7 +36,7 @@ set -uo pipefail
 # collisions (the #34 race).  At these settings the pre-fix code fails within
 # ~30s; widen --idspace / drop --clients for a milder, more "realistic" soak.
 CLIENTS=16; JOBS=4; SECS=60; PARTS=4; IDSPACE=500; CRASH=0; KEEP=0
-AUTOVAC=off; ROUND_SECS=0
+AUTOVAC=off; ROUND_SECS=0; CHURN=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINDIR="$SCRIPT_DIR/../../../build/install/bin"
 
@@ -49,6 +49,7 @@ while [ $# -gt 0 ]; do
     --idspace) IDSPACE=$2; shift 2;;
     --autovacuum) AUTOVAC=$2; shift 2;;   # on|off (off = corruption detector)
     --round-secs) ROUND_SECS=$2; shift 2;; # verify every N secs (long runs)
+    --churn) CHURN=$2; shift 2;;           # N extra clients that reconnect per txn (-C)
     --crash) CRASH=1; shift;;
     --keep) KEEP=1; shift;;
     --bindir) BINDIR=$2; shift 2;;
@@ -56,6 +57,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ "$ROUND_SECS" = "0" ] && ROUND_SECS=$SECS
+# enough backends for persistent + churn clients + verify/autovacuum/aux headroom
+MAXCONN=$(( CLIENTS + CHURN + 30 )); [ "$MAXCONN" -lt 64 ] && MAXCONN=64
 
 BINDIR="$(cd "$BINDIR" && pwd)" || { echo "bindir not found"; exit 2; }
 PG_CTL="$BINDIR/pg_ctl"; INITDB="$BINDIR/initdb"; PSQL="$BINDIR/psql"; PGBENCH="$BINDIR/pgbench"
@@ -101,7 +104,7 @@ start_cluster() {
   fi
   "$PG_CTL" -D "$DATA" \
     -o "-c unix_socket_directories=$SOCK -c listen_addresses='' $durable_opts \
-        -c deadlock_timeout=50ms -c max_connections=64 $av_opts" \
+        -c deadlock_timeout=50ms -c max_connections=$MAXCONN $av_opts" \
     -l "$LOG" start -w >/dev/null 2>&1
 }
 
@@ -111,7 +114,7 @@ wait_ready() {
   echo "cluster did not become ready"; tail -20 "$LOG"; return 1
 }
 
-echo "=== ProgreSQL spanning soak: clients=$CLIENTS jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE crash=$CRASH ==="
+echo "=== ProgreSQL spanning soak: clients=$CLIENTS churn=$CHURN jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE autovacuum=$AUTOVAC max_connections=$MAXCONN crash=$CRASH ==="
 
 "$INITDB" -D "$DATA" -U volte -A trust >/dev/null 2>&1 || { echo "initdb failed"; exit 1; }
 start_cluster; wait_ready || exit 1
@@ -173,9 +176,26 @@ rm -f /tmp/spanning_soak_setup.$$
 echo "SELECT op();" > "$RUN/op.sql"
 
 run_load() {   # $1 = duration
+  # Persistent connections: sustained per-backend load (the original workload).
   "$PGBENCH" -h "$SOCK" -U volte -d postgres -n -f "$RUN/op.sql" \
-    -c "$CLIENTS" -j "$JOBS" -T "$1" 2>&1 | \
-    grep -E "tps|number of (transactions|failed)" | sed 's/^/  pgbench: /'
+    -c "$CLIENTS" -j "$JOBS" -T "$1" >"$RUN/pers.out" 2>&1 &
+  local pers_pid=$!
+  local churn_pid=""
+  if [ "$CHURN" -gt 0 ]; then
+    # Connection churn: -C opens a FRESH connection for every transaction, so
+    # this hammers backend startup/teardown, per-connection spanning relcache
+    # setup, and the postmaster's fork path -- concurrently with the persistent
+    # read/write load and concurrent connect/disconnect.
+    "$PGBENCH" -h "$SOCK" -U volte -d postgres -n -C -f "$RUN/op.sql" \
+      -c "$CHURN" -j "$JOBS" -T "$1" >"$RUN/churn.out" 2>&1 &
+    churn_pid=$!
+  fi
+  wait "$pers_pid"
+  grep -E "tps|number of (transactions|failed)" "$RUN/pers.out" | sed 's/^/  persist:  /'
+  if [ -n "$churn_pid" ]; then
+    wait "$churn_pid"
+    grep -E "tps|number of (transactions|failed)" "$RUN/churn.out" | sed 's/^/  churn(-C):/'
+  fi
 }
 
 verify() {     # echoes FAIL lines; returns nonzero on any failure
