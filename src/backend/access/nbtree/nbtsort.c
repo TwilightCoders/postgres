@@ -43,6 +43,7 @@
 #include "access/nbtree.h"
 #include "access/parallel.h"
 #include "access/relscan.h"
+#include "access/spanning.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/index.h"

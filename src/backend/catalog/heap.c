@@ -32,6 +32,7 @@
 #include "access/genam.h"
 #include "access/multixact.h"
 #include "access/relation.h"
+#include "access/spanning.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/binary_upgrade.h"
