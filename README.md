@@ -83,7 +83,15 @@ referenced side a single cross-partition unique key to point at.
 
 ## Quickstart
 
-Build it like any PostgreSQL source tree:
+Install the prebuilt binaries from the Homebrew tap (keg-only, so it won't
+clash with a stock `postgresql`):
+
+```sh
+brew install twilightcoders/tap/progresql
+# brew prints the keg path; add its bin/ to PATH, or use it explicitly
+```
+
+Or build it like any PostgreSQL source tree:
 
 ```sh
 git clone -b progresql-18 https://github.com/TwilightCoders/progresql.git
@@ -103,7 +111,8 @@ a `build.sh` wrapper at the repo root.)
 Run the feature's regression suites:
 
 ```sh
-make -C src/test/regress check    # 240/240, includes the `progresql*` suites
+make -C src/test/regress check    # 242/242, includes the `progresql*` suites
+make -C src/test/isolation check  # 122/122, includes the spanning-* specs
 ```
 
 ---
@@ -215,10 +224,49 @@ A focused diff on top of `REL_18_STABLE`
 - **242/242** core regression tests pass, including the ProgreSQL suites
   (`progresql`, `progresql_ddl`, `progresql_partseq`, `progresql_global`,
   `progresql_hot`, `progresql_vacuum_collision`, `progresql_oid_reuse`,
-  `progresql_drain`, `progresql_fk`, `progresql_dumpdef`), plus 122/122 isolation.
+  `progresql_drain`, `progresql_fk`, `progresql_dumpdef`), plus **122/122**
+  isolation tests.
+- **TAP**: `recovery/049_spanning_crash` (crash recovery, 17/17) and
+  `subscription/031_spanning` (logical replication, 7/7) pass.
+- **Soak-verified** (cassert + `amcheck` oracle): the cross-partition uniqueness
+  race, the deferred-vacuum drain (6 h scale + a 24-partition run), 25 crash/
+  recover cycles, local-index leaves, and concurrent index DROP/CREATE during a
+  drain — all clean (0 duplicates, 0 crashes). See `src/test/spanning/`.
 - Warning-clean under PostgreSQL's standard strict flags.
-- Branch layout: `master` tracks upstream PostgreSQL; **`progresql-18`** carries
-  the spanning-index feature (this is the active experimental line).
+- Branch layout: `master` tracks upstream PostgreSQL; the spanning-index feature
+  is maintained as a rebasable patch series on a working branch and shipped via
+  the `twilightcoders/tap` Homebrew tap (keg-only `progresql`).
+
+See [`PRODUCTION_READINESS.md`](./PRODUCTION_READINESS.md) for the honest
+production/upstream gap assessment, and
+[`docs/disaster-recovery.md`](./docs/disaster-recovery.md) for the
+backup/DR runbook.
+
+## Backup & disaster recovery
+
+The recommended production posture keeps the fork on the **primary only** and uses
+**stock PostgreSQL as the durable copy** — so all your backup/DR tooling is the
+battle-tested, supported kind:
+
+- **ProgreSQL primary** enforces partitioning + cross-partition uniqueness via the
+  spanning index.
+- **Logical replication → a stock PostgreSQL replica.** Logical decoding ships
+  ordinary heap row changes (the spanning index is index-level state; the
+  `partseq` discriminator lives in the index, not the heap), so a vanilla
+  subscriber applies them with no knowledge of the fork. The replica is a faithful
+  data copy you can back up with `pg_dump` / pgBackRest / PITR / etc.
+- **The spanning index carries no information not derivable from the data**, so
+  recovery is simple: stand up a fresh ProgreSQL, apply your `GLOBAL` schema (from
+  source control), and load the data back — the rows route to partitions and the
+  spanning index is rebuilt, re-enforcing uniqueness on the way in.
+
+One required setting: because a spanning-PK leaf has no local primary key,
+`UPDATE`/`DELETE` won't logically replicate unless the leaves are set to
+**`REPLICA IDENTITY FULL`**. INSERT replicates without it.
+
+This is validated end-to-end (a live master→replica→rebuild drill, and the
+`031_spanning` TAP test). Full runbook, including the restore recipe and
+monitoring, in [`docs/disaster-recovery.md`](./docs/disaster-recovery.md).
 
 ## Tracking upstream
 
@@ -242,7 +290,16 @@ git rebase upstream/REL_18_STABLE progresql-18
   `GLOBAL` index on an already multi-level tree.
 - The per-statement cache is exactly that — per statement; it is rebuilt for
   each top-level DML.
-- This is a research fork, not a supported product.
+- **Logical replication of `UPDATE`/`DELETE`** from a spanning-indexed table
+  requires `REPLICA IDENTITY FULL` on the leaf partitions (a spanning-PK leaf has
+  no local primary key to serve as the replica identity). INSERT needs nothing
+  extra. See [`docs/disaster-recovery.md`](./docs/disaster-recovery.md).
+- This is a **fork** of PostgreSQL: running it means you maintain the divergence
+  (forward-porting minors yourself). The recommended way to bound that risk is to
+  confine the fork to the primary and keep a stock-PostgreSQL logical replica as
+  the supported backup/DR target (see *Backup & disaster recovery* above). Single-
+  node correctness is extensively tested; it has not had independent PG-internals
+  review and is not (yet) proposed for upstream merge.
 
 ## License
 

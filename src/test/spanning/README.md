@@ -50,11 +50,39 @@ src/test/spanning/spanning_soak.sh --crash
 
 # milder, more "realistic" soak (wider key space, fewer clients)
 src/test/spanning/spanning_soak.sh --clients 8 --idspace 50000 --secs 300
+
+# DHR deferred-drain path: autovacuum-driven coalesced drains under load,
+# verifying every --round-secs (long runs)
+src/test/spanning/spanning_soak.sh --defer-vacuum --autovacuum on \
+    --secs 21600 --round-secs 600
+
+# #38 deferred local-index path: per-leaf local index + heapallindexed amcheck
+src/test/spanning/spanning_soak.sh --defer-vacuum --autovacuum on --local-index
+
+# #41 DDL-vs-drain: drop/recreate the tag spanning index under load + drains
+src/test/spanning/spanning_soak.sh --defer-vacuum --autovacuum on --ddl-churn
+
+# connection churn: extra clients that reconnect every txn (-C)
+src/test/spanning/spanning_soak.sh --churn 8
 ```
 
-Flags: `--clients N --jobs N --secs N --partitions N --idspace N --crash --keep
---bindir DIR`. Exit status is 0 only if every oracle passes. Run against an
-`--enable-cassert` build so backend assertions are a third oracle.
+Flags:
+
+| flag | meaning |
+|---|---|
+| `--clients N` / `--jobs N` / `--secs N` | persistent pgbench clients / threads / duration |
+| `--partitions N` / `--idspace N` | partition count / user-key space (tight = stronger detector) |
+| `--autovacuum on\|off` | off (default) is the race detector; on bounds bloat for long runs + drives the deferred drain |
+| `--round-secs N` | verify every N seconds (catch corruption when it happens, not just at the end) |
+| `--churn N` | N extra clients that open a fresh connection per txn (`pgbench -C`) |
+| `--defer-vacuum` | `spanning_defer_vacuum=on` — soak the DHR coalesced-drain path |
+| `--local-index` | add a per-leaf local index + `heapallindexed` amcheck it (the #38 oracle) |
+| `--ddl-churn` | drop/recreate the tag spanning index under load (the #41 drain-vs-DROP oracle) |
+| `--crash` | kill -9 mid-load on a durable (fsync) cluster, recover, then verify |
+| `--keep` / `--bindir DIR` | keep the throwaway cluster / point at a specific `bin/` |
+
+Exit status is 0 only if every oracle passes. Run against an `--enable-cassert`
+build so backend assertions are a third oracle.
 
 The defaults are tuned to be a **detector**, not a gentle soak: a tight key space
 + high client count maximizes same-key cross-partition collisions. Widen
