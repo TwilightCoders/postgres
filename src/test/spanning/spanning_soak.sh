@@ -23,9 +23,12 @@
 #
 # Usage:
 #   spanning_soak.sh [--clients N] [--jobs N] [--secs N] [--partitions N]
-#                    [--idspace N] [--crash] [--keep] [--bindir DIR]
+#                    [--idspace N] [--autovacuum on|off] [--round-secs N]
+#                    [--churn N] [--defer-vacuum] [--crash] [--keep] [--bindir DIR]
 #
-# Defaults: 12 clients, 4 jobs, 60s, 8 partitions, idspace 5000.
+# Defaults: 16 clients, 4 jobs, 60s, 4 partitions, idspace 500, autovacuum off
+# (the corruption detector); --defer-vacuum soaks the DHR coalesced-drain path
+# instead of the eager per-leaf spanning vacuum.
 #
 # src/test/spanning/spanning_soak.sh
 #-------------------------------------------------------------------------
@@ -36,7 +39,7 @@ set -uo pipefail
 # collisions (the #34 race).  At these settings the pre-fix code fails within
 # ~30s; widen --idspace / drop --clients for a milder, more "realistic" soak.
 CLIENTS=16; JOBS=4; SECS=60; PARTS=4; IDSPACE=500; CRASH=0; KEEP=0
-AUTOVAC=off; ROUND_SECS=0; CHURN=0
+AUTOVAC=off; ROUND_SECS=0; CHURN=0; DEFER=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINDIR="$SCRIPT_DIR/../../../build/install/bin"
 
@@ -50,6 +53,7 @@ while [ $# -gt 0 ]; do
     --autovacuum) AUTOVAC=$2; shift 2;;   # on|off (off = corruption detector)
     --round-secs) ROUND_SECS=$2; shift 2;; # verify every N secs (long runs)
     --churn) CHURN=$2; shift 2;;           # N extra clients that reconnect per txn (-C)
+    --defer-vacuum) DEFER=1; shift;;       # spanning_defer_vacuum=on (soak the DHR drain path)
     --crash) CRASH=1; shift;;
     --keep) KEEP=1; shift;;
     --bindir) BINDIR=$2; shift 2;;
@@ -102,9 +106,14 @@ start_cluster() {
   else
     av_opts="-c autovacuum=off"
   fi
+  # DHR drain path: defer the spanning-index vacuum to the coalesced drain.  This
+  # exercises the enqueue + reap-suppression + drain (and, with autovacuum on, the
+  # work-item/launcher drain trigger) under stress, instead of the eager path.
+  local defer_opts=""
+  [ "$DEFER" = "1" ] && defer_opts="-c spanning_defer_vacuum=on"
   "$PG_CTL" -D "$DATA" \
     -o "-c unix_socket_directories=$SOCK -c listen_addresses='' $durable_opts \
-        -c deadlock_timeout=50ms -c max_connections=$MAXCONN $av_opts" \
+        -c deadlock_timeout=50ms -c max_connections=$MAXCONN $av_opts $defer_opts" \
     -l "$LOG" start -w >/dev/null 2>&1
 }
 
@@ -114,7 +123,7 @@ wait_ready() {
   echo "cluster did not become ready"; tail -20 "$LOG"; return 1
 }
 
-echo "=== ProgreSQL spanning soak: clients=$CLIENTS churn=$CHURN jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE autovacuum=$AUTOVAC max_connections=$MAXCONN crash=$CRASH ==="
+echo "=== ProgreSQL spanning soak: clients=$CLIENTS churn=$CHURN jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE autovacuum=$AUTOVAC defer_vacuum=$DEFER max_connections=$MAXCONN crash=$CRASH ==="
 
 "$INITDB" -D "$DATA" -U volte -A trust >/dev/null 2>&1 || { echo "initdb failed"; exit 1; }
 start_cluster; wait_ready || exit 1
