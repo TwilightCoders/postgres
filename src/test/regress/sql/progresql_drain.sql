@@ -93,26 +93,42 @@ CREATE TABLE drq_plain (x int PRIMARY KEY);
 SELECT pg_drain_spanning_index('drq_plain_pkey'::regclass);
 DROP TABLE drq_plain;
 
--- A spanning leaf WITH a local index must NOT be deferred/drained: the drain
--- reaps every LP_DEAD slot, which would orphan a live local-index entry.  Such
--- leaves use the eager path (no enqueue), so the drain never touches them and
--- the local index stays consistent with the heap.
+-- #38: a spanning leaf WITH a local index IS deferred under spanning_defer_vacuum.
+-- The leaf VACUUM enqueues without scanning ANY index (local or spanning); the
+-- coalesced drain later removes the LOCAL index entries for the dead slots too
+-- (spanning_drain_vacuum_local_indexes) BEFORE reaping, so a reaped-then-reused
+-- slot can never collide with a surviving local-index entry (the reuse trap in
+-- the local-index direction).  Behavioural assertions here (enqueue happens, the
+-- drain retires + reaps + clears the queue, the local index keeps EXACTLY the
+-- live rows, no app-level dups); the structural amcheck of the local index under
+-- churn is the --local-index spanning soak's job.
 CREATE TABLE li (id bigint NOT NULL, v int NOT NULL,
     PRIMARY KEY (id) GLOBAL) PARTITION BY LIST ((id % 1));
 CREATE TABLE li0 PARTITION OF li FOR VALUES IN (0) WITH (autovacuum_enabled = false);
 CREATE INDEX li0_v ON li0 (v);
 INSERT INTO li SELECT g, g FROM generate_series(1, 500) g;
 DELETE FROM li WHERE id <= 250;
-VACUUM li0;                                  -- local-index leaf -> eager path
-SELECT count(*) AS drainq_after_local_idx FROM pg_spanning_drainq;   -- expect 0
-SELECT pg_drain_spanning_index('li_pkey'::regclass) AS retired;      -- expect 0
-INSERT INTO li SELECT g, g FROM generate_series(1, 250) g;           -- reinsert deleted
+VACUUM li0;                                  -- local-index leaf -> NOW deferred (#38)
+-- Enqueued: the spanning PK has a pending drain row for li0 (was 0 pre-#38).
+SELECT count(*) > 0 AS enqueued FROM pg_spanning_drainq
+  WHERE sdq_idxid = 'li_pkey'::regclass;     -- expect t
+-- Coalesced drain: retire spanning AND local-index entries for the dead slots,
+-- then reap.  retired counts the spanning entries removed.
+SELECT pg_drain_spanning_index('li_pkey'::regclass) > 0 AS retired;  -- expect t
+SELECT count(*) AS drainq_after FROM pg_spanning_drainq;             -- expect 0
+-- Reinsert the deleted ids: they reuse the now-freed slots.
+INSERT INTO li SELECT g, g FROM generate_series(1, 250) g;
+-- The local index must hold EXACTLY the live rows: an index scan and a seqscan
+-- over the full range return identical counts (500).  A drain that wrongly
+-- removed live local entries would make the index scan undercount.
 SET enable_seqscan = off;
-SELECT count(*) AS li_index_rows FROM li0 WHERE v BETWEEN 1 AND 250;
+SELECT count(*) AS li_index_rows FROM li0 WHERE v BETWEEN 1 AND 500;
 RESET enable_seqscan;
 SET enable_indexscan = off; SET enable_bitmapscan = off;
-SELECT count(*) AS li_seq_rows FROM li0 WHERE v BETWEEN 1 AND 250;
+SELECT count(*) AS li_seq_rows FROM li0 WHERE v BETWEEN 1 AND 500;
 RESET enable_indexscan; RESET enable_bitmapscan;
+-- No duplicate ids on the spanning key after the reuse.
+SELECT count(*) AS dup_ids FROM (SELECT id FROM li GROUP BY id HAVING count(*) > 1) d;
 DROP TABLE li CASCADE;
 
 -- Dup-key churn against a spanning index must not crash: the heap-probing
