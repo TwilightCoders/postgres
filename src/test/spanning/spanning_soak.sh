@@ -39,7 +39,7 @@ set -uo pipefail
 # collisions (the #34 race).  At these settings the pre-fix code fails within
 # ~30s; widen --idspace / drop --clients for a milder, more "realistic" soak.
 CLIENTS=16; JOBS=4; SECS=60; PARTS=4; IDSPACE=500; CRASH=0; KEEP=0
-AUTOVAC=off; ROUND_SECS=0; CHURN=0; DEFER=0
+AUTOVAC=off; ROUND_SECS=0; CHURN=0; DEFER=0; LOCALIDX=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINDIR="$SCRIPT_DIR/../../../build/install/bin"
 
@@ -54,6 +54,7 @@ while [ $# -gt 0 ]; do
     --round-secs) ROUND_SECS=$2; shift 2;; # verify every N secs (long runs)
     --churn) CHURN=$2; shift 2;;           # N extra clients that reconnect per txn (-C)
     --defer-vacuum) DEFER=1; shift;;       # spanning_defer_vacuum=on (soak the DHR drain path)
+    --local-index) LOCALIDX=1; shift;;     # add a per-leaf local index (soak the #38 deferred local-index path)
     --crash) CRASH=1; shift;;
     --keep) KEEP=1; shift;;
     --bindir) BINDIR=$2; shift 2;;
@@ -123,7 +124,7 @@ wait_ready() {
   echo "cluster did not become ready"; tail -20 "$LOG"; return 1
 }
 
-echo "=== ProgreSQL spanning soak: clients=$CLIENTS churn=$CHURN jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE autovacuum=$AUTOVAC defer_vacuum=$DEFER max_connections=$MAXCONN crash=$CRASH ==="
+echo "=== ProgreSQL spanning soak: clients=$CLIENTS churn=$CHURN jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE autovacuum=$AUTOVAC defer_vacuum=$DEFER local_index=$LOCALIDX max_connections=$MAXCONN crash=$CRASH ==="
 
 "$INITDB" -D "$DATA" -U volte -A trust >/dev/null 2>&1 || { echo "initdb failed"; exit 1; }
 start_cluster; wait_ready || exit 1
@@ -144,6 +145,11 @@ fi
   for p in $(seq 0 $((PARTS-1))); do
     echo "CREATE TABLE st_$p PARTITION OF st FOR VALUES IN ($p);"
   done
+  # A per-leaf LOCAL index makes the leaves nindexes>0, exercising the #38
+  # deferred local-index drain path (the drain must vacuum this index for the
+  # dead set before reaping).  Indexing payload (the HOT-update column) also
+  # forces those updates cold, producing more dead tuples -> more drain work.
+  [ "$LOCALIDX" = "1" ] && echo "CREATE INDEX st_payload_idx ON st (payload);"
   echo "DROP TABLE IF EXISTS soakcfg;"
   echo "CREATE TABLE soakcfg (idspace int, parts int);"
   echo "INSERT INTO soakcfg VALUES ($IDSPACE, $PARTS);"
@@ -227,6 +233,22 @@ verify() {     # echoes FAIL lines; returns nonzero on any failure
     fi
     rm -f /tmp/amck.$$
   done
+  # Structural oracle for the #38 deferred local-index path: amcheck every leaf's
+  # LOCAL index.  An unsafe reap (freeing a slot whose local entry the drain
+  # failed to retire) shows up here as a dangling/duplicated entry ("item order
+  # invariant violated" / "heap tuple ... not found in index").
+  if [ "$LOCALIDX" = "1" ]; then
+    local lidx
+    for lidx in $(psql_q -c "SELECT c.oid::regclass::text FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid WHERE c.relkind='i' AND i.indrelid IN (SELECT inhrelid FROM pg_inherits WHERE inhparent='st'::regclass) ORDER BY 1;"); do
+      if "$PSQL" -h "$SOCK" -U volte -d postgres -v ON_ERROR_STOP=1 -qc \
+           "SELECT bt_index_check('$lidx'::regclass, true); SELECT bt_index_parent_check('$lidx'::regclass, true);" >/tmp/amck.$$ 2>&1; then
+        echo "  amcheck(local) $lidx: OK"
+      else
+        echo "  FAIL: amcheck(local) $lidx"; cat /tmp/amck.$$ | sed 's/^/    /'; rc=1
+      fi
+      rm -f /tmp/amck.$$
+    done
+  fi
   return $rc
 }
 
