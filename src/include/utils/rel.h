@@ -165,6 +165,19 @@ typedef struct RelationData
 	Bitmapset  *rd_hotblockingattr; /* cols blocking HOT update */
 	Bitmapset  *rd_summarizedattr;	/* cols indexed by summarizing indexes */
 
+	/*
+	 * ProgreSQL: cached predicate -- is this a leaf partition with a spanning
+	 * (GLOBAL) index on an ancestor root?  Lazily computed by
+	 * RelationHasSpanningAncestor and reset with the other relcache-derived
+	 * caches in RelationClearRelation, so it tracks spanning-index add/drop
+	 * (leaf relcaches are invalidated on spanning build -- #42).  Lets the
+	 * per-insert spanning maintenance hook early-out without a catalog walk
+	 * (get_partition_ancestors + index scan) on tables that use no spanning
+	 * index -- the common "do no harm" case.
+	 */
+	bool		rd_progresql_spanning_leaf;			/* cached answer */
+	bool		rd_progresql_spanning_leaf_valid;	/* is the answer computed? */
+
 	PublicationDesc *rd_pubdesc;	/* publication descriptor, or NULL */
 
 	/*

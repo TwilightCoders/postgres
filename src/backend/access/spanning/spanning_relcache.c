@@ -187,3 +187,27 @@ progresql_leaf_has_spanning_ancestor(Relation relation)
 	list_free(ancestors);
 	return found;
 }
+
+/*
+ * RelationHasSpanningAncestor
+ *
+ * Relcache-cached form of progresql_leaf_has_spanning_ancestor for the per-row
+ * write path.  The answer changes only when a spanning index is added to or
+ * dropped from an ancestor root; spanning-index build invalidates every leaf
+ * relcache (#42), and RelationClearRelation resets the cached flag, so the
+ * cache tracks those changes correctly.  This lets the per-insert spanning
+ * maintenance hook early-out with a single field read instead of repeating
+ * get_partition_ancestors + a pg_index scan for every inserted row of a
+ * partitioned table that uses no spanning index (the do-no-harm common case).
+ */
+bool
+RelationHasSpanningAncestor(Relation relation)
+{
+	if (!relation->rd_progresql_spanning_leaf_valid)
+	{
+		relation->rd_progresql_spanning_leaf =
+			progresql_leaf_has_spanning_ancestor(relation);
+		relation->rd_progresql_spanning_leaf_valid = true;
+	}
+	return relation->rd_progresql_spanning_leaf;
+}

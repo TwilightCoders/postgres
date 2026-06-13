@@ -6503,6 +6503,7 @@ load_relcache_init_file(bool shared)
 		rel->rd_pkindex = InvalidOid;
 		rel->rd_replidindex = InvalidOid;
 		rel->rd_attrsvalid = false;
+		rel->rd_progresql_spanning_leaf_valid = false;	/* ProgreSQL: recompute */
 		rel->rd_keyattr = NULL;
 		rel->rd_pkattr = NULL;
 		rel->rd_idattr = NULL;

@@ -236,6 +236,19 @@ ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 
+	/*
+	 * Fast path for the do-no-harm case: a leaf with no spanning index on any
+	 * ancestor has nothing to maintain.  RelationHasSpanningAncestor is a cached
+	 * relcache predicate (reset on relcache rebuild, which a spanning-index
+	 * add/drop triggers -- #42), so this is a single field read after the first
+	 * call per backend.  It avoids building the per-statement partition cache
+	 * entry -- whose miss path does get_partition_ancestors + table_open(root) +
+	 * a pg_index walk -- for every inserted row of an ordinary partitioned
+	 * table (each single-row INSERT statement is a fresh estate -> cache miss).
+	 */
+	if (!RelationHasSpanningAncestor(partition))
+		return;
+
 	pe = progresql_build_partition_cache_entry(estate, partition);
 	if (pe->nEntries == 0)
 		return;
