@@ -99,7 +99,21 @@ the leaf relcache) is sound end-to-end.
 all leaf index work to the coalesced drain; drain gains a per-partition
 local-index ambulkdelete pass before the reap), keeping the coarse drainq and the
 O(N) spanning-scan coalescing. This is the XL change gating #39's default flip.
-DESIGN ONLY — implement under review, TDD, redfield.
+
+**#38 IMPLEMENTED + #39 DEFAULT FLIPPED (committed `b79e384ddc`..`2ad374e329`).**
+The DHR-lift landed per the Option-2 design: `lazy_vacuum`'s defer decision is
+hoisted to cover BOTH no-local-index and local-index spanning leaves, and
+`progresql_drain_spanning_index` gained `spanning_drain_vacuum_local_indexes` — a
+per-partition local-index `ambulkdelete` against the same LP_DEAD set, run before
+the reap so no live local entry is orphaned (the coarse `pg_spanning_drainq` is
+unchanged; the O(N) spanning coalescing is preserved).  With deferral now safe for
+every spanning leaf, `spanning_defer_vacuum`'s default was flipped to **on**
+(guc_tables.c, postgresql.conf.sample, README).  Validation: regress 241/241 +
+isolation 122/122 with the default on; a new `progresql_drain` local-index case;
+and the structural oracle — a `--local-index` cassert soak (new soak knob,
+heapallindexed amcheck of every leaf index) — PASS at 5×120s with churn (30/30
+local amchecks clean, 0 dups/crashes).  A 3h x86 local-index soak runs on the NAS
+(soak4) as post-push assurance.
 
 **Env caveat (machine-specific):** the PERL5LIB/IPC::Run note above is true on the
 WORK machine (Ash Forge) only. On the HOME machine (Otto Loom / volte) IPC::Run is
