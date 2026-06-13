@@ -39,7 +39,7 @@ set -uo pipefail
 # collisions (the #34 race).  At these settings the pre-fix code fails within
 # ~30s; widen --idspace / drop --clients for a milder, more "realistic" soak.
 CLIENTS=16; JOBS=4; SECS=60; PARTS=4; IDSPACE=500; CRASH=0; KEEP=0
-AUTOVAC=off; ROUND_SECS=0; CHURN=0; DEFER=0; LOCALIDX=0
+AUTOVAC=off; ROUND_SECS=0; CHURN=0; DEFER=0; LOCALIDX=0; DDLCHURN=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINDIR="$SCRIPT_DIR/../../../build/install/bin"
 
@@ -55,6 +55,7 @@ while [ $# -gt 0 ]; do
     --churn) CHURN=$2; shift 2;;           # N extra clients that reconnect per txn (-C)
     --defer-vacuum) DEFER=1; shift;;       # spanning_defer_vacuum=on (soak the DHR drain path)
     --local-index) LOCALIDX=1; shift;;     # add a per-leaf local index (soak the #38 deferred local-index path)
+    --ddl-churn) DDLCHURN=1; shift;;       # drop/recreate the tag spanning index under load (soak #41 drain-vs-DROP)
     --crash) CRASH=1; shift;;
     --keep) KEEP=1; shift;;
     --bindir) BINDIR=$2; shift 2;;
@@ -124,7 +125,7 @@ wait_ready() {
   echo "cluster did not become ready"; tail -20 "$LOG"; return 1
 }
 
-echo "=== ProgreSQL spanning soak: clients=$CLIENTS churn=$CHURN jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE autovacuum=$AUTOVAC defer_vacuum=$DEFER local_index=$LOCALIDX max_connections=$MAXCONN crash=$CRASH ==="
+echo "=== ProgreSQL spanning soak: clients=$CLIENTS churn=$CHURN jobs=$JOBS secs=$SECS parts=$PARTS idspace=$IDSPACE autovacuum=$AUTOVAC defer_vacuum=$DEFER local_index=$LOCALIDX ddl_churn=$DDLCHURN max_connections=$MAXCONN crash=$CRASH ==="
 
 "$INITDB" -D "$DATA" -U volte -A trust >/dev/null 2>&1 || { echo "initdb failed"; exit 1; }
 start_cluster; wait_ready || exit 1
@@ -190,11 +191,44 @@ PLPGSQL
 rm -f /tmp/spanning_soak_setup.$$
 echo "SELECT op();" > "$RUN/op.sql"
 
+# DDL churn (#41): repeatedly DROP and re-CREATE the tag spanning index while the
+# load (and, with --defer-vacuum, the coalesced drains) run.  The short window
+# where st_tag_key is absent lets a drain that snapshotted the root's index list
+# BEFORE the drop hit the try_index_open()/try_table_open() NULL paths (the #40
+# concurrent-DROP hardening), and exercises RemoveSpanningDrainqForIndex on drop +
+# the backfill on re-create.  Safe under load: the PK on id makes tag (= 't'||id)
+# unique by construction, so the re-create's UNIQUE backfill never finds a dup.
+ddl_churn_loop() {   # $1 = duration
+  local end=$((SECONDS + $1))
+  local n=0
+  # Deadlocks between the DDL (AccessExclusive) and the load (RowExclusive) are
+  # expected under contention and are tolerated -- the test cares only that no
+  # crash/corruption results and that the re-CREATE always succeeds.
+  while [ "$SECONDS" -lt "$end" ]; do
+    "$PSQL" -h "$SOCK" -U volte -d postgres -qc \
+      "ALTER TABLE st DROP CONSTRAINT IF EXISTS st_tag_key;" >>"$RUN/ddl.out" 2>&1
+    sleep 0.5
+    "$PSQL" -h "$SOCK" -U volte -d postgres -qc \
+      "ALTER TABLE st ADD CONSTRAINT st_tag_key UNIQUE (tag) GLOBAL;" >>"$RUN/ddl.out" 2>&1
+    n=$((n + 1))
+    sleep 1
+  done
+  # Leave the index present for verify() (idempotent: drop-if-exists then add).
+  "$PSQL" -h "$SOCK" -U volte -d postgres -qc \
+    "ALTER TABLE st DROP CONSTRAINT IF EXISTS st_tag_key; ALTER TABLE st ADD CONSTRAINT st_tag_key UNIQUE (tag) GLOBAL;" >>"$RUN/ddl.out" 2>&1
+  echo "$n" > "$RUN/ddl.count"
+}
+
 run_load() {   # $1 = duration
   # Persistent connections: sustained per-backend load (the original workload).
   "$PGBENCH" -h "$SOCK" -U volte -d postgres -n -f "$RUN/op.sql" \
     -c "$CLIENTS" -j "$JOBS" -T "$1" >"$RUN/pers.out" 2>&1 &
   local pers_pid=$!
+  local ddl_pid=""
+  if [ "$DDLCHURN" = "1" ]; then
+    ddl_churn_loop "$1" &
+    ddl_pid=$!
+  fi
   local churn_pid=""
   if [ "$CHURN" -gt 0 ]; then
     # Connection churn: -C opens a FRESH connection for every transaction, so
@@ -210,6 +244,20 @@ run_load() {   # $1 = duration
   if [ -n "$churn_pid" ]; then
     wait "$churn_pid"
     grep -E "tps|number of (transactions|failed)" "$RUN/churn.out" | sed 's/^/  churn(-C):/'
+  fi
+  if [ -n "$ddl_pid" ]; then
+    wait "$ddl_pid"
+    local cycles dls others
+    cycles=$(cat "$RUN/ddl.count" 2>/dev/null); cycles=${cycles:-0}
+    dls=$(grep -ci "deadlock detected" "$RUN/ddl.out" 2>/dev/null); dls=${dls:-0}
+    others=$(grep -iE "ERROR|FATAL" "$RUN/ddl.out" 2>/dev/null | grep -vic "deadlock detected"); others=${others:-0}
+    echo "  ddl-churn: $cycles drop/recreate cycles (tolerated deadlocks=$dls, other-errors=$others)"
+    # A non-deadlock error means a re-CREATE failed -- a real problem, since the PK
+    # on id makes tag unique by construction, so the UNIQUE backfill must succeed.
+    if [ "$others" -gt 0 ]; then
+      grep -iE "ERROR|FATAL" "$RUN/ddl.out" | grep -vi "deadlock detected" | head -3 | sed 's/^/    ddl-err: /'
+    fi
+    : > "$RUN/ddl.out"
   fi
 }
 

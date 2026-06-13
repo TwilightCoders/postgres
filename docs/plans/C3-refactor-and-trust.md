@@ -136,6 +136,17 @@ CASCADE/SET NULL/ON UPDATE through the root AND direct-leaf, ATTACH, multi-colum
 key, zero-orphans). regress 242/242, isolation 122/122. Design + as-built:
 `docs/plans/C3-FK-to-spanning-PK-design.md`.
 
+**#41 SOAKED — concurrent DROP/CREATE of a spanning index during drains.** Added a
+`--ddl-churn` knob to `spanning_soak.sh` that drops and re-creates the tag spanning
+index (`st_tag_key`) in a loop while the load and the deferred coalesced drains
+run.  This exercises the #40 concurrent-DROP hardening (a drain that snapshotted
+the root's index list before the drop hits the `try_index_open`/`try_table_open`
+NULL paths), plus `RemoveSpanningDrainqForIndex` on drop and the backfill on
+re-create.  Safe under load because the PK on id makes tag (= 't'||id) unique by
+construction, so the UNIQUE backfill never finds a dup.  Result: ~39 cycles/round,
+0 dups, 0 crashes, amcheck clean on both spanning indexes, only tolerated
+DDL-vs-DML deadlocks.  #41 closed.
+
 ### PROGRESS 2026-06-04 (#34 FIXED — concurrency gating blocker CLOSED)
 The cross-partition uniqueness race (#34), the last data-safety blocker, is fixed
 and verified. README flag softened "Highly experimental / don't trust your data"
