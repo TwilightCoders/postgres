@@ -70,6 +70,14 @@ predicts, NOT a leak. The deferred drain path is now scale-validated; the #40 fi
 holds under load. (The flip of the default itself remains blocked by #38 — see
 below — and #39 also wants a re-soak WITH local indexes once #38 lands.)
 
+**Higher-partition deferred soak — PASS** (NAS, container `progresql-soak-hi`,
+reused the soak3 cassert build). Same DHR config at 4× the partition count to
+stress the #40 root-coordination (drain unions many dirty partitions across both
+spanning indexes, per-partition kill-maps + reaps): `--clients 24 --churn 12
+--idspace 2000 --partitions 24 --secs 10800`. Result: **18/18 rounds, 36/36
+amcheck OK, 0 dups, 0 crashes, 0 deadlocks**, size bounded at 12 MB. Confirms the
+multi-partition drain coordination holds at higher partition fan-out.
+
 **Crash-torture of the deferred path — 25/25 PASS** (local cassert HEAD,
 `/tmp/crash-defer-loop.sh`). 25 cycles, each: fresh fsync-on cluster, load with
 autovacuum-driven deferred drains in flight, `kill -9` the postmaster mid-load,
