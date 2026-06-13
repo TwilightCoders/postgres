@@ -33,6 +33,7 @@
 #include "executor/tuptable.h"
 #include "partitioning/partdesc.h"
 #include "utils/fmgroids.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -624,6 +625,20 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 		table_endscan(scan);
 		ExecDropSingleTupleTableSlot(slot);
 		table_close(partRel, AccessShareLock);
+
+		/*
+		 * Invalidate this leaf's relcache.  Adding a spanning index to an
+		 * already-populated partitioned table changes every leaf's hot-blocking
+		 * attribute set: the spanning key columns become HOT-blocking on the
+		 * leaf (progresql_add_spanning_hotblocking_attrs), so a spanning-key
+		 * UPDATE must be forced cold.  ALTER TABLE / CREATE INDEX invalidate the
+		 * partitioned root but not its leaves, so a backend that cached a leaf's
+		 * rd_hotblockingattr BEFORE this build would keep the stale (pre-spanning)
+		 * set, treat a spanning-key UPDATE as HOT, drop the spanning entry, and
+		 * silently break cross-partition uniqueness (#42).  Forcing a leaf
+		 * relcache rebuild on every backend closes that window.
+		 */
+		CacheInvalidateRelcacheByRelid(partOid);
 	}
 
 	PopActiveSnapshot();

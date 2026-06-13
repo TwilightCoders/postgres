@@ -1,0 +1,13 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1cache s2add s1upd s1dup s1check
+step s1cache: UPDATE relinval SET pad = pad + 1 WHERE k = 100;
+step s2add: ALTER TABLE relinval ADD CONSTRAINT relinval_uq UNIQUE (k) GLOBAL;
+step s1upd: UPDATE relinval SET k = 200 WHERE k = 100;
+step s1dup: INSERT INTO relinval VALUES (200, 1, 0);
+ERROR:  duplicate key value violates unique constraint "relinval_uq"
+step s1check: SELECT k, count(*) FROM relinval GROUP BY k HAVING count(*) > 1;
+k|count
+-+-----
+(0 rows)
+

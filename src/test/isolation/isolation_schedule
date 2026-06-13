@@ -121,3 +121,4 @@ test: lock-nowait
 # ProgreSQL: cross-partition ("spanning") unique enforcement under concurrency
 test: spanning-unique
 test: spanning-detach
+test: spanning-relcache
