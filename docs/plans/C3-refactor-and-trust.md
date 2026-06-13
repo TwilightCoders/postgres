@@ -51,6 +51,47 @@ HARD one — do it as a FOCUSED pass, AFTER (B) testing exists as the net:
 
 ## (B) Trust-testing — what drops the README flag
 
+### PROGRESS 2026-06-13 (deferred-path scale-soak PASS; HEAD re-verified green)
+The perf-default staircase advanced and the committed tree was re-verified after
+the perf-flag struct change.
+
+**#39 deferred-path scale-soak — PASS (the gate for flipping the default).** 6h NAS
+soak (container `progresql-soak-defer`, cassert build of HEAD `70c95a3646`),
+`spanning_soak.sh --defer-vacuum --autovacuum on --clients 16 --churn 8
+--idspace 800 --partitions 6 --secs 21600 --round-secs 600`. This exercises the
+DHR coalesced-drain path (not the eager path) with autovacuum-driven drains, on a
+table with TWO spanning indexes (int PK GLOBAL + text UNIQUE GLOBAL) on
+no-local-index leaves — the exact multi-index, `nindexes==0` geometry the #40
+deferred-drain corruption fix addressed. Result: **36/36 rounds, 72/72 amcheck OK
+(bt_index_check + bt_index_parent_check on both spanning indexes), 0 dups, 0
+unexpected crashes, 0 deadlocks**, ~8M txns/round (~13k tps persistent). Bloat
+plateaued at 9776 kB and held — the bounded held-LP_DEAD behaviour the DHR design
+predicts, NOT a leak. The deferred drain path is now scale-validated; the #40 fix
+holds under load. (The flip of the default itself remains blocked by #38 — see
+below — and #39 also wants a re-soak WITH local indexes once #38 lands.)
+
+**HEAD re-verified green on a clean local rebuild.** The local `build/install`
+predated the perf-flag commit (which added two bools to `RelationData` in rel.h —
+a struct change requiring a full rebuild). Clean-rebuilt HEAD and ran: **regress
+241/241, isolation 122/122** (incl. progresql_drain/concurrency/global/hot,
+spanning-unique/detach/relcache). The perf flag (cache "has spanning ancestor" on
+the leaf relcache) is sound end-to-end.
+
+**#38 (DHR-lift) design drafted + committed** (`a75f80c4bc`,
+`docs/plans/C3-DHR-lift-local-index-leaves-design.md`). Recommends Option 2 (defer
+all leaf index work to the coalesced drain; drain gains a per-partition
+local-index ambulkdelete pass before the reap), keeping the coarse drainq and the
+O(N) spanning-scan coalescing. This is the XL change gating #39's default flip.
+DESIGN ONLY — implement under review, TDD, redfield.
+
+**Env caveat (machine-specific):** the PERL5LIB/IPC::Run note above is true on the
+WORK machine (Ash Forge) only. On the HOME machine (Otto Loom / volte) IPC::Run is
+NOT installed, so the spanning TAP suite (`049_spanning_crash`, `031_spanning`)
+can't run here without `sudo cpan IPC::Run` (or brew perl + cpanm). regress +
+isolation cover the perf flag's actual surface; the soak covers deferred-drain
+correctness; the perf flag touches no WAL/crash path, so TAP was not a gating gap
+this session.
+
 ### PROGRESS 2026-06-04 (#34 FIXED — concurrency gating blocker CLOSED)
 The cross-partition uniqueness race (#34), the last data-safety blocker, is fixed
 and verified. README flag softened "Highly experimental / don't trust your data"
