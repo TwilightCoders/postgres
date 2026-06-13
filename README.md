@@ -72,6 +72,13 @@ GLOBAL`. Ordinary partitioned tables behave exactly like stock PostgreSQL. (The
 syntax aligns with Oracle's `GLOBAL` partitioned indexes and the in-core
 "global index" proposal under discussion on pgsql-hackers.)
 
+A spanning `PRIMARY KEY` / `UNIQUE` can also be the target of a **foreign key**:
+`REFERENCES events (id)` from another table is accepted and fully enforced
+(INSERT-time existence checks plus `ON DELETE` / `ON UPDATE` `RESTRICT` /
+`CASCADE` / `SET NULL` / `SET DEFAULT`, on operations through the partitioned root
+*and* on individual leaf partitions), since the spanning index gives the
+referenced side a single cross-partition unique key to point at.
+
 ---
 
 ## Quickstart
@@ -205,10 +212,10 @@ A focused diff on top of `REL_18_STABLE`
 ## Status
 
 - Based on **PostgreSQL 18** (`REL_18_STABLE`).
-- **240/240** core regression tests pass, including the ProgreSQL suites
+- **242/242** core regression tests pass, including the ProgreSQL suites
   (`progresql`, `progresql_ddl`, `progresql_partseq`, `progresql_global`,
   `progresql_hot`, `progresql_vacuum_collision`, `progresql_oid_reuse`,
-  `progresql_drain`, `progresql_dumpdef`).
+  `progresql_drain`, `progresql_fk`, `progresql_dumpdef`), plus 122/122 isolation.
 - Warning-clean under PostgreSQL's standard strict flags.
 - Branch layout: `master` tracks upstream PostgreSQL; **`progresql-18`** carries
   the spanning-index feature (this is the active experimental line).

@@ -452,6 +452,8 @@ static Oid	transformFkeyCheckAttrs(Relation pkrel,
 									int numattrs, int16 *attnums,
 									bool with_period, Oid *opclasses,
 									bool *pk_has_without_overlaps);
+static bool index_is_spanning(Oid indexOid);
+static Oid	fkReferencedPartitionIndex(Relation partRel, Oid indexOid);
 static void checkFkeyPermissions(Relation rel, int16 *attnums, int natts);
 static CoercionPathType findFkeyCast(Oid targetTypeId, Oid sourceTypeId,
 									 Oid *funcid);
@@ -11006,11 +11008,10 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 			else
 				mapped_pkattnum = pkattnum;
 
-			/* Determine the index to use at this level */
-			partIndexId = index_get_partition(partRel, indexOid);
-			if (!OidIsValid(partIndexId))
-				elog(ERROR, "index for %u not found in partition %s",
-					 indexOid, RelationGetRelationName(partRel));
+			/* Determine the index to use at this level (a spanning GLOBAL index
+			 * has no per-partition child; fkReferencedPartitionIndex reuses the
+			 * root index OID for it). */
+			partIndexId = fkReferencedPartitionIndex(partRel, indexOid);
 
 			/* Create entry at this level ... */
 			address = addFkConstraint(addFkReferencedSide,
@@ -11426,10 +11427,9 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		 * Because this new partition appears in the referenced side of the
 		 * constraint, we don't need to set up for Phase 3 check.
 		 */
-		partIndexId = index_get_partition(partitionRel, indexOid);
-		if (!OidIsValid(partIndexId))
-			elog(ERROR, "index for %u not found in partition %s",
-				 indexOid, RelationGetRelationName(partitionRel));
+		/* A spanning GLOBAL index has no per-partition child; reuse the root
+		 * index OID for it (see fkReferencedPartitionIndex). */
+		partIndexId = fkReferencedPartitionIndex(partitionRel, indexOid);
 
 		/*
 		 * Get the "action" triggers belonging to the constraint to pass as
@@ -13528,6 +13528,52 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
  *
  *	Raises an ERROR on validation failure.
  */
+/*
+ * index_is_spanning
+ *		True if the given index OID is a ProgreSQL spanning (GLOBAL) index.
+ *		Cheap syscache lookup; used on the FK referenced side, where a spanning
+ *		index lives only on the partitioned root and has no per-partition child.
+ */
+static bool
+index_is_spanning(Oid indexOid)
+{
+	HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexOid));
+	bool		result;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for index %u", indexOid);
+	result = IndexFormIsSpanning((Form_pg_index) GETSTRUCT(tup));
+	ReleaseSysCache(tup);
+	return result;
+}
+
+/*
+ * fkReferencedPartitionIndex
+ *		The index OID to record at one partition level of a referenced-side FK.
+ *
+ * For an ordinary partitioned unique index, descend to this partition's child
+ * index.  For a ProgreSQL spanning (GLOBAL) index there is no per-partition
+ * child -- it is a single btree on the partitioned root -- so reuse the root
+ * index OID at every level.  The referenced-side action triggers do not probe
+ * the PK index (their action query targets the referencing table); the index is
+ * carried only as constraint/trigger metadata, so the root OID is correct at all
+ * levels.
+ */
+static Oid
+fkReferencedPartitionIndex(Relation partRel, Oid indexOid)
+{
+	Oid			partIndexId;
+
+	if (index_is_spanning(indexOid))
+		return indexOid;
+
+	partIndexId = index_get_partition(partRel, indexOid);
+	if (!OidIsValid(partIndexId))
+		elog(ERROR, "index for %u not found in partition %s",
+			 indexOid, RelationGetRelationName(partRel));
+	return partIndexId;
+}
+
 static Oid
 transformFkeyCheckAttrs(Relation pkrel,
 						int numattrs, int16 *attnums,
@@ -13582,8 +13628,15 @@ transformFkeyCheckAttrs(Relation pkrel,
 		 * Must have the right number of columns; must be unique (or if
 		 * temporal then exclusion instead) and not a partial index; forget it
 		 * if there are any expressions, too. Invalid indexes are out as well.
+		 *
+		 * ProgreSQL: a spanning (GLOBAL) index carries a trailing partseq
+		 * discriminator key beyond the user-visible unique columns, so match the
+		 * referenced columns against its leading indnuniqatts user key, not the
+		 * full indnkeyatts.  The column-match loop below only inspects the first
+		 * numattrs index columns (the user key), so it already ignores partseq.
 		 */
-		if (indexStruct->indnkeyatts == numattrs &&
+		if ((IndexFormIsSpanning(indexStruct) ?
+			 indexStruct->indnuniqatts : indexStruct->indnkeyatts) == numattrs &&
 			(with_period ? indexStruct->indisexclusion : indexStruct->indisunique) &&
 			indexStruct->indisvalid &&
 			heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL) &&

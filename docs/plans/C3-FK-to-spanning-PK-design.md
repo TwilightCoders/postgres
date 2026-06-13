@@ -3,11 +3,10 @@
 > Scoping + design for letting a `REFERENCES p(id)` foreign key target a spanning
 > (`GLOBAL`) PRIMARY KEY / UNIQUE constraint on a partitioned root.
 >
-> Status: **DESIGN / SCOPING ONLY — not implemented.** Drafted 2026-06-13 after
-> the DHR staircase (#38 + #39) shipped.  This is a genuine feature (a new
-> capability), not a surgical fix; it expands the fork's surface, so it wants a
-> deliberate build under review, not an autonomous slam-in.  **Do not ship a
-> partial implementation** — see the data-integrity hazard below.
+> Status: **IMPLEMENTED 2026-06-13** (both gaps; see "As built" at the bottom).
+> Drafted, then built the same day after the DHR staircase (#38 + #39) shipped.
+> Both gaps landed together (the matcher fix alone would be a data-integrity
+> hole — see below), validated by the `progresql_fk` regress matrix.
 
 ## Current behaviour
 `CREATE TABLE c (..., pid int REFERENCES p(id))` where `p` has
@@ -105,7 +104,31 @@ root-level trigger for spanning indexes, plus enforcement verification and a bro
 FK-semantics test matrix.  Corruption/integrity-sensitive (it is a data-integrity
 constraint); build under review with the full test matrix green before shipping.
 
-## Interim option (not done)
+## As built (2026-06-13)
+Both gaps landed in `src/backend/commands/tablecmds.c`:
+- **Gap 1:** `transformFkeyCheckAttrs` compares the referenced columns against
+  `IndexFormIsSpanning(idx) ? indnuniqatts : indnkeyatts`; the existing column
+  loop already inspects only the leading `numattrs` columns, so partseq is
+  ignored automatically.
+- **Gap 2:** a helper `fkReferencedPartitionIndex(partRel, indexOid)` returns the
+  root `indexOid` unchanged for a spanning index (it has no per-partition child)
+  and otherwise `index_get_partition` as before.  The two referenced-side
+  recursion sites (`addFkRecurseReferenced` and the ATTACH-time
+  `CloneFkReferenced`) call it, so per-leaf action triggers + sub-constraints are
+  created with the root spanning index as their `conindid`/`tgconstrindid` (carried
+  as metadata only).  No change to the RI trigger functions or enforcement queries
+  was needed — `SELECT … FOR KEY SHARE` on the partitioned root uses the spanning
+  btree as a leading-column scan.
+- **Tests:** `src/test/regress/sql/progresql_fk.sql` — CHECK (incl. absent key),
+  ON DELETE RESTRICT/CASCADE/SET NULL, ON UPDATE CASCADE, all enforced through the
+  root AND on direct-leaf ops; ATTACH a new referenced partition (cloned FK
+  enforces immediately); multi-column spanning key; zero-orphans assertion.
+  regress 242/242, isolation 122/122.
+- **Deferred follow-ups (not blocking):** an isolation spec for concurrent child
+  INSERT vs parent DELETE through the spanning index (standard RI row-locking, so
+  low risk); DETACH of a referenced spanning partition; pg_upgrade of the FK.
+
+## Interim option (superseded — feature now implemented)
 A clean early ERROR — detect the spanning user-key match in `transformFkeyCheckAttrs`
 and raise "foreign keys referencing a spanning (GLOBAL) constraint are not yet
 supported" instead of the misleading "no unique constraint matching given keys".

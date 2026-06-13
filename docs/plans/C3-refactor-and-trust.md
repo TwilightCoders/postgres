@@ -123,6 +123,19 @@ isolation cover the perf flag's actual surface; the soak covers deferred-drain
 correctness; the perf flag touches no WAL/crash path, so TAP was not a gating gap
 this session.
 
+**#33 IMPLEMENTED — FK references to a spanning (GLOBAL) PK.** A foreign key can
+now target a spanning PRIMARY KEY/UNIQUE. Two gaps closed in tablecmds.c:
+`transformFkeyCheckAttrs` matches the referenced columns against the spanning
+index's leading `indnuniqatts` user key (not the full `(user,partseq)`), and a new
+`fkReferencedPartitionIndex` helper feeds the root spanning index OID to the
+referenced-side recursion at every partition level (a spanning index has no
+per-leaf child) so per-leaf action triggers are still created — both
+`addFkRecurseReferenced` and ATTACH-time `CloneFkReferenced`. No RI-trigger or
+enforcement-query change needed. Validated by `progresql_fk` (CHECK + RESTRICT/
+CASCADE/SET NULL/ON UPDATE through the root AND direct-leaf, ATTACH, multi-column
+key, zero-orphans). regress 242/242, isolation 122/122. Design + as-built:
+`docs/plans/C3-FK-to-spanning-PK-design.md`.
+
 ### PROGRESS 2026-06-04 (#34 FIXED — concurrency gating blocker CLOSED)
 The cross-partition uniqueness race (#34), the last data-safety blocker, is fixed
 and verified. README flag softened "Highly experimental / don't trust your data"
