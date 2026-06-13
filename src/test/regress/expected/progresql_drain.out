@@ -238,4 +238,63 @@ SELECT count(*) AS drainq_after_drop FROM pg_spanning_drainq
 
 DROP TABLE dq CASCADE;
 DROP TABLE dq_a;   -- the detached partition, now standalone
+-- Multi-spanning-index root-coordinated drain (#40 regression).  With more than
+-- one spanning index on a table the heap is SHARED, so a partition's dead slot
+-- may be reaped only after EVERY spanning index has retired its entry for it.  A
+-- per-index drain that reaped after clearing only its own entries orphaned the
+-- sibling index's entries -- a reuse trap that duplicated entries in the other
+-- index (amcheck "item order invariant violated").  The drain is therefore
+-- root-coordinated: draining ONE spanning index drains ALL of them against one
+-- per-partition LP_DEAD set and clears the whole root's queue.  The structural
+-- corruption itself is caught by the amcheck-based spanning soak; here we assert
+-- the load-bearing behavioural difference deterministically (no amcheck needed).
+CREATE TABLE mi (id bigint NOT NULL, tag text NOT NULL, k int NOT NULL,
+    PRIMARY KEY (id) GLOBAL, UNIQUE (tag) GLOBAL) PARTITION BY LIST (k);
+CREATE TABLE mi0 PARTITION OF mi FOR VALUES IN (0) WITH (autovacuum_enabled = false);
+CREATE TABLE mi1 PARTITION OF mi FOR VALUES IN (1) WITH (autovacuum_enabled = false);
+INSERT INTO mi SELECT g, 't' || g, g % 2 FROM generate_series(1, 40) g;
+DELETE FROM mi WHERE id <= 20;
+VACUUM mi0;
+VACUUM mi1;
+-- Both spanning indexes (mi_pkey, mi_tag_key) enqueued both dirty partitions.
+SELECT sdq_idxid::regclass::text AS idx, count(*) AS rows
+  FROM pg_spanning_drainq GROUP BY 1 ORDER BY 1;
+    idx     | rows 
+------------+------
+ mi_pkey    |    2
+ mi_tag_key |    2
+(2 rows)
+
+-- Drain via ONE index: root-coordination must drain the SIBLING too, clearing
+-- the ENTIRE queue.  Pre-#40-fix this left mi_tag_key's rows (and reaped slots
+-- whose mi_tag_key entries then orphaned).
+SELECT pg_drain_spanning_index('mi_pkey'::regclass) > 0 AS retired_some;
+ retired_some 
+--------------
+ t
+(1 row)
+
+SELECT count(*) AS drainq_rows_after FROM pg_spanning_drainq;   -- expect 0
+ drainq_rows_after 
+-------------------
+                 0
+(1 row)
+
+-- No app-level duplicates on either spanning key; deleted keys reinsert; live
+-- keys still reject duplicates on BOTH id and tag.
+INSERT INTO mi VALUES (3, 't3', 1);             -- id=3 was deleted -> success
+INSERT INTO mi VALUES (40, 't-x', 0);           -- ERROR: duplicate key (id)=(40)
+ERROR:  duplicate key value violates unique constraint "mi_pkey"
+DETAIL:  Key (id)=(40) already exists.
+INSERT INTO mi VALUES (99, 't40', 1);           -- ERROR: duplicate key (tag)=(t40)
+ERROR:  duplicate key value violates unique constraint "mi_tag_key"
+DETAIL:  Key (tag)=(t40) already exists.
+SELECT (SELECT count(*) FROM (SELECT id FROM mi GROUP BY id HAVING count(*) > 1) a) AS dup_ids,
+       (SELECT count(*) FROM (SELECT tag FROM mi GROUP BY tag HAVING count(*) > 1) b) AS dup_tags;
+ dup_ids | dup_tags 
+---------+----------
+       0 |        0
+(1 row)
+
+DROP TABLE mi CASCADE;
 RESET spanning_defer_vacuum;

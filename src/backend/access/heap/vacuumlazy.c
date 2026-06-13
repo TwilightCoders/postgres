@@ -2880,20 +2880,22 @@ spanning_drain_reap_partition(Relation rel, TidStore *dead,
 int64
 progresql_drain_spanning_index(Oid spanningIndexOid)
 {
-	Relation	idxRel;
 	HeapTuple	idxtup;
 	bool		isspanning;
-	List	   *dirty;
+	Oid			rootOid;
+	Relation	rootRel;
+	List	   *allidx;
 	ListCell   *lc;
-	int			ndirty;
+	Oid		   *spanidx;		/* spanning index OIDs on the root */
+	List	  **idxdirty;		/* per-index dirty partseq lists */
+	int			nspan;
+	int			s;
+	List	   *partoids = NIL; /* deduped dirty partition OIDs (the union) */
+	int			npart;
 	int			i;
-	int32		maxpartseq = 0;
 	SpanningDrainEntry *entries;
-	BTSpanningDrainKill kill;
 	BufferAccessStrategy bstrategy;
 	Relation	heaprel = NULL;
-	IndexVacuumInfo ivinfo;
-	IndexBulkDeleteResult *istat;
 	int64		retired = 0;
 
 	/* The drain writes WAL (index delitems + heap reap); not legal in recovery. */
@@ -2920,84 +2922,179 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 				 errmsg("\"%s\" is not a spanning index",
 						get_rel_name(spanningIndexOid))));
 
-	/* 2. Snapshot the dirty partseqs; resolve them by index OID (no index lock). */
-	dirty = SpanningDrainqListDirty(spanningIndexOid);
-	if (dirty == NIL)
+	/*
+	 * 2. Resolve the partitioned root and ALL its spanning indexes.  The reap
+	 * is a shared-heap operation, so a dead slot may be freed only once EVERY
+	 * spanning index on the root has retired its entry for it (the invariant the
+	 * eager path keeps in progresql_vacuum_spanning_indexes).  We therefore
+	 * drain the whole sibling set here, not just the index that triggered us.
+	 */
+	rootOid = IndexGetRelation(spanningIndexOid, false);
+	rootRel = table_open(rootOid, AccessShareLock);
+	allidx = RelationGetIndexList(rootRel);
+	spanidx = (Oid *) palloc(list_length(allidx) * sizeof(Oid));
+	nspan = 0;
+	foreach(lc, allidx)
+	{
+		Oid			io = lfirst_oid(lc);
+		Relation	ir = index_open(io, AccessShareLock);
+
+		if (RelationIsSpanning(ir))
+			spanidx[nspan++] = io;
+		index_close(ir, AccessShareLock);
+	}
+	list_free(allidx);
+	table_close(rootRel, AccessShareLock);
+
+	if (nspan == 0)				/* defensive: the trigger index was spanning */
+	{
+		pfree(spanidx);
 		return 0;
+	}
 
 	bstrategy = GetAccessStrategy(BAS_VACUUM);
 
-	ndirty = list_length(dirty);
-	entries = (SpanningDrainEntry *) palloc0(ndirty * sizeof(SpanningDrainEntry));
-	i = 0;
-	foreach(lc, dirty)
+	/*
+	 * 3. Snapshot each spanning index's dirty partseqs and union the partitions
+	 * they name (by OID; a partition has a different partseq in each index).
+	 * Syscache only --- no index lock yet (partitions lock first).
+	 */
+	idxdirty = (List **) palloc0(nspan * sizeof(List *));
+	for (s = 0; s < nspan; s++)
 	{
-		int32		ps = lfirst_int(lc);
+		idxdirty[s] = SpanningDrainqListDirty(spanidx[s]);
+		foreach(lc, idxdirty[s])
+		{
+			int32		ps = lfirst_int(lc);
+			Oid			po = SpanningResolvePartseqRelidByOid(spanidx[s], ps);
 
-		entries[i].partseq = ps;
-		entries[i].partOid = SpanningResolvePartseqRelidByOid(spanningIndexOid, ps);
-		entries[i].partRel = NULL;
-		entries[i].dead = NULL;
-		if (ps > maxpartseq)
-			maxpartseq = ps;
-		i++;
+			if (OidIsValid(po) && !list_member_oid(partoids, po))
+				partoids = lappend_oid(partoids, po);
+		}
 	}
 
-	/* 3. Lock partitions in OID order (before the index) and build kill sets. */
-	qsort(entries, ndirty, sizeof(SpanningDrainEntry), spanning_drain_entry_cmp);
-
-	kill.maxpartseq = maxpartseq;
-	kill.deadbypartseq = (struct TidStore **)
-		palloc0((maxpartseq + 1) * sizeof(struct TidStore *));
-
-	for (i = 0; i < ndirty; i++)
+	if (partoids == NIL)		/* nothing pending across the whole root */
 	{
-		if (!OidIsValid(entries[i].partOid))
-			continue;			/* partition gone; just drop its drainq row */
+		for (s = 0; s < nspan; s++)
+			list_free(idxdirty[s]);
+		pfree(idxdirty);
+		pfree(spanidx);
+		FreeAccessStrategy(bstrategy);
+		return 0;
+	}
 
+	/*
+	 * 4. Lock partitions (SUEL, OID order) and build ONE LP_DEAD kill set per
+	 * partition.  This same per-partition set is used by every index's scan AND
+	 * by the reap, so all spanning indexes retire exactly the slots that get
+	 * freed --- no sibling's entry can outlive the reap (the #40 fix).
+	 */
+	npart = list_length(partoids);
+	entries = (SpanningDrainEntry *) palloc0(npart * sizeof(SpanningDrainEntry));
+	i = 0;
+	foreach(lc, partoids)
+	{
+		entries[i].partseq = -1;	/* per-index; resolved in the scan loop */
+		entries[i].partOid = lfirst_oid(lc);
+		entries[i].partRel = NULL;
+		entries[i].dead = NULL;
+		i++;
+	}
+	qsort(entries, npart, sizeof(SpanningDrainEntry), spanning_drain_entry_cmp);
+
+	for (i = 0; i < npart; i++)
+	{
 		/* try_table_open: a partition dropped since resolve opens as NULL. */
 		entries[i].partRel = try_table_open(entries[i].partOid,
 											ShareUpdateExclusiveLock);
 		if (entries[i].partRel == NULL)
-			continue;
+			continue;			/* gone; just drop its drainq rows below */
 
 		entries[i].dead =
 			spanning_drain_build_lpdead_store(entries[i].partRel, bstrategy);
-		kill.deadbypartseq[entries[i].partseq] = (struct TidStore *) entries[i].dead;
-
 		if (heaprel == NULL)
-			heaprel = entries[i].partRel;
+			heaprel = entries[i].partRel;	/* a real leaf for ivinfo.heaprel */
 	}
 
-	/* 4. Now lock the index (after partitions -> consistent global order). */
-	idxRel = index_open(spanningIndexOid, ShareUpdateExclusiveLock);
-
 	/*
-	 * 5. One coalesced index scan retiring all dirty partseqs' dead entries.
-	 * heaprel is a real leaf (not the partitioned root) so BTPageIsRecyclable's
-	 * relkind assert is satisfied (see bt_spanning_bulkdelete / commit B1).  If
-	 * every dirty partition was dropped there is nothing to scan or reap.
+	 * 5. For each spanning index (SUEL, after partitions), scan it once and
+	 * delete its entries whose (partseq, TID) is in the shared kill set.
+	 * heaprel is a real leaf (not the storage-less root) so BTPageIsRecyclable's
+	 * relkind assert holds (see bt_spanning_bulkdelete / commit B1).
 	 */
 	if (heaprel != NULL)
 	{
-		ivinfo.index = idxRel;
-		ivinfo.heaprel = heaprel;
-		ivinfo.analyze_only = false;
-		ivinfo.report_progress = false;
-		ivinfo.estimated_count = true;
-		ivinfo.message_level = DEBUG2;
-		ivinfo.num_heap_tuples = -1;
-		ivinfo.strategy = bstrategy;
-
-		istat = bt_spanning_drain(&ivinfo, NULL, &kill);
-		if (istat != NULL)
+		for (s = 0; s < nspan; s++)
 		{
-			retired = istat->tuples_removed;
-			pfree(istat);
+			Relation	idxRel = try_index_open(spanidx[s],
+											   ShareUpdateExclusiveLock);
+			BTSpanningDrainKill kill;
+			int32		maxps = 0;
+			IndexVacuumInfo ivinfo;
+			IndexBulkDeleteResult *istat;
+
+			/*
+			 * The root and indexes are unlocked between the step-2 snapshot and
+			 * here, so a sibling spanning index can be dropped concurrently.
+			 * try_index_open returns NULL then; just skip it (DROP INDEX's
+			 * RemoveSpanningDrainqForIndex already cleared its drainq rows).  Its
+			 * entries are gone, so reaping below cannot orphan them.
+			 */
+			if (idxRel == NULL)
+				continue;
+
+			/* Map this index's partseq for each locked partition to its set. */
+			for (i = 0; i < npart; i++)
+			{
+				int32		ps;
+
+				if (entries[i].partRel == NULL || entries[i].dead == NULL)
+					continue;
+				ps = SpanningLookupPartseqByRelid(idxRel, entries[i].partOid);
+				if (ps > maxps)
+					maxps = ps;
+			}
+			kill.maxpartseq = maxps;
+			kill.deadbypartseq = (struct TidStore **)
+				palloc0((maxps + 1) * sizeof(struct TidStore *));
+			for (i = 0; i < npart; i++)
+			{
+				int32		ps;
+
+				if (entries[i].partRel == NULL || entries[i].dead == NULL)
+					continue;
+				ps = SpanningLookupPartseqByRelid(idxRel, entries[i].partOid);
+				if (ps >= 0 && ps <= maxps)
+					kill.deadbypartseq[ps] = (struct TidStore *) entries[i].dead;
+			}
+
+			ivinfo.index = idxRel;
+			ivinfo.heaprel = heaprel;
+			ivinfo.analyze_only = false;
+			ivinfo.report_progress = false;
+			ivinfo.estimated_count = true;
+			ivinfo.message_level = DEBUG2;
+			ivinfo.num_heap_tuples = -1;
+			ivinfo.strategy = bstrategy;
+
+			istat = bt_spanning_drain(&ivinfo, NULL, &kill);
+			if (istat != NULL)
+			{
+				retired += istat->tuples_removed;
+				pfree(istat);
+			}
+			pfree(kill.deadbypartseq);
+			index_close(idxRel, NoLock);	/* keep SUEL until commit */
 		}
 
-		/* 6. Reap the now-safe LP_DEAD slots (index entries already gone). */
-		for (i = 0; i < ndirty; i++)
+		/*
+		 * 6. Reap each partition's now-safe LP_DEAD slots ONCE.  Every spanning
+		 * index that maps a partition was scanned against that partition's full
+		 * LP_DEAD set above (an index that does not map it has no entries for
+		 * it), so freeing these slots can orphan no entry --- the
+		 * root-coordinated invariant that fixes #40.
+		 */
+		for (i = 0; i < npart; i++)
 		{
 			if (entries[i].partRel != NULL && entries[i].dead != NULL)
 				spanning_drain_reap_partition(entries[i].partRel,
@@ -3005,22 +3102,25 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 		}
 	}
 
-	/* 7. Drop the drained queue rows (only the partseqs we processed). */
-	SpanningDrainqDeleteList(spanningIndexOid, dirty);
+	/* 7. Drop the drained queue rows for every index we processed. */
+	for (s = 0; s < nspan; s++)
+		SpanningDrainqDeleteList(spanidx[s], idxdirty[s]);
 
 	/* Cleanup; keep all locks until commit (NoLock on close). */
-	for (i = 0; i < ndirty; i++)
+	for (i = 0; i < npart; i++)
 	{
 		if (entries[i].dead != NULL)
 			TidStoreDestroy(entries[i].dead);
 		if (entries[i].partRel != NULL)
 			table_close(entries[i].partRel, NoLock);
 	}
-	pfree(kill.deadbypartseq);
+	for (s = 0; s < nspan; s++)
+		list_free(idxdirty[s]);
+	pfree(idxdirty);
+	pfree(spanidx);
 	pfree(entries);
-	list_free(dirty);
+	list_free(partoids);
 	FreeAccessStrategy(bstrategy);
-	index_close(idxRel, NoLock);
 
 	return retired;
 }
