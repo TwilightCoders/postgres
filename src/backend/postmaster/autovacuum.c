@@ -77,6 +77,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_spanning_drainq.h"
 #include "commands/dbcommands.h"
 #include "commands/vacuum.h"
 #include "common/int.h"
@@ -2522,6 +2523,36 @@ deleted:
 	}
 
 	list_free(table_oids);
+
+	/*
+	 * ProgreSQL: durable backstop for deferred spanning-index drains (DHR).
+	 *
+	 * A leaf-partition vacuum that defers its spanning-index cleanup records the
+	 * obligation durably in pg_spanning_drainq and fires a best-effort
+	 * AutoVacuumRequestWork nudge so a drain runs promptly.  That nudge is lossy:
+	 * the shmem work-item array is bounded (a request is silently dropped when
+	 * full), and no nudge is issued at all if autovacuum was off when the leaf
+	 * enqueued.  The durable queue --- not the shmem request --- is the source of
+	 * truth, so rediscover every spanning index that still owes a drain straight
+	 * from the catalog and (re-)request one.  AutoVacuumRequestWork de-duplicates
+	 * against any surviving nudge, and the loop below drains them with the same
+	 * per-item snapshot and error isolation as backend-issued requests.  This
+	 * bounds the held-LP_DEAD heap bloat that deferral trades against: as long as
+	 * a worker reaches this database (every naptime cycle), its queue drains.
+	 */
+	{
+		List	   *pending;
+		ListCell   *lc;
+
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pending = SpanningDrainqListAllIndexes();
+		PopActiveSnapshot();
+
+		foreach(lc, pending)
+			AutoVacuumRequestWork(AVW_SpanningIndexDrain, lfirst_oid(lc),
+								  InvalidBlockNumber);
+		list_free(pending);
+	}
 
 	/*
 	 * Perform additional work items, as requested by backends.

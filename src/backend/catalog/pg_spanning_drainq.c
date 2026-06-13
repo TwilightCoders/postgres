@@ -145,6 +145,48 @@ SpanningDrainqListDirty(Oid spanningIndexOid)
 }
 
 /*
+ * SpanningDrainqListAllIndexes
+ *		Return the distinct set of spanning-index OIDs (as a List of Oid) that
+ *		currently have any pending drain rows in this database.
+ *
+ * This is the durability backstop's reader: an autovacuum worker calls it once
+ * per do_autovacuum cycle to rediscover every spanning index that still owes a
+ * drain, independent of whether the best-effort AutoVacuumRequestWork nudge from
+ * the enqueuing leaf vacuum survived (the shmem work-item array is bounded and
+ * lossy, and no nudge is issued at all if autovacuum was off at enqueue time).
+ * The durable queue --- not the shmem request --- is the source of truth.
+ *
+ * A full catalog scan: the queue is tiny (O(#partitions) rows, usually one
+ * spanning index), so de-duplicating with list_member_oid is cheap and does not
+ * depend on scan order.  Caller provides the snapshot (an active transaction).
+ */
+List *
+SpanningDrainqListAllIndexes(void)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *result = NIL;
+
+	catalog = table_open(SpanningDrainqRelationId, AccessShareLock);
+
+	scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_spanning_drainq form = (Form_pg_spanning_drainq) GETSTRUCT(tup);
+
+		if (!list_member_oid(result, form->sdq_idxid))
+			result = lappend_oid(result, form->sdq_idxid);
+	}
+
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+
+	return result;
+}
+
+/*
  * SpanningDrainqDeleteList
  *		Delete the (spanningIndexOid, partseq) rows for each partseq in the list.
  *		Called by the drain after it has retired those partitions' spanning
