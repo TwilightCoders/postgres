@@ -70,6 +70,15 @@ predicts, NOT a leak. The deferred drain path is now scale-validated; the #40 fi
 holds under load. (The flip of the default itself remains blocked by #38 — see
 below — and #39 also wants a re-soak WITH local indexes once #38 lands.)
 
+**Crash-torture of the deferred path — 25/25 PASS** (local cassert HEAD,
+`/tmp/crash-defer-loop.sh`). 25 cycles, each: fresh fsync-on cluster, load with
+autovacuum-driven deferred drains in flight, `kill -9` the postmaster mid-load,
+crash-recover, then verify. Result: 25/25 dup-clean, 50/50 amcheck OK, 0
+unexpected crashes. This validates the DHR crash_safety design (drainq catalog
+durability, held-LP_DEAD survival across crash, in-flight-drain WAL replay) and
+substitutes for the spanning crash TAP (`049_spanning_crash`) that can't run on
+this host (no IPC::Run).
+
 **HEAD re-verified green on a clean local rebuild.** The local `build/install`
 predated the perf-flag commit (which added two bools to `RelationData` in rel.h —
 a struct change requiring a full rebuild). Clean-rebuilt HEAD and ran: **regress
