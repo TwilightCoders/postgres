@@ -170,14 +170,16 @@ partition tree (`tablecmds.c`, `index.c`, `heap.c`):
   probe O(log n) on the hot write path). So retiring one leaf's dead entries
   needs a full index scan — and N leaf VACUUMs would each scan the whole index:
   **O(N²) per sweep**.
-- The fix (GUC `spanning_defer_vacuum`, default off): a leaf VACUUM *enqueues*
+- The fix (GUC `spanning_defer_vacuum`, default **on**): a leaf VACUUM *enqueues*
   its dead entries to the durable **`pg_spanning_drainq`** catalog and leaves the
   heap slots `LP_DEAD` (un-reaped, so they can't be reused). A single coalesced
   **drain** then retires every queued partition's entries in *one* index scan and
   reaps the now-safe slots — **O(N)**. Measured: per-leaf VACUUM cost goes from
   growing-with-N to flat; the sweep drops ~10× at 64 partitions and the gap
   widens. The drain runs automatically (an autovacuum work item) or on demand via
-  `pg_drain_spanning_index(regclass)`.
+  `pg_drain_spanning_index(regclass)`. It applies to leaves with local indexes
+  too: the drain vacuums each leaf's local indexes for the dead set before reaping
+  (so the deferral is universal, not limited to no-local-index leaves).
 - Correctness rests on an audited invariant: a held `LP_DEAD` slot can only be
   reaped by the gated drain (a new tuple can never reuse it first), so a stale
   entry's address can never alias a live row before the entry is retired.
@@ -227,8 +229,6 @@ git rebase upstream/REL_18_STABLE progresql-18
 - The feature is opt-in via the `GLOBAL` keyword; plain partitioned tables are
   untouched. (Combining `INHERITS` with `PARTITION BY` is rejected, exactly as in
   stock PostgreSQL — `GLOBAL` is the only way to request a spanning index.)
-- The deferred coalesced VACUUM drain is behind `spanning_defer_vacuum` (default
-  off) and currently applies to spanning leaves without local indexes.
 - Multi-level (sub-)partitioning is not supported under a spanning index: every
   partition must be a storage-bearing leaf. This is rejected at DDL — both
   sub-partitioning a partition of a spanning-indexed root, and creating a

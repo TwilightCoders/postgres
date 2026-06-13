@@ -2159,7 +2159,7 @@ struct config_bool ConfigureNamesBool[] =
 						 "instead of scanning the whole spanning index once per leaf."),
 		},
 		&spanning_defer_vacuum,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 

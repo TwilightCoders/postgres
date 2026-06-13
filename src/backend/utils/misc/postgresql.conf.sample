@@ -725,7 +725,7 @@
 # - Default Behavior -
 
 #vacuum_truncate = on			# enable truncation after vacuum
-#spanning_defer_vacuum = off		# defer spanning-index vacuuming to a coalesced drain
+#spanning_defer_vacuum = on		# defer spanning-index vacuuming to a coalesced drain
 
 # - Freezing -
 
