@@ -1,0 +1,127 @@
+-- ProgreSQL: spanning (GLOBAL) indexes over table inheritance (INHERITS).
+--
+-- "Inherit at the top, partition/bucket the leaves": one spanning index on an
+-- ordinary inheritance root enforces uniqueness across every storage-bearing
+-- leaf at any depth -- across time buckets AND across typed children -- on
+-- build, INSERT, UPDATE, and through the dynamic add/remove of leaves.
+--
+-- The discriminator (partseq) resolves to any leaf relation, so the only thing
+-- that had to generalize from declarative partitioning was leaf enumeration and
+-- leaf->root resolution (find_all_inheritors / progresql_spanning_ancestors).
+-- The cross-leaf uniqueness invariant (GROUP BY ... HAVING count(*) > 1 == 0
+-- rows, queried from the inheritance root) is the oracle here; amcheck's
+-- structural check is exercised by the soak harness, not this suite.
+-- Section 1: the shape -- inheritance root, typed children, time-bucket leaves.
+CREATE TABLE ent (id int NOT NULL, ts date NOT NULL, kind text);
+CREATE TABLE msg (body text) INHERITS (ent);
+CREATE TABLE msg_2026_01 (CHECK (ts >= '2026-01-01' AND ts < '2026-02-01')) INHERITS (msg);
+CREATE TABLE msg_2026_02 (CHECK (ts >= '2026-02-01' AND ts < '2026-03-01')) INHERITS (msg);
+CREATE TABLE fct (claim text) INHERITS (ent);
+CREATE TABLE fct_2026_01 (CHECK (ts >= '2026-01-01' AND ts < '2026-02-01')) INHERITS (fct);
+-- Section 2: build-time enforcement -- a pre-existing cross-leaf duplicate must
+-- make the GLOBAL index build fail (backfill runs UNIQUE_CHECK over all leaves).
+INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (1, '2026-01-10', 'm', 'a');
+INSERT INTO fct_2026_01(id, ts, kind, claim) VALUES (1, '2026-01-12', 'f', 'dup');  -- same id, different leaf+type
+CREATE UNIQUE INDEX ent_id_g ON ent (id) GLOBAL;   -- ERROR: build sees the cross-leaf dup
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(1) already exists.
+DELETE FROM fct_2026_01 WHERE claim = 'dup';
+-- clean build now succeeds and spans the whole tree
+INSERT INTO msg_2026_02(id, ts, kind, body) VALUES (2, '2026-02-10', 'm', 'b');
+INSERT INTO fct_2026_01(id, ts, kind, claim) VALUES (3, '2026-01-12', 'f', 'c');
+CREATE UNIQUE INDEX ent_id_g ON ent (id) GLOBAL;
+SELECT count(*) AS rows_via_root FROM ent;
+ rows_via_root 
+---------------
+             3
+(1 row)
+
+-- Section 3: live enforcement -- INSERT and UPDATE, cross-time and cross-type.
+INSERT INTO msg_2026_02(id, ts, kind, body) VALUES (1, '2026-02-15', 'm', 'x');  -- ERROR: cross-time dup
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(1) already exists.
+INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (3, '2026-01-20', 'm', 'x');  -- ERROR: cross-type dup (3 is a fct)
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(3) already exists.
+INSERT INTO msg_2026_02(id, ts, kind, body) VALUES (9, '2026-02-16', 'm', 'ok'); -- ok: new id
+UPDATE fct_2026_01 SET id = 2 WHERE id = 3;                                       -- ERROR: would collide with msg id=2
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(2) already exists.
+SELECT id, count(*) FROM ent GROUP BY id HAVING count(*) > 1;                     -- (none)
+ id | count 
+----+-------
+(0 rows)
+
+-- Section 4: dynamic add -- CREATE ... INHERITS a live spanning tree.
+CREATE TABLE msg_2026_03 (CHECK (ts >= '2026-03-01' AND ts < '2026-04-01')) INHERITS (msg);
+INSERT INTO msg_2026_03(id, ts, kind, body) VALUES (10, '2026-03-10', 'm', 'ok'); -- ok: new leaf registered
+INSERT INTO msg_2026_03(id, ts, kind, body) VALUES (1, '2026-03-11', 'm', 'dup'); -- ERROR: enforced on the new leaf
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(1) already exists.
+-- Section 5: dynamic add -- ALTER ... INHERIT a pre-populated table (backfill).
+CREATE TABLE late (id int NOT NULL, ts date NOT NULL, kind text, note text);
+INSERT INTO late VALUES (50, '2026-01-01', 'l', 'fifty'), (51, '2026-01-02', 'l', 'fiftyone');
+ALTER TABLE late INHERIT ent;                                                    -- backfills 50,51
+INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (50, '2026-01-21', 'm', 'd'); -- ERROR: backfilled id=50 enforced
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(50) already exists.
+-- ALTER INHERIT of a table that already conflicts is rejected at attach time
+CREATE TABLE bad (id int NOT NULL, ts date NOT NULL, kind text, note text);
+INSERT INTO bad VALUES (9, '2026-01-01', 'b', 'conflicts');
+ALTER TABLE bad INHERIT ent;                                                     -- ERROR: id=9 already in tree
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(9) already exists.
+DROP TABLE bad;
+-- Section 6: dynamic remove -- NO INHERIT retires the child's entries.
+ALTER TABLE late NO INHERIT ent;
+INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (50, '2026-01-22', 'm', 'now-ok');  -- ok: 50 was retired
+ALTER TABLE late INHERIT ent;                                                    -- ERROR: 50 now back in the tree
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(50) already exists.
+DROP TABLE late;
+-- Section 7: DROP of an inheritance leaf cleans its partseq map (OID-reuse safe).
+SELECT count(*) AS partseq_rows_before_drop FROM pg_index_partition;
+ partseq_rows_before_drop 
+--------------------------
+                        7
+(1 row)
+
+DROP TABLE msg_2026_03;
+SELECT count(*) AS partseq_rows_after_drop FROM pg_index_partition;              -- one fewer
+ partseq_rows_after_drop 
+-------------------------
+                       6
+(1 row)
+
+-- Section 8: integrity oracle -- no cross-leaf duplicates survived any of the
+-- build/insert/update/attach/detach/drop operations above.
+SELECT id, count(*) FROM ent GROUP BY id HAVING count(*) > 1;                     -- (none)
+ id | count 
+----+-------
+(0 rows)
+
+-- Section 9: multi-level DECLARATIVE partitioning is spanned by the same path.
+CREATE TABLE mld (id int NOT NULL, region text NOT NULL, ts date NOT NULL)
+    PARTITION BY LIST (region);
+CREATE TABLE mld_us PARTITION OF mld FOR VALUES IN ('us') PARTITION BY RANGE (ts);
+CREATE TABLE mld_us_24 PARTITION OF mld_us FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE mld_us_25 PARTITION OF mld_us FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO mld VALUES (1, 'us', '2024-06-01');
+CREATE UNIQUE INDEX mld_id_g ON mld (id) GLOBAL;
+INSERT INTO mld VALUES (1, 'us', '2025-06-01');  -- ERROR: dup across grandchild leaves
+ERROR:  duplicate key value violates unique constraint "mld_id_g"
+DETAIL:  Key (id)=(1) already exists.
+INSERT INTO mld VALUES (2, 'us', '2025-06-01');  -- ok
+SELECT id, count(*) FROM mld GROUP BY id HAVING count(*) > 1;                     -- (none)
+ id | count 
+----+-------
+(0 rows)
+
+DROP TABLE ent CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table msg
+drop cascades to table msg_2026_01
+drop cascades to table msg_2026_02
+drop cascades to table fct
+drop cascades to table fct_2026_01
+DROP TABLE mld;
