@@ -1210,6 +1210,23 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	StoreCatalogInheritance(relationId, inheritOids, stmt->partbound != NULL);
 
 	/*
+	 * ProgreSQL: a plain INHERITS child (not a declarative partition) of a
+	 * spanning (GLOBAL) tree needs a partseq allocated so later INSERTs resolve.
+	 * The rel is newly created and empty, so this just registers the leaf (the
+	 * backfill scan is a no-op).  Declarative partitions (stmt->partbound) get
+	 * their partseq from the partition index-clone path instead.
+	 */
+	if (inheritOids != NIL && stmt->partbound == NULL)
+	{
+		Relation	newrel;
+
+		CommandCounterIncrement();
+		newrel = table_open(relationId, AccessShareLock);
+		progresql_backfill_spanning_indexes_for_attached_partition(newrel);
+		table_close(newrel, AccessShareLock);
+	}
+
+	/*
 	 * Process the partitioning specification (if any) and store the partition
 	 * key information into the catalog.
 	 */
@@ -17454,6 +17471,16 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 	/* OK to create inheritance */
 	CreateInheritance(child_rel, parent_rel, false);
 
+	/*
+	 * ProgreSQL: if the new parent (or an ancestor) carries a spanning (GLOBAL)
+	 * index, register and backfill this child's leaves into it now -- so the
+	 * child's existing rows are enforced for cross-leaf uniqueness and later DML
+	 * maintains the index.  CommandCounterIncrement makes the just-written
+	 * pg_inherits row visible to the spanning-ancestor walk.
+	 */
+	CommandCounterIncrement();
+	progresql_backfill_spanning_indexes_for_attached_partition(child_rel);
+
 	ObjectAddressSet(address, RelationRelationId,
 					 RelationGetRelid(parent_rel));
 
@@ -18061,6 +18088,16 @@ RemoveInheritance(Relation child_rel, Relation parent_rel, bool expect_detached)
 	bool		is_partitioning;
 
 	is_partitioning = (parent_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
+
+	/*
+	 * ProgreSQL: NO INHERIT removes an inheritance child from any spanning
+	 * (GLOBAL) tree above it.  Retire its spanning entries now, while
+	 * pg_inherits still links it to the ancestor so the spanning-ancestor walk
+	 * can find the index.  Declarative DETACH (is_partitioning) has its own
+	 * retirement path, so skip it here to avoid double retirement.
+	 */
+	if (!is_partitioning)
+		progresql_clean_spanning_indexes_for_partition(child_rel, true);
 
 	found = DeleteInheritsTuple(RelationGetRelid(child_rel),
 								RelationGetRelid(parent_rel),

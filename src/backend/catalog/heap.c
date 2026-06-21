@@ -1891,13 +1891,15 @@ heap_drop_with_catalog(Oid relid)
 		update_default_partition_oid(parentOid, InvalidOid);
 
 	/*
-	 * ProgreSQL: remove any spanning index entries that reference this
-	 * partition before its storage is freed.  Must happen while pg_inherits
-	 * still has the parent-child row so get_partition_ancestors can find the
-	 * parent.  Spanning indexes only exist on partitioned roots that combine
-	 * INHERITS + PARTITION BY, so the cleanup is a no-op for ordinary tables.
+	 * ProgreSQL: remove any spanning index entries that reference this leaf
+	 * before its storage is freed.  Must happen while pg_inherits still links it
+	 * to the ancestor so the spanning-ancestor walk can find the root index.
+	 * Applies to any leaf in a spanning tree -- a declarative partition or an
+	 * inheritance child -- so the stale partseq map row never outlives the leaf
+	 * (which would be an OID-reuse hazard).  A no-op for ordinary standalone
+	 * tables.
 	 */
-	if (rel->rd_rel->relispartition)
+	if (rel->rd_rel->relispartition || has_superclass(relid))
 		progresql_clean_spanning_indexes_for_partition(rel, true);
 
 	/*

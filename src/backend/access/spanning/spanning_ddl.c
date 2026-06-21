@@ -259,11 +259,14 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 	ListCell   *lc;
 	Oid			partOid = RelationGetRelid(partRel);
 
-	/* Only leaf partitions that are also inheritance children need cleaning. */
-	if (!partRel->rd_rel->relispartition)
+	/*
+	 * Only a relation that participates in a hierarchy (a declarative partition
+	 * or an inheritance child) can sit under a spanning root.
+	 */
+	if (!partRel->rd_rel->relispartition && !has_superclass(partOid))
 		return;
 
-	ancestors = get_partition_ancestors(partOid);
+	ancestors = progresql_spanning_ancestors(partOid);
 
 	foreach(lc, ancestors)
 	{
@@ -387,13 +390,22 @@ void
 progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 {
 	List	   *ancestors;
+	List	   *leafoids;
 	ListCell   *lc;
-	Oid			attachOid = RelationGetRelid(attachrel);
 
-	if (attachrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-		return;					/* sub-partitioned: handled by leaf ATTACH */
+	/*
+	 * The attaching relation may be a single leaf (a declarative partition or an
+	 * inheritance child) or the root of a subtree being grafted in at once; in
+	 * every case the storage-bearing leaves of its own subtree are what must be
+	 * registered (partseq) and backfilled into the ancestor spanning indexes.
+	 */
+	leafoids = find_all_inheritors(RelationGetRelid(attachrel), AccessShareLock, NULL);
 
-	ancestors = get_partition_ancestors(attachOid);
+	/*
+	 * Spanning roots above the attaching relation -- declarative partition roots
+	 * and/or inheritance (INHERITS) parents, at any depth.
+	 */
+	ancestors = progresql_spanning_ancestors(RelationGetRelid(attachrel));
 
 	foreach(lc, ancestors)
 	{
@@ -403,14 +415,6 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 		ListCell   *il;
 
 		parentRel = table_open(parentOid, AccessShareLock);
-
-		/* Spanning indexes only live on PARTITION BY roots. */
-		if (parentRel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		{
-			table_close(parentRel, AccessShareLock);
-			continue;
-		}
-
 		indexoidlist = RelationGetIndexList(parentRel);
 
 		foreach(il, indexoidlist)
@@ -418,12 +422,7 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			Oid			indexOid = lfirst_oid(il);
 			Relation	idxRel;
 			IndexInfo  *idxInfo;
-			TupleTableSlot *slot;
-			TableScanDesc scan;
-			Datum		values[INDEX_MAX_KEYS];
-			bool		isnull[INDEX_MAX_KEYS];
-			Snapshot	snapshot;
-			int32		partseq;
+			ListCell   *ll;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
 
@@ -435,44 +434,75 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 
 			idxInfo = BuildIndexInfo(idxRel);
 
-			/*
-			 * ProgreSQL C1: the attaching partition's index-local partseq
-			 * (get-or-allocate).  It is the trailing discriminator stored in
-			 * each backfilled spanning index entry below.
-			 */
-			partseq = SpanningGetOrAllocPartseq(idxRel, attachOid);
-
-			snapshot = GetTransactionSnapshot();
-			PushActiveSnapshot(snapshot);
-
-			slot = table_slot_create(attachrel, NULL);
-			scan = table_beginscan(attachrel, GetActiveSnapshot(), 0, NULL);
-
-			while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+			foreach(ll, leafoids)
 			{
-				int			k;
+				Oid			leafOid = lfirst_oid(ll);
+				Relation	leafRel;
+				TupleTableSlot *slot;
+				TableScanDesc scan;
+				Datum		values[INDEX_MAX_KEYS];
+				bool		isnull[INDEX_MAX_KEYS];
+				Snapshot	snapshot;
+				int32		partseq;
 
-				FormIndexDatum(idxInfo, slot, NULL, values, isnull);
+				leafRel = table_open(leafOid, AccessShareLock);
 
-				/* Trailing key column: the attaching partition's partseq. */
-				k = idxInfo->ii_NumIndexKeyAttrs - 1;
-				values[k] = Int32GetDatum(partseq);
-				isnull[k] = false;
+				/* only storage-bearing leaves carry rows and a partseq */
+				if (leafRel->rd_rel->relkind != RELKIND_RELATION)
+				{
+					table_close(leafRel, AccessShareLock);
+					continue;
+				}
 
 				/*
-				 * Pass parentRel as heapRelation: the partitioned root has
-				 * rd_tableam == NULL, which signals nbtinsert.c to skip
-				 * heap-liveness deletion passes that would be unsafe across
-				 * partitions.  UNIQUE_CHECK_YES so any pre-existing
-				 * cross-partition duplicates are reported.
+				 * This leaf's index-local partseq (get-or-allocate): the
+				 * trailing discriminator stored in each backfilled entry.  For a
+				 * freshly created, still-empty leaf this just allocates the
+				 * partseq so later INSERTs resolve; the scan below is a no-op.
 				 */
-				index_insert(idxRel, values, isnull, &slot->tts_tid,
-							 parentRel, UNIQUE_CHECK_YES, false, idxInfo);
+				partseq = SpanningGetOrAllocPartseq(idxRel, leafOid);
+
+				snapshot = GetTransactionSnapshot();
+				PushActiveSnapshot(snapshot);
+
+				slot = table_slot_create(leafRel, NULL);
+				scan = table_beginscan(leafRel, GetActiveSnapshot(), 0, NULL);
+
+				while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+				{
+					int			k;
+
+					FormIndexDatum(idxInfo, slot, NULL, values, isnull);
+
+					/* Trailing key column: this leaf's partseq. */
+					k = idxInfo->ii_NumIndexKeyAttrs - 1;
+					values[k] = Int32GetDatum(partseq);
+					isnull[k] = false;
+
+					/*
+					 * heapRelation = parentRel (the spanning root) is a
+					 * placeholder; nbtinsert keys its heap-liveness skip on the
+					 * index being spanning, and the real heap is resolved from
+					 * the partseq.  UNIQUE_CHECK_YES so pre-existing
+					 * cross-leaf duplicates are reported at attach time.
+					 */
+					index_insert(idxRel, values, isnull, &slot->tts_tid,
+								 parentRel, UNIQUE_CHECK_YES, false, idxInfo);
+				}
+
+				table_endscan(scan);
+				ExecDropSingleTupleTableSlot(slot);
+				PopActiveSnapshot();
+
+				/*
+				 * Reset the leaf's cached "has spanning ancestor" flag so the
+				 * executor maintenance hook fires for subsequent DML on it.
+				 */
+				CacheInvalidateRelcacheByRelid(leafOid);
+
+				table_close(leafRel, AccessShareLock);
 			}
 
-			table_endscan(scan);
-			ExecDropSingleTupleTableSlot(slot);
-			PopActiveSnapshot();
 			index_close(idxRel, RowExclusiveLock);
 		}
 
@@ -481,6 +511,7 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 	}
 
 	list_free(ancestors);
+	list_free(leafoids);
 }
 
 /*
