@@ -1248,7 +1248,7 @@ ExecInsert(ModifyTableContext *context,
 		 * For ProgreSQL tables: if we just inserted into a leaf partition,
 		 * propagate the insert into any spanning indexes on the root.
 		 */
-		if (resultRelationDesc->rd_rel->relispartition)
+		if (RelationHasSpanningAncestor(resultRelationDesc))
 			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid,
 										  resultRelationDesc, estate);
 	}
@@ -2379,7 +2379,7 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	 * its new entry dropped, so once the live tuple moved off its original page
 	 * the spanning index could no longer find it and admitted duplicates.
 	 */
-	if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition &&
+	if (RelationHasSpanningAncestor(resultRelInfo->ri_RelationDesc) &&
 		updateCxt->updateIndexes == TU_All)
 		ExecInsertSpanningIndexTuples(slot, &slot->tts_tid,
 									  resultRelInfo->ri_RelationDesc,

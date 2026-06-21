@@ -89,10 +89,10 @@ SELECT indnuniqatts > 0 AS is_spanning
 
 -- Section 5: negative cases -- GLOBAL is rejected where it cannot apply
 CREATE TABLE pg_plain (id bigint NOT NULL, PRIMARY KEY (id) GLOBAL);  -- ERROR: not partitioned
-ERROR:  GLOBAL index is only supported on partitioned tables
+ERROR:  GLOBAL index is only supported on partitioned tables or inheritance parents
 CREATE TABLE pg_plain2 (id bigint);
 CREATE UNIQUE INDEX ON pg_plain2 (id) GLOBAL;                          -- ERROR: not partitioned
-ERROR:  GLOBAL index is only supported on partitioned tables
+ERROR:  GLOBAL index is only supported on partitioned tables or inheritance parents
 -- Multi-level partitioning under a spanning index is rejected at DDL time:
 -- every partition must be a leaf (the partseq map keys leaves, not interior
 -- nodes).  This forbids the untested grandchild-leaf case by construction.

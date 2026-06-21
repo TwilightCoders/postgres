@@ -28,6 +28,7 @@
 #include "catalog/index.h"
 #include "catalog/partition.h"
 #include "catalog/pg_index_partition.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_spanning_drainq.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
@@ -541,14 +542,21 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 {
 	Relation	idxRel;
 	IndexInfo  *idxInfo;
-	PartitionDesc partdesc;
+	List	   *leafoids;
+	ListCell   *lc;
 	Snapshot	snapshot;
-	int			pi;
 
 	idxRel = index_open(indexRelationId, RowExclusiveLock);
 	idxInfo = BuildIndexInfo(idxRel);
 
-	partdesc = RelationGetPartitionDesc(rel, true);
+	/*
+	 * Enumerate every storage-bearing leaf beneath this root, at any depth,
+	 * whether the tree is built from declarative partitions, table inheritance
+	 * (INHERITS), or a mix of both.  find_all_inheritors walks pg_inherits
+	 * recursively and returns the root plus all descendants; the relkind filter
+	 * in the loop below keeps only leaves that actually hold rows.
+	 */
+	leafoids = find_all_inheritors(RelationGetRelid(rel), AccessShareLock, NULL);
 
 	/*
 	 * Push the transaction snapshot as active so that heap visibility checks
@@ -559,9 +567,9 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 	snapshot = GetTransactionSnapshot();
 	PushActiveSnapshot(snapshot);
 
-	for (pi = 0; pi < partdesc->nparts; pi++)
+	foreach(lc, leafoids)
 	{
-		Oid			partOid = partdesc->oids[pi];
+		Oid			partOid = lfirst_oid(lc);
 		Relation	partRel;
 		TupleTableSlot *slot;
 		TableScanDesc scan;
@@ -572,19 +580,19 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 		partRel = table_open(partOid, AccessShareLock);
 
 		/*
-		 * Spanning indexes do not support multi-level partitioning: partdesc
-		 * holds only the root's DIRECT partitions, so a sub-partitioned child's
-		 * grandchild leaves are never visited here --- they would silently be
-		 * omitted from the index (their rows unenforced for uniqueness) and
-		 * could never get a partseq.  Reject it at build time rather than
-		 * corrupt-by-omission.
+		 * Only relations with physical storage are spanning leaves.  Skip every
+		 * intermediate parent the tree-walk returns: the declarative root,
+		 * sub-partitioned mid-level nodes, and abstract inheritance parents that
+		 * hold no rows of their own --- their rows (if any) are reached through
+		 * their own storage-bearing children.  This is what lets a single
+		 * spanning index cover table inheritance at the top with
+		 * partitioned/bucketed leaves below, at any depth.
 		 */
-		if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot create a spanning (GLOBAL) index on a multi-level partitioned table"),
-					 errdetail("Partition \"%s\" is itself partitioned; spanning indexes require every partition to be a leaf.",
-							   RelationGetRelationName(partRel))));
+		if (partRel->rd_rel->relkind != RELKIND_RELATION)
+		{
+			table_close(partRel, AccessShareLock);
+			continue;
+		}
 
 		/*
 		 * ProgreSQL C1: this partition's index-local partseq (get-or-allocate;
@@ -640,6 +648,8 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 		 */
 		CacheInvalidateRelcacheByRelid(partOid);
 	}
+
+	list_free(leafoids);
 
 	PopActiveSnapshot();
 

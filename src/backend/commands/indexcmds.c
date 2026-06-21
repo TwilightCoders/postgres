@@ -754,10 +754,20 @@ DefineIndex(Oid tableId,
 	 */
 	if (stmt->isglobal)
 	{
-		if (!partitioned)
+		/*
+		 * ProgreSQL: a spanning (GLOBAL) index may be created on a declaratively
+		 * partitioned root OR on an inheritance parent (table inheritance at the
+		 * top, partitioned/bucketed leaves below).  Both are enumerated uniformly
+		 * via find_all_inheritors when the index is built and maintained.
+		 */
+		bool		spannable = partitioned ||
+			(rel->rd_rel->relkind == RELKIND_RELATION &&
+			 rel->rd_rel->relhassubclass);
+
+		if (!spannable)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("GLOBAL index is only supported on partitioned tables")));
+					 errmsg("GLOBAL index is only supported on partitioned tables or inheritance parents")));
 		if (rel->rd_rel->relispartition)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),

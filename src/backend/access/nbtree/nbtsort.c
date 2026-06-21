@@ -477,13 +477,18 @@ _bt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
 	if (!buildstate->btleader)
 	{
 		/*
-		 * ProgreSQL spanning indexes: the heap is a partitioned root with no
-		 * physical storage.  Skip the scan and leave the spool empty so that
-		 * _bt_leafbuild() writes the empty-index metapage structure.  The
-		 * index will be populated separately from the child partitions by
-		 * BuildSpanningIndexFromPartitions().
+		 * ProgreSQL spanning indexes: skip the root heap scan and leave the
+		 * spool empty so _bt_leafbuild() writes the empty-index metapage; the
+		 * index is populated from the full leaf set (declarative partitions
+		 * and/or inheritance children, at any depth) by
+		 * BuildSpanningIndexFromPartitions().  A declarative root has no storage
+		 * of its own, but an inheritance root does --- and its own rows must be
+		 * indexed with a partseq via the backfill path, not with the raw
+		 * tableoid the normal build callback would store --- so key the skip on
+		 * the spanning marker, not on the root's relkind.
 		 */
-		if (heap->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		if (heap->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+			!RelationIsSpanning(index))
 			reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
 											   _bt_build_callback, buildstate,
 											   NULL);

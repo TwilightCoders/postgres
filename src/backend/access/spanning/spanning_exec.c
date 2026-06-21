@@ -109,7 +109,12 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 
 	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
 
-	ancestors = get_partition_ancestors(RelationGetRelid(partition));
+	/*
+	 * Resolve this leaf's spanning roots by walking the full pg_inherits tree
+	 * upward (declarative partitions and/or table inheritance, any depth), not
+	 * just declarative partition ancestry.
+	 */
+	ancestors = progresql_spanning_ancestors(RelationGetRelid(partition));
 	foreach(lc, ancestors)
 	{
 		Oid			parentOid = lfirst_oid(lc);

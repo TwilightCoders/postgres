@@ -142,8 +142,12 @@ CREATE TABLE legacy (PRIMARY KEY (id)) INHERITS (legacy_base)
 ERROR:  cannot create partitioned table as inheritance child
                                       --        as inheritance child
 DROP TABLE legacy_base;
--- Section 14: spanning indexes reject multi-level partitioning at DDL time
--- (every partition must be a storage-bearing leaf).
+-- Section 14: spanning indexes and multi-level partitioning.
+-- A GLOBAL index built on a PRE-EXISTING multi-level tree is supported: the
+-- build enumerates every storage-bearing leaf at any depth (find_all_inheritors)
+-- and enforces uniqueness across them.  Only DYNAMIC sub-partitioning of an
+-- already-spanning-indexed root is rejected (its new sub-leaves would have no
+-- partseq and silently escape the index).
 -- (a) cannot sub-partition a partition of a spanning-indexed root
 CREATE TABLE ml1 (id bigint NOT NULL, region text NOT NULL, ts timestamptz NOT NULL,
     PRIMARY KEY (id) GLOBAL) PARTITION BY LIST (region);
@@ -152,15 +156,21 @@ CREATE TABLE ml1_us PARTITION OF ml1 FOR VALUES IN ('us')
 ERROR:  cannot sub-partition a partition of a table with a spanning (GLOBAL) index
 DETAIL:  Spanning index "ml1_pkey" does not support multi-level partitioning; every partition must be a leaf.
 DROP TABLE ml1;
--- (b) cannot create a GLOBAL index on a pre-existing multi-level tree
+-- (b) a GLOBAL index built on a PRE-EXISTING multi-level tree IS supported:
+-- the build spans every grandchild leaf and enforces uniqueness across them.
 CREATE TABLE ml2 (id bigint NOT NULL, region text NOT NULL, ts timestamptz NOT NULL)
     PARTITION BY LIST (region);
 CREATE TABLE ml2_us PARTITION OF ml2 FOR VALUES IN ('us') PARTITION BY RANGE (ts);
 CREATE TABLE ml2_us_2024 PARTITION OF ml2_us
     FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
-CREATE UNIQUE INDEX ON ml2 (id) GLOBAL;   -- ERROR: multi-level partitioned table
-ERROR:  cannot create a spanning (GLOBAL) index on a multi-level partitioned table
-DETAIL:  Partition "ml2_us" is itself partitioned; spanning indexes require every partition to be a leaf.
+CREATE TABLE ml2_us_2025 PARTITION OF ml2_us
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+INSERT INTO ml2 VALUES (1, 'us', '2024-06-01');
+CREATE UNIQUE INDEX ON ml2 (id) GLOBAL;   -- supported: spans grandchild leaves
+INSERT INTO ml2 VALUES (1, 'us', '2025-06-01');  -- ERROR: dup id across sub-partitions
+ERROR:  duplicate key value violates unique constraint "ml2_id_idx"
+DETAIL:  Key (id)=(1) already exists.
+INSERT INTO ml2 VALUES (2, 'us', '2025-06-01');  -- ok
 DROP TABLE ml2;
 -- Section 15: INSERT ... ON CONFLICT is unsupported on a spanning index -- the
 -- arbiter-inference path cannot see the root's spanning index from a leaf -- so

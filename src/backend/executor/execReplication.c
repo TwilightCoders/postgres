@@ -635,7 +635,7 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 		 * cross-partition duplicates.  A cross-partition conflict raises a
 		 * unique violation, same as the local executor.
 		 */
-		if (rel->rd_rel->relispartition)
+		if (RelationHasSpanningAncestor(rel))
 			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid, rel, estate);
 
 		/* AFTER ROW INSERT Triggers */
@@ -733,7 +733,7 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 		 * entry for the new TID is required or the apply worker loses the row
 		 * from the spanning index (silent cross-partition duplicates).
 		 */
-		if (rel->rd_rel->relispartition && update_indexes == TU_All)
+		if (RelationHasSpanningAncestor(rel) && update_indexes == TU_All)
 			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid, rel, estate);
 
 		/* AFTER ROW UPDATE Triggers */

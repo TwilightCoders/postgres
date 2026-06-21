@@ -27,12 +27,76 @@
 #include "access/table.h"
 #include "catalog/partition.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_inherits.h"
 #include "nodes/bitmapset.h"
+#include "nodes/pg_list.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 #include "access/spanning.h"
+
+/*
+ * progresql_spanning_ancestors
+ *
+ * Return the OIDs of every ancestor of relid, walking pg_inherits upward and
+ * covering BOTH declarative partition parents and table-inheritance (INHERITS)
+ * parents -- and any mix, at any depth (multiple inheritance included).  This is
+ * the leaf->root resolution that lets one spanning index be maintained for a
+ * leaf regardless of whether it is reached via partitioning, inheritance, or a
+ * combination of the two.
+ *
+ * Unlike get_partition_ancestors (partition-only, single-parent), this follows
+ * every inhparent link.  It honors detach-in-progress the same way: a partition
+ * whose inheritance row is marked detach-pending is no longer a spanning member,
+ * so it is skipped (and its own ancestors are not pursued through that link).
+ * Catalog scans only (safe from the cached relcache path); caller frees the list.
+ */
+List *
+progresql_spanning_ancestors(Oid relid)
+{
+	List	   *result = NIL;
+	List	   *queue = list_make1_oid(relid);
+	Relation	inhRel;
+
+	inhRel = table_open(InheritsRelationId, AccessShareLock);
+
+	while (queue != NIL)
+	{
+		Oid			cur = linitial_oid(queue);
+		ScanKeyData skey;
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		queue = list_delete_first(queue);
+
+		ScanKeyInit(&skey, Anum_pg_inherits_inhrelid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(cur));
+		scan = systable_beginscan(inhRel, InheritsRelidSeqnoIndexId, true,
+								  NULL, 1, &skey);
+
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Form_pg_inherits inh = (Form_pg_inherits) GETSTRUCT(tup);
+			Oid			parent = inh->inhparent;
+
+			/* a detach-in-progress partition is no longer a spanning member */
+			if (inh->inhdetachpending)
+				continue;
+
+			if (!list_member_oid(result, parent))
+			{
+				result = lappend_oid(result, parent);
+				queue = lappend_oid(queue, parent);
+			}
+		}
+
+		systable_endscan(scan);
+	}
+
+	table_close(inhRel, AccessShareLock);
+	return result;
+}
 
 /*
  * progresql_add_spanning_hotblocking_attrs
@@ -65,10 +129,11 @@ progresql_add_spanning_hotblocking_attrs(Relation relation,
 	ListCell   *lc;
 	Relation	pg_index_rel;
 
-	if (!relation->rd_rel->relispartition)
+	if (!relation->rd_rel->relispartition &&
+		!has_superclass(leafOid))
 		return;
 
-	ancestors = get_partition_ancestors(leafOid);
+	ancestors = progresql_spanning_ancestors(leafOid);
 	if (ancestors == NIL)
 		return;
 
@@ -150,10 +215,11 @@ progresql_leaf_has_spanning_ancestor(Relation relation)
 	Relation	pg_index_rel;
 	bool		found = false;
 
-	if (!relation->rd_rel->relispartition)
+	if (!relation->rd_rel->relispartition &&
+		!has_superclass(RelationGetRelid(relation)))
 		return false;
 
-	ancestors = get_partition_ancestors(RelationGetRelid(relation));
+	ancestors = progresql_spanning_ancestors(RelationGetRelid(relation));
 	if (ancestors == NIL)
 		return false;
 
