@@ -51,6 +51,10 @@ extern void progresql_clean_spanning_indexes_for_partition(Relation partRel,
 extern void progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel);
 extern void progresql_rebuild_spanning_for_rewritten_partition(Oid relid);
 extern void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
+/* remap a spanning index's root-relative user-key attnums to a leaf, by name */
+extern void spanning_remap_keyatts_to_leaf(IndexInfo *idxInfo,
+										   const AttrNumber *rootKeyAtts,
+										   Oid rootOid, Oid leafOid);
 
 /* spanning_relcache.c — leaf->root resolution + HOT-blocking attrs (E7) */
 extern List *progresql_spanning_ancestors(Oid relid);

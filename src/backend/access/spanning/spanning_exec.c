@@ -143,6 +143,23 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 			se->indexRel = indexRel;
 			se->indexInfo = BuildIndexInfo(indexRel);
 			se->discrimKeyPos = se->indexInfo->ii_NumIndexKeyAttrs - 1;
+
+			/*
+			 * The index's key attnums are relative to the root the index lives
+			 * on; remap them to this leaf by column name so FormIndexDatum reads
+			 * the right columns when the leaf orders them differently (a
+			 * reordered inheritance child, or a partition with a divergent
+			 * layout).  Done once per cached (leaf, index) entry.
+			 */
+			{
+				AttrNumber	rootKeyAtts[INDEX_MAX_KEYS];
+
+				memcpy(rootKeyAtts, se->indexInfo->ii_IndexAttrNumbers,
+					   se->indexInfo->ii_NumIndexKeyAttrs * sizeof(AttrNumber));
+				spanning_remap_keyatts_to_leaf(se->indexInfo, rootKeyAtts,
+											   parentOid,
+											   RelationGetRelid(partition));
+			}
 			/*
 			 * Stamp the entry with this partition's index-local partseq; the
 			 * write path below stores it as the trailing discriminator key.

@@ -84,5 +84,37 @@ INSERT INTO mld VALUES (1, 'us', '2025-06-01');  -- ERROR: dup across grandchild
 INSERT INTO mld VALUES (2, 'us', '2025-06-01');  -- ok
 SELECT id, count(*) FROM mld GROUP BY id HAVING count(*) > 1;                     -- (none)
 
+-- Section 10: a leaf whose column order DIFFERS from the root (attached via
+-- ALTER ... INHERIT).  The index records key attnums relative to the root, so
+-- they must be remapped to the leaf by name -- on backfill AND on live
+-- INSERT/UPDATE -- or it would read the wrong column and miss duplicates.
+-- (ent currently holds ids {1,2,3,9}.)
+CREATE TABLE reord (note text, ts date NOT NULL, id int NOT NULL, kind text);    -- id is attno 3, not 1
+INSERT INTO reord(note, ts, id, kind) VALUES ('conflicts', '2026-01-15', 1, 'r');
+ALTER TABLE reord INHERIT ent;                  -- ERROR: backfill reads id, rejects dup id=1
+DELETE FROM reord;
+INSERT INTO reord(note, ts, id, kind) VALUES ('ok', '2026-01-16', 77, 'r');
+ALTER TABLE reord INHERIT ent;                  -- clean (id=77)
+INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (77, '2026-01-21', 'm', 'd'); -- ERROR: backfilled id=77 enforced
+INSERT INTO reord(note, ts, id, kind) VALUES ('x', '2026-01-17', 2, 'r');        -- ERROR: live INSERT reads id, rejects
+UPDATE reord SET id = 9 WHERE id = 77;          -- ERROR: live UPDATE reads id, collides with id=9
+INSERT INTO reord(note, ts, id, kind) VALUES ('new', '2026-01-18', 88, 'r');     -- ok
+SELECT id, count(*) FROM ent GROUP BY id HAVING count(*) > 1;                     -- (none)
+DROP TABLE reord;
+
+-- Section 11: multiple inheritance / diamond -- a leaf reachable via two paths
+-- to the same spanning root is deduped to ONE partseq and enforced once.
+CREATE TABLE dr (id int NOT NULL, ts date NOT NULL);
+CREATE TABLE da () INHERITS (dr);
+CREATE TABLE db () INHERITS (dr);
+CREATE TABLE dchild () INHERITS (da, db);
+CREATE UNIQUE INDEX dr_id_g ON dr (id) GLOBAL;
+INSERT INTO dchild(id, ts) VALUES (1, '2026-01-01');
+INSERT INTO da(id, ts) VALUES (1, '2026-01-02');   -- ERROR: same root, enforced
+INSERT INTO dr(id, ts) VALUES (1, '2026-01-03');   -- ERROR: enforced at the root too
+INSERT INTO dchild(id, ts) VALUES (2, '2026-01-04');  -- ok
+SELECT id, count(*) FROM dr GROUP BY id HAVING count(*) > 1;                      -- (none)
+DROP TABLE dr CASCADE;
+
 DROP TABLE ent CASCADE;
 DROP TABLE mld;

@@ -35,6 +35,7 @@
 #include "partitioning/partdesc.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -374,6 +375,44 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
 }
 
 /*
+ * spanning_remap_keyatts_to_leaf
+ *
+ * A spanning index records its user-key columns as attribute numbers of the
+ * root the index lives on.  A leaf may order those columns differently -- a
+ * declarative partition attached with a divergent layout, or (more commonly for
+ * inheritance) a standalone table whose columns are in a different order that is
+ * later ALTER ... INHERIT'd.  Before reading a leaf tuple with FormIndexDatum we
+ * translate each user-key attnum from the root to this leaf by column name, into
+ * idxInfo->ii_IndexAttrNumbers.  The trailing discriminator key is left as the
+ * root's value -- it is overwritten with the partseq and never read from the
+ * heap.  Spanning indexes never have expression keys, so every user-key attnum
+ * is a plain (positive) column number.
+ *
+ * rootKeyAtts holds the index's original (root-relative) key attnums, captured
+ * once before the per-leaf loop, so the translation is always root -> leaf.
+ */
+void
+spanning_remap_keyatts_to_leaf(IndexInfo *idxInfo, const AttrNumber *rootKeyAtts,
+							   Oid rootOid, Oid leafOid)
+{
+	int			nkey = idxInfo->ii_NumIndexKeyAttrs;
+	int			i;
+
+	for (i = 0; i < nkey - 1; i++)
+	{
+		AttrNumber	ratt = rootKeyAtts[i];
+		char	   *name;
+
+		if (ratt <= 0)
+			continue;			/* not expected for spanning user keys */
+		name = get_attname(rootOid, ratt, false);
+		idxInfo->ii_IndexAttrNumbers[i] = get_attnum(leafOid, name);
+		pfree(name);
+	}
+	idxInfo->ii_IndexAttrNumbers[nkey - 1] = rootKeyAtts[nkey - 1];
+}
+
+/*
  * progresql_backfill_spanning_indexes_for_attached_partition
  *
  * After ATTACH PARTITION, walk all spanning indexes on partitioned-root
@@ -422,6 +461,7 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			Oid			indexOid = lfirst_oid(il);
 			Relation	idxRel;
 			IndexInfo  *idxInfo;
+			AttrNumber	rootKeyAtts[INDEX_MAX_KEYS];
 			ListCell   *ll;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
@@ -433,6 +473,9 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			}
 
 			idxInfo = BuildIndexInfo(idxRel);
+			/* index key attnums are root-relative; remapped per leaf by name */
+			memcpy(rootKeyAtts, idxInfo->ii_IndexAttrNumbers,
+				   idxInfo->ii_NumIndexKeyAttrs * sizeof(AttrNumber));
 
 			foreach(ll, leafoids)
 			{
@@ -461,6 +504,10 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 				 * partseq so later INSERTs resolve; the scan below is a no-op.
 				 */
 				partseq = SpanningGetOrAllocPartseq(idxRel, leafOid);
+
+				/* read this leaf's columns by name (layout may differ from root) */
+				spanning_remap_keyatts_to_leaf(idxInfo, rootKeyAtts,
+											   parentOid, leafOid);
 
 				snapshot = GetTransactionSnapshot();
 				PushActiveSnapshot(snapshot);
@@ -573,12 +620,16 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 {
 	Relation	idxRel;
 	IndexInfo  *idxInfo;
+	AttrNumber	rootKeyAtts[INDEX_MAX_KEYS];
 	List	   *leafoids;
 	ListCell   *lc;
 	Snapshot	snapshot;
 
 	idxRel = index_open(indexRelationId, RowExclusiveLock);
 	idxInfo = BuildIndexInfo(idxRel);
+	/* index key attnums are root-relative; remapped per leaf by name */
+	memcpy(rootKeyAtts, idxInfo->ii_IndexAttrNumbers,
+		   idxInfo->ii_NumIndexKeyAttrs * sizeof(AttrNumber));
 
 	/*
 	 * Enumerate every storage-bearing leaf beneath this root, at any depth,
@@ -631,6 +682,10 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 		 * each spanning index entry below.
 		 */
 		partseq = SpanningGetOrAllocPartseq(idxRel, partOid);
+
+		/* read this leaf's columns by name (layout may differ from root) */
+		spanning_remap_keyatts_to_leaf(idxInfo, rootKeyAtts,
+									   RelationGetRelid(rel), partOid);
 
 		slot = table_slot_create(partRel, NULL);
 		scan = table_beginscan(partRel, GetActiveSnapshot(), 0, NULL);
