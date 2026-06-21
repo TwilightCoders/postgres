@@ -116,5 +116,20 @@ INSERT INTO dchild(id, ts) VALUES (2, '2026-01-04');  -- ok
 SELECT id, count(*) FROM dr GROUP BY id HAVING count(*) > 1;                      -- (none)
 DROP TABLE dr CASCADE;
 
+-- Section 12: COPY into an inheritance leaf maintains the spanning index.  This
+-- is the same write path logical-replication initial table sync uses, and a
+-- spanning leaf usually has no local index, so COPY must drive spanning
+-- maintenance itself or cross-leaf uniqueness is silently lost on bulk load.
+-- (ent currently holds ids {1,2,3,9}.)
+COPY msg_2026_02(id, ts, kind, body) FROM stdin;
+1	2026-02-25	m	copydup
+\.
+COPY msg_2026_02(id, ts, kind, body) FROM stdin;
+200	2026-02-25	m	c1
+201	2026-02-26	m	c2
+\.
+INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (200,'2026-01-28','m','dup'); -- ERROR: COPY-loaded id enforced
+SELECT id, count(*) FROM ent GROUP BY id HAVING count(*) > 1;                     -- (none)
+
 DROP TABLE ent CASCADE;
 DROP TABLE mld;

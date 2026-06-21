@@ -571,7 +571,7 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 			 * entirely (heap row written, no spanning entry).  Done first so a
 			 * cross-partition conflict errors before AFTER ROW triggers fire.
 			 */
-			if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
+			if (RelationHasSpanningAncestor(resultRelInfo->ri_RelationDesc))
 				ExecInsertSpanningIndexTuples(buffer->slots[i],
 											  &buffer->slots[i]->tts_tid,
 											  resultRelInfo->ri_RelationDesc,
@@ -1460,7 +1460,7 @@ CopyFrom(CopyFromState cstate)
 						 * none); without this, plain (non-batched) COPY would
 						 * bypass cross-partition uniqueness enforcement.
 						 */
-						if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
+						if (RelationHasSpanningAncestor(resultRelInfo->ri_RelationDesc))
 							ExecInsertSpanningIndexTuples(myslot, &myslot->tts_tid,
 														  resultRelInfo->ri_RelationDesc,
 														  estate);

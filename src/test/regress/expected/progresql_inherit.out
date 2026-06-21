@@ -173,6 +173,24 @@ NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table da
 drop cascades to table db
 drop cascades to table dchild
+-- Section 12: COPY into an inheritance leaf maintains the spanning index.  This
+-- is the same write path logical-replication initial table sync uses, and a
+-- spanning leaf usually has no local index, so COPY must drive spanning
+-- maintenance itself or cross-leaf uniqueness is silently lost on bulk load.
+-- (ent currently holds ids {1,2,3,9}.)
+COPY msg_2026_02(id, ts, kind, body) FROM stdin;
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(1) already exists.
+CONTEXT:  COPY msg_2026_02, line 2
+COPY msg_2026_02(id, ts, kind, body) FROM stdin;
+INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (200,'2026-01-28','m','dup'); -- ERROR: COPY-loaded id enforced
+ERROR:  duplicate key value violates unique constraint "ent_id_g"
+DETAIL:  Key (id)=(200) already exists.
+SELECT id, count(*) FROM ent GROUP BY id HAVING count(*) > 1;                     -- (none)
+ id | count 
+----+-------
+(0 rows)
+
 DROP TABLE ent CASCADE;
 NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table msg
