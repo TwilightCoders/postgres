@@ -136,6 +136,7 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
+#include "access/spanning.h"
 #include "access/table.h"
 #include "access/tidstore.h"
 #include "access/transam.h"
@@ -145,6 +146,7 @@
 #include "catalog/index.h"
 #include "catalog/partition.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_index_partition.h"
 #include "catalog/pg_spanning_drainq.h"
 #include "catalog/storage.h"
@@ -2515,7 +2517,7 @@ static void
 progresql_vacuum_spanning_indexes(LVRelState *vacrel)
 {
 	Oid			partOid = RelationGetRelid(vacrel->rel);
-	List	   *ancestors = get_partition_ancestors(partOid);
+	List	   *ancestors = progresql_spanning_ancestors(partOid);
 	ListCell   *lc;
 
 	foreach(lc, ancestors)
@@ -3247,10 +3249,10 @@ progresql_rel_has_spanning_ancestor(Relation rel)
 	ListCell   *lc;
 	bool		found = false;
 
-	if (!rel->rd_rel->relispartition)
+	if (!rel->rd_rel->relispartition && !has_superclass(RelationGetRelid(rel)))
 		return false;
 
-	ancestors = get_partition_ancestors(RelationGetRelid(rel));
+	ancestors = progresql_spanning_ancestors(RelationGetRelid(rel));
 
 	foreach(lc, ancestors)
 	{
