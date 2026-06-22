@@ -86,6 +86,29 @@ ALTER TABLE t1 REPLICA IDENTITY FULL;
 CREATE PUBLICATION pub FOR TABLE t WITH (publish_via_partition_root = true);
 ```
 
+### Table-inheritance (`INHERITS`) hierarchies
+
+If the spanning index is on a **table-inheritance** root (typed children, time-
+bucketed leaves) rather than a declaratively partitioned root, the publication
+side differs: `publish_via_partition_root` does **not** apply — inheritance
+children are *separate* logical-replication relations, and publishing the parent
+alone replicates only the parent's own rows. Publish every storage-bearing leaf
+explicitly (or use `FOR ALL TABLES`), and set `REPLICA IDENTITY FULL` on each
+leaf (they have no local PK, same as partitions):
+
+```sql
+-- inheritance root + typed children + bucketed leaves
+ALTER TABLE msg_2026_01 REPLICA IDENTITY FULL;   -- every leaf
+ALTER TABLE fct_2026_01 REPLICA IDENTITY FULL;
+CREATE PUBLICATION pub FOR TABLE msg_2026_01, fct_2026_01 /* , ... every leaf */;
+-- or simply:  CREATE PUBLICATION pub FOR ALL TABLES;
+```
+
+The subscriber maintains its spanning index on initial COPY sync, streamed
+INSERT, and replicated UPDATE — covered by the `subscription/032_spanning_inherit`
+TAP test. This is also the per-leaf shape a fork↔fork multi-master mesh uses
+(each node publishes its leaves with `origin = none` for loop avoidance).
+
 On the **stock-PostgreSQL replica**:
 
 ```sql
