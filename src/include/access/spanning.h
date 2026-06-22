@@ -62,5 +62,7 @@ extern void progresql_add_spanning_hotblocking_attrs(Relation relation,
 													 Bitmapset **hotblockingattrs);
 extern bool progresql_leaf_has_spanning_ancestor(Relation relation);
 extern bool RelationHasSpanningAncestor(Relation relation);
+/* true if relation has a spanning (GLOBAL) index of its own (FK referenced-side) */
+extern bool RelationHasSpanningIndex(Relation relation);
 
 #endif							/* SPANNING_H */

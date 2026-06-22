@@ -24,6 +24,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/spanning.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -390,7 +391,8 @@ RI_FKey_check(TriggerData *trigdata)
 		 * ----------
 		 */
 		initStringInfo(&querybuf);
-		pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+		pk_only = (pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+				   RelationHasSpanningIndex(pk_rel)) ?
 			"" : "ONLY ";
 		quoteRelationName(pkrelname, pk_rel);
 		if (riinfo->hasperiod)
@@ -561,7 +563,8 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 		 * ----------
 		 */
 		initStringInfo(&querybuf);
-		pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+		pk_only = (pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+				   RelationHasSpanningIndex(pk_rel)) ?
 			"" : "ONLY ";
 		quoteRelationName(pkrelname, pk_rel);
 		if (riinfo->hasperiod)

@@ -599,6 +599,7 @@ static void addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint,
 static void CloneForeignKeyConstraints(List **wqueue, Relation parentRel,
 									   Relation partitionRel);
 static void CloneFkReferenced(Relation parentRel, Relation partitionRel);
+static void progresql_clone_referenced_fks_to_child(Relation childRel);
 static void CloneFkReferencing(List **wqueue, Relation parentRel,
 							   Relation partRel);
 static void createForeignKeyCheckTriggers(Oid myRelOid, Oid refRelOid,
@@ -1223,6 +1224,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		CommandCounterIncrement();
 		newrel = table_open(relationId, AccessShareLock);
 		progresql_backfill_spanning_indexes_for_attached_partition(newrel);
+		/* and clone any cross-child FK action triggers onto the new child */
+		progresql_clone_referenced_fks_to_child(newrel);
 		table_close(newrel, AccessShareLock);
 	}
 
@@ -11057,6 +11060,67 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 			}
 		}
 	}
+
+	/*
+	 * ProgreSQL: an inheritance parent carrying a spanning (GLOBAL) index is a
+	 * cross-child FK target -- the referenced row may live in any child, and a
+	 * DELETE/UPDATE on a child fires only that child's triggers.  So, exactly as
+	 * for declarative partitions above, create a referenced-side pg_constraint
+	 * row + action triggers on each direct child and recurse (handling depth and
+	 * column-order divergence by name).  The spanning index spans the whole tree
+	 * and has no per-child child, so the same root index OID is reused at every
+	 * level.  Gated on the referenced index being spanning, so vanilla FKs to an
+	 * ordinary inheritance parent keep their standard ONLY-the-parent semantics.
+	 */
+	else if (pkrel->rd_rel->relhassubclass && index_is_spanning(indexOid))
+	{
+		List	   *children = find_inheritance_children(RelationGetRelid(pkrel),
+														ShareRowExclusiveLock);
+		ListCell   *lc;
+
+		foreach(lc, children)
+		{
+			Relation	childRel = table_open(lfirst_oid(lc), ShareRowExclusiveLock);
+			AttrMap    *map;
+			AttrNumber *mapped_pkattnum;
+			ObjectAddress address;
+
+			map = build_attrmap_by_name_if_req(RelationGetDescr(childRel),
+											   RelationGetDescr(pkrel),
+											   false);
+			if (map)
+			{
+				mapped_pkattnum = palloc(sizeof(AttrNumber) * numfks);
+				for (int j = 0; j < numfks; j++)
+					mapped_pkattnum[j] = map->attnums[pkattnum[j] - 1];
+			}
+			else
+				mapped_pkattnum = pkattnum;
+
+			address = addFkConstraint(addFkReferencedSide,
+									  fkconstraint->conname, fkconstraint, rel,
+									  childRel, indexOid, parentConstr,
+									  numfks, mapped_pkattnum,
+									  fkattnum, pfeqoperators, ppeqoperators,
+									  ffeqoperators, numfkdelsetcols,
+									  fkdelsetcols, true, with_period);
+			addFkRecurseReferenced(fkconstraint, rel, childRel,
+								   indexOid, address.objectId, numfks,
+								   mapped_pkattnum, fkattnum,
+								   pfeqoperators, ppeqoperators, ffeqoperators,
+								   numfkdelsetcols, fkdelsetcols,
+								   old_check_ok,
+								   deleteTriggerOid, updateTriggerOid,
+								   with_period);
+
+			table_close(childRel, NoLock);
+			if (map)
+			{
+				pfree(mapped_pkattnum);
+				free_attrmap(map);
+			}
+		}
+	}
 }
 
 /*
@@ -11490,6 +11554,38 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 	}
 
 	table_close(trigrel, RowExclusiveLock);
+}
+
+/*
+ * progresql_clone_referenced_fks_to_child
+ *
+ * A child that newly joins a spanning-indexed inheritance tree (CREATE ...
+ * INHERITS or ALTER ... INHERIT) must acquire the referenced-side action
+ * triggers of every foreign key that targets one of its spanning ancestors --
+ * otherwise a DELETE/UPDATE on the new child would not fire those FK actions and
+ * cross-child referential integrity would be silently lost on the new leaf.
+ * This is the inheritance analogue of the CloneFkReferenced call that fires when
+ * a partition is attached.  We clone from each spanning ancestor (a FK may
+ * target any level) and reuse CloneFkReferenced, so column-order divergence and
+ * deeper sub-children are handled by the same machinery.
+ */
+static void
+progresql_clone_referenced_fks_to_child(Relation childRel)
+{
+	List	   *ancestors = progresql_spanning_ancestors(RelationGetRelid(childRel));
+	ListCell   *lc;
+
+	foreach(lc, ancestors)
+	{
+		Relation	anc = table_open(lfirst_oid(lc), ShareRowExclusiveLock);
+
+		/* only an ancestor carrying a spanning index is a cross-child FK target */
+		if (RelationHasSpanningIndex(anc))
+			CloneFkReferenced(anc, childRel);
+
+		table_close(anc, NoLock);
+	}
+	list_free(ancestors);
 }
 
 /*
@@ -17480,6 +17576,8 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 	 */
 	CommandCounterIncrement();
 	progresql_backfill_spanning_indexes_for_attached_partition(child_rel);
+	/* and clone any cross-child FK action triggers onto the newly-attached child */
+	progresql_clone_referenced_fks_to_child(child_rel);
 
 	ObjectAddressSet(address, RelationRelationId,
 					 RelationGetRelid(parent_rel));

@@ -33,6 +33,7 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 #include "access/spanning.h"
 
@@ -276,4 +277,38 @@ RelationHasSpanningAncestor(Relation relation)
 		relation->rd_progresql_spanning_leaf_valid = true;
 	}
 	return relation->rd_progresql_spanning_leaf;
+}
+
+/*
+ * RelationHasSpanningIndex
+ *
+ * True if relation has at least one spanning (GLOBAL) index of its own.  The RI
+ * foreign-key machinery uses this to decide that a FK referencing this relation
+ * must resolve across the whole inheritance/partition tree (not ONLY the root):
+ * the spanning index enforces the referenced key's uniqueness across every
+ * child, so the referenced row may live in any descendant.  Catalog scan only.
+ */
+bool
+RelationHasSpanningIndex(Relation relation)
+{
+	List	   *indexoidlist = RelationGetIndexList(relation);
+	ListCell   *lc;
+	bool		found = false;
+
+	foreach(lc, indexoidlist)
+	{
+		HeapTuple	tup = SearchSysCache1(INDEXRELID,
+										  ObjectIdGetDatum(lfirst_oid(lc)));
+
+		if (HeapTupleIsValid(tup))
+		{
+			if (IndexFormIsSpanning((Form_pg_index) GETSTRUCT(tup)))
+				found = true;
+			ReleaseSysCache(tup);
+		}
+		if (found)
+			break;
+	}
+	list_free(indexoidlist);
+	return found;
 }

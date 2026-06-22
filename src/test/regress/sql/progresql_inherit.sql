@@ -131,5 +131,39 @@ COPY msg_2026_02(id, ts, kind, body) FROM stdin;
 INSERT INTO msg_2026_01(id, ts, kind, body) VALUES (200,'2026-01-28','m','dup'); -- ERROR: COPY-loaded id enforced
 SELECT id, count(*) FROM ent GROUP BY id HAVING count(*) > 1;                     -- (none)
 
+-- Section 13: foreign keys that RESOLVE ACROSS typed children.  A FK to the
+-- inheritance root's spanning PK must (a) find the referenced row in whatever
+-- child holds it, (b) enforce RESTRICT/CASCADE when a referenced row is
+-- deleted/updated from a child (including a different typed child), and (c)
+-- extend to children added dynamically after the FK already exists.
+CREATE TABLE fke (id int NOT NULL, ts date NOT NULL, kind text);
+CREATE TABLE fke_msg (body text) INHERITS (fke);
+CREATE TABLE fke_msg_jan (CHECK (ts >= '2026-01-01' AND ts < '2026-02-01')) INHERITS (fke_msg);
+CREATE TABLE fke_fct (claim text) INHERITS (fke);
+CREATE TABLE fke_fct_jan (CHECK (ts >= '2026-01-01' AND ts < '2026-02-01')) INHERITS (fke_fct);
+CREATE UNIQUE INDEX fke_id_g ON fke (id) GLOBAL;
+INSERT INTO fke_msg_jan(id,ts,kind,body) VALUES (1,'2026-01-10','m','a'),(2,'2026-01-11','m','b');
+INSERT INTO fke_fct_jan(id,ts,kind,claim) VALUES (3,'2026-01-12','f','c');
+CREATE TABLE fk_restrict (rid int PRIMARY KEY, eid int REFERENCES fke(id));
+CREATE TABLE fk_cascade  (rid int PRIMARY KEY, eid int REFERENCES fke(id) ON DELETE CASCADE);
+-- (a) existence resolves into children: id=1 (msg child), id=3 (fct child, cross-type)
+INSERT INTO fk_restrict VALUES (10, 1);
+INSERT INTO fk_cascade  VALUES (20, 3);
+INSERT INTO fk_restrict VALUES (11, 99);   -- ERROR: 99 is in no child
+-- (b) RESTRICT blocks a child DELETE of a referenced row
+DELETE FROM fke_msg_jan WHERE id = 1;      -- ERROR: still referenced from fk_restrict
+-- CASCADE fires on a cross-type child DELETE
+DELETE FROM fke_fct_jan WHERE id = 3;      -- cascades to fk_cascade rid=20
+SELECT count(*) AS cascade_left FROM fk_cascade WHERE rid = 20;   -- 0
+-- (c) a dynamically-added child acquires the FK action triggers too
+CREATE TABLE fke_msg_feb (CHECK (ts >= '2026-02-01' AND ts < '2026-03-01')) INHERITS (fke_msg);
+INSERT INTO fke_msg_feb(id,ts,kind,body) VALUES (5,'2026-02-10','m','e');
+INSERT INTO fk_cascade VALUES (50, 5);
+DELETE FROM fke_msg_feb WHERE id = 5;      -- cascades on the dynamic child
+SELECT count(*) AS dyn_cascade_left FROM fk_cascade WHERE rid = 50;   -- 0
+DROP TABLE fke CASCADE;
+DROP TABLE fk_restrict;
+DROP TABLE fk_cascade;
+
 DROP TABLE ent CASCADE;
 DROP TABLE mld;
