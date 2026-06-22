@@ -110,11 +110,15 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
 
 	/*
-	 * Resolve this leaf's spanning roots by walking the full pg_inherits tree
-	 * upward (declarative partitions and/or table inheritance, any depth), not
-	 * just declarative partition ancestry.
+	 * Resolve this relation's spanning roots by walking the full pg_inherits
+	 * tree upward (declarative partitions and/or table inheritance, any depth).
+	 * Include the relation ITSELF first: a heap-bearing root that carries its
+	 * own spanning index and receives direct inserts is a leaf of its own index
+	 * (its own partseq), so it must be maintained here too -- not just leaves
+	 * under an ancestor.
 	 */
-	ancestors = progresql_spanning_ancestors(RelationGetRelid(partition));
+	ancestors = lcons_oid(RelationGetRelid(partition),
+						  progresql_spanning_ancestors(RelationGetRelid(partition)));
 	foreach(lc, ancestors)
 	{
 		Oid			parentOid = lfirst_oid(lc);

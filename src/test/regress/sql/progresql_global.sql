@@ -57,10 +57,15 @@ ALTER TABLE pg_alt ADD CONSTRAINT pg_alt_pk PRIMARY KEY (id) GLOBAL;
 SELECT indnuniqatts > 0 AS is_spanning
   FROM pg_index WHERE indexrelid = 'pg_alt_pk'::regclass;
 
--- Section 5: negative cases -- GLOBAL is rejected where it cannot apply
-CREATE TABLE pg_plain (id bigint NOT NULL, PRIMARY KEY (id) GLOBAL);  -- ERROR: not partitioned
+-- Section 5: GLOBAL on a plain ordinary table is accepted -- it declares a
+-- spanning root that spans itself until descendants (partitions or INHERITS
+-- children) are added.  This is the root-first DDL pattern: the spanning PK is
+-- created before any children exist, then children INHERIT and are backfilled.
+CREATE TABLE pg_plain (id bigint NOT NULL, PRIMARY KEY (id) GLOBAL);   -- OK: spanning root (no children yet)
+INSERT INTO pg_plain VALUES (1);
+INSERT INTO pg_plain VALUES (1);                                       -- ERROR: enforced on its own rows
 CREATE TABLE pg_plain2 (id bigint);
-CREATE UNIQUE INDEX ON pg_plain2 (id) GLOBAL;                          -- ERROR: not partitioned
+CREATE UNIQUE INDEX ON pg_plain2 (id) GLOBAL;                          -- OK: spanning root
 
 -- Multi-level partitioning under a spanning index is rejected at DDL time:
 -- every partition must be a leaf (the partseq map keys leaves, not interior
@@ -85,6 +90,7 @@ DROP TABLE pg_events;
 DROP TABLE pg_codes;
 DROP TABLE pg_sku;
 DROP TABLE pg_alt;
+DROP TABLE pg_plain;
 DROP TABLE pg_plain2;
 DROP TABLE pg_ml;
 DROP TABLE pg_ml2;

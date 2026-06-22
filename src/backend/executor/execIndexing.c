@@ -366,6 +366,17 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 
 		indexInfo = indexInfoArray[i];
 
+		/*
+		 * ProgreSQL: spanning (GLOBAL) indexes are maintained out-of-band by
+		 * ExecInsertSpanningIndexTuples, which stores the partseq discriminator
+		 * and runs the cross-leaf uniqueness check.  Skip them in the normal
+		 * path so a heap-bearing root that carries its own spanning index is not
+		 * double-maintained (leaves never have a local spanning index, so this is
+		 * a no-op for them).
+		 */
+		if (RelationIsSpanning(indexRelation))
+			continue;
+
 		/* If the index is marked as read-only, ignore it */
 		if (!indexInfo->ii_ReadyForInserts)
 			continue;

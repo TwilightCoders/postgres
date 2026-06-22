@@ -756,18 +756,22 @@ DefineIndex(Oid tableId,
 	{
 		/*
 		 * ProgreSQL: a spanning (GLOBAL) index may be created on a declaratively
-		 * partitioned root OR on an inheritance parent (table inheritance at the
-		 * top, partitioned/bucketed leaves below).  Both are enumerated uniformly
-		 * via find_all_inheritors when the index is built and maintained.
+		 * partitioned root OR on an ordinary table that is (or will become) an
+		 * inheritance root -- table inheritance at the top, partitioned/bucketed
+		 * leaves below.  We deliberately do NOT require children to exist yet:
+		 * the natural DDL order creates the root WITH its spanning PK first, then
+		 * adds children (each backfilled into the index as it INHERITS), so a
+		 * childless ordinary table is allowed here and simply spans itself until
+		 * descendants arrive.  Leaves are enumerated uniformly via
+		 * find_all_inheritors when the index is built and maintained.
 		 */
 		bool		spannable = partitioned ||
-			(rel->rd_rel->relkind == RELKIND_RELATION &&
-			 rel->rd_rel->relhassubclass);
+			rel->rd_rel->relkind == RELKIND_RELATION;
 
 		if (!spannable)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("GLOBAL index is only supported on partitioned tables or inheritance parents")));
+					 errmsg("GLOBAL index is only supported on ordinary or partitioned tables")));
 		if (rel->rd_rel->relispartition)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
