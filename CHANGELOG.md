@@ -17,8 +17,8 @@ Newest first.
 - **Cross-child foreign keys** — a FK referencing a spanning root resolves into
   any typed child; `RESTRICT`/`CASCADE`/`SET NULL` fire on child DML; children
   added after the FK are enforced.
-- **Public introspection contract for client tooling** (e.g. the
-  `a client adapter` adapter): `progresql_version()` returns the fork's
+- **Public introspection contract for client tooling** (ORM adapters,
+  schema-dump tools): `progresql_version()` returns the fork's
   feature-set version (the supported fork-detection hook — vanilla reports the
   same `server_version`); `pg_index_is_global(regclass)` reports whether an
   existing index is a spanning index; and `pg_index_global_columns(regclass)`
@@ -30,6 +30,12 @@ Newest first.
 - `GLOBAL` is now accepted on any ordinary table (previously required existing
   children), enabling the root-first DDL pattern. It is still rejected on views,
   materialized views, foreign tables, partitions, and for exclusion constraints.
+
+### Fixed
+- The spanning TAP tests (`recovery/050_spanning_inherit_crash`,
+  `subscription/031_spanning`, `subscription/032_spanning_inherit`) are now
+  registered in `meson.build`; previously they ran only under the Makefile build
+  (`prove` auto-discovers `t/*.pl`) and were silently skipped by a meson build.
 
 ## 2026-06-13
 

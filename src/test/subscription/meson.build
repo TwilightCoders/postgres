@@ -43,6 +43,11 @@ tests += {
       't/034_temporal.pl',
       't/035_conflicts.pl',
       't/100_bugs.pl',
+      # ProgreSQL: spanning-index logical replication (declarative + INHERITS).
+      # NB: these collide on test number with stock 031/032 above; renumber to
+      # unique IDs before any upstream submission (see PRODUCTION_READINESS.md).
+      't/031_spanning.pl',
+      't/032_spanning_inherit.pl',
     ],
   },
 }

@@ -57,7 +57,9 @@ tests += {
       't/046_checkpoint_logical_slot.pl',
       't/047_checkpoint_physical_slot.pl',
       't/048_vacuum_horizon_floor.pl',
-      't/049_spanning_crash.pl'
+      't/049_spanning_crash.pl',
+      # ProgreSQL: spanning-index crash recovery over INHERITS trees
+      't/050_spanning_inherit_crash.pl'
     ],
   },
 }

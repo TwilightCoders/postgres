@@ -1,8 +1,8 @@
 # ProgreSQL
 
 **A PostgreSQL fork that adds native _spanning indexes_ — true cross-partition
-`PRIMARY KEY` / `UNIQUE` enforcement on partitioned tables, without forcing the
-partition key into the constraint.**
+`PRIMARY KEY` / `UNIQUE` enforcement across a partitioned table *or an inheritance
+hierarchy*, without forcing the partition key into the constraint.**
 
 > ⚠️ **Beta.** Cross-partition uniqueness is now tested for single-node
 > correctness, concurrency, and crash recovery: every write path (INSERT, UPDATE
@@ -77,7 +77,57 @@ A spanning `PRIMARY KEY` / `UNIQUE` can also be the target of a **foreign key**:
 (INSERT-time existence checks plus `ON DELETE` / `ON UPDATE` `RESTRICT` /
 `CASCADE` / `SET NULL` / `SET DEFAULT`, on operations through the partitioned root
 *and* on individual leaf partitions), since the spanning index gives the
-referenced side a single cross-partition unique key to point at.
+referenced side a single cross-partition unique key to point at. When the root is
+an inheritance tree, the referenced row is resolved into whatever typed child
+actually holds it (see below) — the FK works across child tables, not just sibling
+partitions.
+
+### Beyond partitions: spanning over table inheritance
+
+A spanning index isn't limited to declarative partitioning. Put `GLOBAL` on an
+ordinary **inheritance root** (`INHERITS`) and the index enforces uniqueness across
+the *whole* tree — every storage-bearing leaf at any depth, across both time
+buckets *and* typed children. The pattern is "inherit at the top, partition/bucket
+the leaves":
+
+```sql
+CREATE TABLE ent (id int NOT NULL, ts date NOT NULL, kind text);
+CREATE TABLE msg (body  text) INHERITS (ent);     -- a typed child
+CREATE TABLE fct (claim text) INHERITS (ent);     -- another typed child
+CREATE TABLE msg_2026_01 () INHERITS (msg);       -- time-bucket leaves
+CREATE TABLE fct_2026_01 () INHERITS (fct);
+
+CREATE UNIQUE INDEX ent_id_g ON ent (id) GLOBAL;  -- one index spans the whole tree
+
+INSERT INTO msg_2026_01 (id, ts, kind) VALUES (1, '2026-01-10', 'm');   -- ok
+INSERT INTO fct_2026_01 (id, ts, kind) VALUES (1, '2026-01-12', 'f');   -- ERROR: id=1
+                                                        --   collides across a typed child ✔
+```
+
+Build- and live-time enforcement, dynamic `CREATE … INHERITS` / `ALTER … INHERIT`
+/ `NO INHERIT` / `DROP` of leaves, reordered-column children, multiple-inheritance
+diamonds, `COPY`, logical replication, and **cross-child foreign keys** (a `REFERENCES`
+to the root resolves into whichever typed child holds the row) are all covered by the
+`progresql_inherit` suite. Leaf enumeration and leaf→root resolution are recursive,
+so an *existing* multi-level declarative tree (sub-partitions of partitions) is
+spanned by the same path.
+
+### Introspecting a spanning index (the client-tooling contract)
+
+Three built-in functions are the **supported introspection contract** for client
+tooling (ORM adapters, schema-dump tools) to detect the fork and round-trip a
+spanning index through a schema dump — so a client never has to read the internal
+`indnuniqatts` key-padding, and can depend on these by name across PG-minor
+forward-ports:
+
+| Function | Returns |
+|---|---|
+| `progresql_version()` | the fork's feature-set version (`'1.0'`) — the supported fork-detection hook (stock PostgreSQL has no such function) |
+| `pg_index_is_global(regclass)` | whether an existing index is a spanning index; `NULL` for a non-index argument |
+| `pg_index_global_columns(regclass)` | the index's user-facing key column names, **excluding** the trailing `partseq` discriminator; `NULL` for a non-index or expression key |
+
+For a `PRIMARY KEY` / `UNIQUE` *constraint*, resolve its `conindid` first and pass
+that to `pg_index_is_global` / `pg_index_global_columns`.
 
 ---
 
@@ -111,7 +161,7 @@ a `build.sh` wrapper at the repo root.)
 Run the feature's regression suites:
 
 ```sh
-make -C src/test/regress check    # 242/242, includes the `progresql*` suites
+make -C src/test/regress check    # 243/243, includes the `progresql*` suites
 make -C src/test/isolation check  # 122/122, includes the spanning-* specs
 ```
 
@@ -221,13 +271,15 @@ A focused diff on top of `REL_18_STABLE`
 ## Status
 
 - Based on **PostgreSQL 18** (`REL_18_STABLE`).
-- **242/242** core regression tests pass, including the ProgreSQL suites
+- **243/243** core regression tests pass, including the ProgreSQL suites
   (`progresql`, `progresql_ddl`, `progresql_partseq`, `progresql_global`,
   `progresql_hot`, `progresql_vacuum_collision`, `progresql_oid_reuse`,
-  `progresql_drain`, `progresql_fk`, `progresql_dumpdef`), plus **122/122**
-  isolation tests.
+  `progresql_concurrency`, `progresql_drain`, `progresql_fk`, `progresql_inherit`,
+  `progresql_dumpdef`), plus **122/122** isolation tests.
 - **TAP**: `recovery/049_spanning_crash` (crash recovery, 17/17) and
-  `subscription/031_spanning` (logical replication, 7/7) pass.
+  `subscription/031_spanning` (logical replication, 7/7) pass, with inheritance
+  variants `recovery/050_spanning_inherit_crash` and
+  `subscription/032_spanning_inherit` extending both to `INHERITS` trees.
 - **Soak-verified** (cassert + `amcheck` oracle): the cross-partition uniqueness
   race, the deferred-vacuum drain (6 h scale + a 24-partition run), 25 crash/
   recover cycles, local-index leaves, and concurrent index DROP/CREATE during a
@@ -281,13 +333,20 @@ git rebase upstream/REL_18_STABLE progresql-18
 
 ## Limitations
 
-- The feature is opt-in via the `GLOBAL` keyword; plain partitioned tables are
-  untouched. (Combining `INHERITS` with `PARTITION BY` is rejected, exactly as in
-  stock PostgreSQL — `GLOBAL` is the only way to request a spanning index.)
-- Multi-level (sub-)partitioning is not supported under a spanning index: every
-  partition must be a storage-bearing leaf. This is rejected at DDL — both
-  sub-partitioning a partition of a spanning-indexed root, and creating a
-  `GLOBAL` index on an already multi-level tree.
+- The feature is opt-in via the `GLOBAL` keyword; plain partitioned and plain
+  inheritance tables are untouched — `GLOBAL` is the only way to request a spanning
+  index. (A *single table* that both `INHERITS` and is `PARTITION BY` is still
+  rejected, exactly as in stock PostgreSQL. That is separate from a `GLOBAL` index
+  on an inheritance *root* whose children are themselves partitioned/bucketed,
+  which is fully supported — see "spanning over table inheritance" above.)
+- A `GLOBAL` index built over an *existing* multi-level tree — declarative
+  sub-partitions, or inheritance depth — spans every storage-bearing leaf at any
+  depth (enumeration is recursive). What is still rejected at DDL is *incrementally*
+  sub-partitioning a partition (or `ATTACH`ing an already-partitioned table)
+  **after** a spanning index already exists on a *declarative* root: the new
+  grandchildren would have no `partseq` and would silently escape the index. The
+  order matters — build the multi-level tree first, then add `GLOBAL`; or use an
+  inheritance root, under which depth can be added freely at any time.
 - The per-statement cache is exactly that — per statement; it is rebuilt for
   each top-level DML.
 - **Logical replication of `UPDATE`/`DELETE`** from a spanning-indexed table
