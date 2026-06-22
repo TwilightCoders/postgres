@@ -4,6 +4,31 @@ Changes ProgreSQL adds on top of stock PostgreSQL (`REL_18_STABLE`). Vanilla
 PostgreSQL behavior is unchanged unless a table opts in with the `GLOBAL` keyword.
 Newest first.
 
+## 2026-06-22
+
+### Added
+- **Spanning over table inheritance (`INHERITS`)** — a `GLOBAL` index on an
+  inheritance root enforces cross-leaf uniqueness over the whole tree (across
+  time buckets *and* typed children), with build/live INSERT-UPDATE enforcement,
+  dynamic `CREATE…INHERITS` / `ALTER…INHERIT` / `NO INHERIT` / `DROP`, VACUUM +
+  DHR drain, dump/restore, crash recovery, logical-rep + master↔master mesh, and
+  multi-level declarative partitioning. Root-first DDL (`PRIMARY KEY (id) GLOBAL`
+  before children) is supported; a heap-bearing root enforces its own direct rows.
+- **Cross-child foreign keys** — a FK referencing a spanning root resolves into
+  any typed child; `RESTRICT`/`CASCADE`/`SET NULL` fire on child DML; children
+  added after the FK are enforced.
+- **Public introspection contract for client tooling** (e.g. the
+  `a client adapter` adapter): `progresql_version()` returns the fork's
+  feature-set version (the supported fork-detection hook — vanilla reports the
+  same `server_version`), and `pg_index_is_global(regclass)` reports whether an
+  existing index is a spanning index (for the schema-dump round-trip), so clients
+  depend on a documented API rather than internal catalog representation.
+
+### Changed
+- `GLOBAL` is now accepted on any ordinary table (previously required existing
+  children), enabling the root-first DDL pattern. It is still rejected on views,
+  materialized views, foreign tables, partitions, and for exclusion constraints.
+
 ## 2026-06-13
 
 ### Added

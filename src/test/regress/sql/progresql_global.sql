@@ -95,3 +95,19 @@ DROP TABLE pg_plain2;
 DROP TABLE pg_ml;
 DROP TABLE pg_ml2;
 DROP TABLE pg_ml2_sub;
+
+-- Fork identity: progresql_version() is the supported public hook for client
+-- tooling to detect the ProgreSQL fork (vanilla reports the same server_version)
+-- and gate features.  Present in every cluster -- no GLOBAL objects required.
+SELECT progresql_version();
+SELECT to_regproc('progresql_version') IS NOT NULL AS is_progresql;
+
+-- pg_index_is_global() recovers GLOBAL from an existing index (the supported
+-- introspection hook for the schema-dump round-trip), so clients need not read
+-- the internal indnuniqatts key-padding.  NULL for a non-index argument.
+CREATE TABLE g (id int NOT NULL, k int NOT NULL, PRIMARY KEY (id) GLOBAL) PARTITION BY LIST (k);
+CREATE INDEX g_local ON g (k);
+SELECT pg_index_is_global('g_pkey'::regclass)  AS pk_is_global,
+       pg_index_is_global('g_local'::regclass) AS local_is_global,
+       pg_index_is_global('g'::regclass)        AS table_arg_is_null;
+DROP TABLE g;

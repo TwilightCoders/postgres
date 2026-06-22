@@ -18,6 +18,7 @@
  */
 #include "postgres.h"
 
+#include "fmgr.h"
 #include "access/genam.h"
 #include "access/relation.h"
 #include "access/skey.h"
@@ -27,6 +28,7 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/partition.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_index_partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_spanning_drainq.h"
@@ -38,9 +40,55 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/builtins.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 #include "access/spanning.h"
+
+/*
+ * progresql_version
+ *
+ * SQL-callable fork identity + feature-set version.  This is the supported
+ * public hook for client tooling (e.g. an ORM adapter) to
+ * (a) detect that the server is the ProgreSQL fork rather than vanilla
+ * PostgreSQL -- the underlying server_version reports plain "18.3" either way --
+ * via `to_regproc('progresql_version') IS NOT NULL`, and (b) gate features and
+ * specs on the returned feature-set version as the fork evolves.
+ */
+PG_FUNCTION_INFO_V1(progresql_version);
+Datum
+progresql_version(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(PROGRESQL_VERSION_STR));
+}
+
+/*
+ * pg_index_is_global
+ *
+ * SQL-callable: is the given index a ProgreSQL spanning (GLOBAL) index?  The
+ * supported introspection hook for tooling that must recover `GLOBAL` from an
+ * existing index (e.g. a schema dumper round-trip),
+ * so clients depend on this rather than on the internal indnuniqatts/indnkeyatts
+ * key-padding representation.  Returns NULL if the argument is not an index.
+ */
+PG_FUNCTION_INFO_V1(pg_index_is_global);
+Datum
+pg_index_is_global(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	HeapTuple	tup;
+	bool		result;
+
+	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexoid));
+	if (!HeapTupleIsValid(tup))
+		PG_RETURN_NULL();		/* not an index, or it does not exist */
+
+	result = IndexFormIsSpanning((Form_pg_index) GETSTRUCT(tup));
+	ReleaseSysCache(tup);
+
+	PG_RETURN_BOOL(result);
+}
 
 /*
  * Deferred, abort-safe retirement of a partition's spanning-index entries.

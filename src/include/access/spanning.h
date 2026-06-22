@@ -20,6 +20,14 @@
 #include "storage/lock.h"
 #include "utils/relcache.h"
 
+/*
+ * ProgreSQL fork feature-set version, independent of the underlying PostgreSQL
+ * version (which reports plain "18.3").  Exposed to SQL via the built-in
+ * progresql_version() -- the supported hook for fork detection + feature
+ * gating by client tooling (e.g. an ORM adapter).
+ */
+#define PROGRESQL_VERSION_STR "1.0"
+
 extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 										  ItemPointer tupleid,
 										  Relation partition,

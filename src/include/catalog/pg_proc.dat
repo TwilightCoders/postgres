@@ -950,6 +950,16 @@
   proname => 'pg_drain_spanning_index', provolatile => 'v', proparallel => 'u',
   prorettype => 'int8', proargtypes => 'regclass',
   prosrc => 'pg_drain_spanning_index' },
+
+# ProgreSQL: fork identity + feature-set version (the supported detection hook)
+{ oid => '8474', descr => 'ProgreSQL fork feature-set version',
+  proname => 'progresql_version', provolatile => 'i', proparallel => 's',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'progresql_version' },
+{ oid => '8475', descr => 'is an index a ProgreSQL spanning (GLOBAL) index',
+  proname => 'pg_index_is_global', provolatile => 's', proparallel => 's',
+  prorettype => 'bool', proargtypes => 'regclass',
+  prosrc => 'pg_index_is_global' },
 { oid => '4014', descr => 'brin: desummarize page range',
   proname => 'brin_desummarize_range', provolatile => 'v', proparallel => 'u',
   prorettype => 'void', proargtypes => 'regclass int8',
