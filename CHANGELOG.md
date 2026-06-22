@@ -20,9 +20,11 @@ Newest first.
 - **Public introspection contract for client tooling** (e.g. the
   `a client adapter` adapter): `progresql_version()` returns the fork's
   feature-set version (the supported fork-detection hook — vanilla reports the
-  same `server_version`), and `pg_index_is_global(regclass)` reports whether an
-  existing index is a spanning index (for the schema-dump round-trip), so clients
-  depend on a documented API rather than internal catalog representation.
+  same `server_version`); `pg_index_is_global(regclass)` reports whether an
+  existing index is a spanning index; and `pg_index_global_columns(regclass)`
+  returns an index's user-facing key columns (excluding the internal partseq
+  discriminator) for the schema-dump round-trip. Clients depend on this
+  documented API rather than the internal catalog representation.
 
 ### Changed
 - `GLOBAL` is now accepted on any ordinary table (previously required existing

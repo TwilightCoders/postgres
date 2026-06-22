@@ -40,6 +40,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -88,6 +89,61 @@ pg_index_is_global(PG_FUNCTION_ARGS)
 	ReleaseSysCache(tup);
 
 	PG_RETURN_BOOL(result);
+}
+
+/*
+ * pg_index_global_columns
+ *
+ * SQL-callable: the user-facing key column NAMES of an index, as text[].  For a
+ * spanning (GLOBAL) index this is the leading indnuniqatts key columns -- it
+ * EXCLUDES the trailing partseq discriminator, which has no pg_attribute name
+ * and makes stock catalog introspection (e.g. ActiveRecord's indexes(), which
+ * maps every indkey entry to a name) choke on the unnamed column.  For an
+ * ordinary index it is simply all key columns, so callers can use it uniformly.
+ * Returns NULL if the argument is not an index, or if a user key is an
+ * expression (callers should fall back to pg_get_indexdef in that case).
+ */
+PG_FUNCTION_INFO_V1(pg_index_global_columns);
+Datum
+pg_index_global_columns(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	HeapTuple	tup;
+	Form_pg_index pgidx;
+	Oid			indrelid;
+	int			nuser;
+	int			i;
+	Datum	   *elems;
+	ArrayType  *arr;
+
+	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexoid));
+	if (!HeapTupleIsValid(tup))
+		PG_RETURN_NULL();		/* not an index, or it does not exist */
+
+	pgidx = (Form_pg_index) GETSTRUCT(tup);
+	/* spanning: user columns are the leading indnuniqatts; ordinary: all keys */
+	nuser = IndexFormIsSpanning(pgidx) ? pgidx->indnuniqatts : pgidx->indnkeyatts;
+	indrelid = pgidx->indrelid;
+
+	elems = (Datum *) palloc(sizeof(Datum) * nuser);
+	for (i = 0; i < nuser; i++)
+	{
+		AttrNumber	attno = pgidx->indkey.values[i];
+		char	   *name;
+
+		if (attno <= 0)			/* expression/system column: not representable here */
+		{
+			ReleaseSysCache(tup);
+			PG_RETURN_NULL();
+		}
+		name = get_attname(indrelid, attno, false);
+		elems[i] = CStringGetTextDatum(name);
+		pfree(name);
+	}
+	ReleaseSysCache(tup);
+
+	arr = construct_array(elems, nuser, TEXTOID, -1, false, TYPALIGN_INT);
+	PG_RETURN_ARRAYTYPE_P(arr);
 }
 
 /*

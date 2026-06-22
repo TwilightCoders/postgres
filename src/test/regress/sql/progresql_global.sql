@@ -110,4 +110,9 @@ CREATE INDEX g_local ON g (k);
 SELECT pg_index_is_global('g_pkey'::regclass)  AS pk_is_global,
        pg_index_is_global('g_local'::regclass) AS local_is_global,
        pg_index_is_global('g'::regclass)        AS table_arg_is_null;
+-- pg_index_global_columns() returns the user-facing columns (excludes the
+-- partseq discriminator that crashes stock catalog introspection).
+SELECT pg_index_global_columns('g_pkey'::regclass)  AS pk_user_cols,
+       pg_index_global_columns('g_local'::regclass) AS local_cols,
+       pg_index_global_columns('g'::regclass)        AS table_arg_is_null;
 DROP TABLE g;
