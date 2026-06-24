@@ -734,6 +734,21 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 								 * future path ever weakens that locking, we degrade to
 								 * a clean skip (treat as unresolved) instead of an
 								 * elog/crash on the storage-less root.
+								 *
+								 * Lock-ordering note: this AccessShareLock on the
+								 * conflicting partition is taken while the spanning leaf
+								 * buffer content lock is held.  A concurrent DROP/DETACH
+								 * of that partition holds its AccessExclusiveLock, so
+								 * this open can block under the content lock -- but the
+								 * 2-party race is safe: the DDL also needs the root's
+								 * AccessExclusiveLock, which this INSERT's root
+								 * AccessShareLock holds, so they serialize at the root or
+								 * deadlock-and-abort (no uniqueness/correctness impact).
+								 * A narrow residual liveness window (a third backend
+								 * waiting on the held leaf page during the DDL's lock
+								 * wait) is left for a future change to close by releasing
+								 * the buffer before waiting on the partition lock and
+								 * re-descending, as the conflict-wait path already does.
 								 */
 								spanChildRel = try_table_open(child_relid, AccessShareLock);
 								if (spanChildRel != NULL)
@@ -842,6 +857,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 						{
 							Relation	selfCheckRel = heapRel;
 							Relation	selfChildRel = NULL;
+							bool		self_unresolved = false;
 
 							if (nuniqs < saved_keysz)
 							{
@@ -857,16 +873,33 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 									Oid		self_relid =
 										SpanningResolvePartseqRelid(rel, partseq);
 
+									/*
+									 * Open defensively, matching the candidate-side
+									 * open above: degrade to "treat self as live"
+									 * rather than table_open a vanished rel or probe
+									 * the storage-less root if a future weakening of
+									 * partition-removal locking ever resolves this to
+									 * a gone partition.  self_relid is the partition
+									 * THIS insert just wrote and is maintaining, so it
+									 * is guaranteed live today.
+									 */
 									if (OidIsValid(self_relid))
 									{
-										selfChildRel = table_open(self_relid, AccessShareLock);
-										selfCheckRel = selfChildRel;
+										selfChildRel = try_table_open(self_relid, AccessShareLock);
+										if (selfChildRel != NULL)
+											selfCheckRel = selfChildRel;
+										else
+											self_unresolved = true;
 									}
+									else
+										self_unresolved = true;
 								}
 							}
 
 							htid = itup->t_tid;
-							if (table_index_fetch_tuple_check(selfCheckRel, &htid,
+							/* a self tuple that could not be opened is treated as live */
+							if (self_unresolved ||
+								table_index_fetch_tuple_check(selfCheckRel, &htid,
 															  SnapshotSelf, NULL))
 							{
 								/* Normal case --- it's still live */

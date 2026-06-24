@@ -169,11 +169,15 @@ typedef struct RelationData
 	 * ProgreSQL: cached predicate -- is this a leaf partition with a spanning
 	 * (GLOBAL) index on an ancestor root?  Lazily computed by
 	 * RelationHasSpanningAncestor and reset with the other relcache-derived
-	 * caches in RelationClearRelation, so it tracks spanning-index add/drop
-	 * (leaf relcaches are invalidated on spanning build -- #42).  Lets the
-	 * per-insert spanning maintenance hook early-out without a catalog walk
-	 * (get_partition_ancestors + index scan) on tables that use no spanning
-	 * index -- the common "do no harm" case.
+	 * caches in RelationClearRelation.  Spanning-index BUILD/ATTACH explicitly
+	 * invalidate the leaf relcaches (#42), so a newly-added index is tracked
+	 * promptly.  A spanning-index DROP does NOT invalidate the leaves, so a
+	 * stale "true" may linger until the leaf relcache is invalidated for some
+	 * other reason -- which is fail-safe: the per-insert maintenance hook
+	 * re-resolves the ancestor/index set every statement and early-outs when
+	 * none remains, so a stale "true" only costs that re-resolution and can
+	 * never lose enforcement.  Lets the hook early-out without a catalog walk
+	 * on tables that use no spanning index -- the common "do no harm" case.
 	 */
 	bool		rd_progresql_spanning_leaf;			/* cached answer */
 	bool		rd_progresql_spanning_leaf_valid;	/* is the answer computed? */

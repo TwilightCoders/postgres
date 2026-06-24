@@ -469,6 +469,27 @@ static void progresql_vacuum_spanning_indexes(LVRelState *vacrel);
 static void progresql_enqueue_spanning_drain(LVRelState *vacrel);
 static bool progresql_rel_has_spanning_ancestor(Relation rel);
 static bool spanning_tid_reaped(ItemPointer tid, void *state);
+
+/*
+ * Populate an IndexVacuumInfo for a spanning-index vacuum/drain pass.  The
+ * constant fields are identical across all three spanning call sites in this
+ * file; centralizing them keeps the fork's copies from drifting and localizes
+ * any future upstream IndexVacuumInfo field addition to one place.
+ */
+static inline void
+spanning_init_ivinfo(IndexVacuumInfo *iv, Relation idx, Relation heap,
+					 BufferAccessStrategy bs)
+{
+	iv->index = idx;
+	iv->heaprel = heap;
+	iv->analyze_only = false;
+	iv->report_progress = false;
+	iv->estimated_count = true;
+	iv->message_level = DEBUG2;
+	iv->num_heap_tuples = -1;
+	iv->strategy = bs;
+}
+
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
 static void lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
 								  Buffer buffer, OffsetNumber *deadoffsets,
@@ -2570,14 +2591,7 @@ progresql_vacuum_spanning_indexes(LVRelState *vacrel)
 			 * yields the same (non-catalog, non-temp) global visibility horizon
 			 * class, so the recyclability decision is correct.
 			 */
-			ivinfo.index = idxRel;
-			ivinfo.heaprel = vacrel->rel;
-			ivinfo.analyze_only = false;
-			ivinfo.report_progress = false;
-			ivinfo.estimated_count = true;
-			ivinfo.message_level = DEBUG2;
-			ivinfo.num_heap_tuples = -1;
-			ivinfo.strategy = vacrel->bstrategy;
+			spanning_init_ivinfo(&ivinfo, idxRel, vacrel->rel, vacrel->bstrategy);
 
 			istat = bt_spanning_bulkdelete(&ivinfo, istat, partseq,
 										   spanning_tid_reaped,
@@ -2617,7 +2631,15 @@ progresql_enqueue_spanning_drain(LVRelState *vacrel)
 {
 	Oid			partOid = RelationGetRelid(vacrel->rel);
 	int64		ndead = vacrel->dead_items_info->num_items;
-	List	   *ancestors = get_partition_ancestors(partOid);
+	/*
+	 * Use the inheritance-aware ancestor walk (declarative partitions AND
+	 * INHERITS parents, multiple-inheritance included) so the deferred-drain
+	 * enqueue set matches the eager path and the has_spanning_index gate.  The
+	 * partition-only get_partition_ancestors() would miss a spanning root
+	 * reachable only through a non-first inheritance parent (a diamond leaf),
+	 * silently dropping that leaf's deferred cleanup.
+	 */
+	List	   *ancestors = progresql_spanning_ancestors(partOid);
 	ListCell   *lc;
 
 	foreach(lc, ancestors)
@@ -2889,14 +2911,7 @@ spanning_drain_vacuum_local_indexes(Relation partRel, TidStore *dead,
 			continue;
 		}
 
-		ivinfo.index = idxRel;
-		ivinfo.heaprel = partRel;
-		ivinfo.analyze_only = false;
-		ivinfo.report_progress = false;
-		ivinfo.estimated_count = true;
-		ivinfo.message_level = DEBUG2;
-		ivinfo.num_heap_tuples = -1;
-		ivinfo.strategy = bstrategy;
+		spanning_init_ivinfo(&ivinfo, idxRel, partRel, bstrategy);
 
 		istat = index_bulk_delete(&ivinfo, NULL, spanning_tid_reaped,
 								  (void *) dead);
@@ -3130,14 +3145,7 @@ progresql_drain_spanning_index(Oid spanningIndexOid)
 					kill.deadbypartseq[ps] = (struct TidStore *) entries[i].dead;
 			}
 
-			ivinfo.index = idxRel;
-			ivinfo.heaprel = heaprel;
-			ivinfo.analyze_only = false;
-			ivinfo.report_progress = false;
-			ivinfo.estimated_count = true;
-			ivinfo.message_level = DEBUG2;
-			ivinfo.num_heap_tuples = -1;
-			ivinfo.strategy = bstrategy;
+			spanning_init_ivinfo(&ivinfo, idxRel, heaprel, bstrategy);
 
 			istat = bt_spanning_drain(&ivinfo, NULL, &kill);
 			if (istat != NULL)

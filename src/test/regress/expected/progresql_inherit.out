@@ -117,6 +117,33 @@ SELECT id, count(*) FROM mld GROUP BY id HAVING count(*) > 1;                   
 ----+-------
 (0 rows)
 
+-- Section 9b: a grandchild leaf added to the multi-level tree AFTER the spanning
+-- index exists must register its partseq via the ancestor walk -- its direct
+-- parent mld_us carries no spanning index of its own, so the partition
+-- index-clone path (which only inspects the direct parent) misses it.  Before
+-- the fix the new leaf got no partseq and failed closed ("no partseq for
+-- partition") at the first INSERT.
+CREATE TABLE mld_us_26 PARTITION OF mld_us
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+INSERT INTO mld VALUES (3, 'us', '2026-06-01');  -- ok: new grandchild leaf is registered + usable
+INSERT INTO mld VALUES (1, 'us', '2026-07-01');  -- ERROR: dup id=1 enforced on the new grandchild
+ERROR:  duplicate key value violates unique constraint "mld_id_g"
+DETAIL:  Key (id)=(1) already exists.
+SELECT id, count(*) FROM mld GROUP BY id HAVING count(*) > 1;                     -- (none)
+ id | count 
+----+-------
+(0 rows)
+
+-- DROP of the after-index grandchild cleans its partseq map (OID-reuse safe)
+DROP TABLE mld_us_26;
+INSERT INTO mld VALUES (1, 'us', '2025-06-15');  -- ERROR: still enforced via the build-first leaf
+ERROR:  duplicate key value violates unique constraint "mld_id_g"
+DETAIL:  Key (id)=(1) already exists.
+SELECT id, count(*) FROM mld GROUP BY id HAVING count(*) > 1;                     -- (none)
+ id | count 
+----+-------
+(0 rows)
+
 -- Section 10: a leaf whose column order DIFFERS from the root (attached via
 -- ALTER ... INHERIT).  The index records key attnums relative to the root, so
 -- they must be remapped to the leaf by name -- on backfill AND on live
@@ -163,6 +190,29 @@ INSERT INTO dr(id, ts) VALUES (1, '2026-01-03');   -- ERROR: enforced at the roo
 ERROR:  duplicate key value violates unique constraint "dr_id_g"
 DETAIL:  Key (id)=(1) already exists.
 INSERT INTO dchild(id, ts) VALUES (2, '2026-01-04');  -- ok
+SELECT id, count(*) FROM dr GROUP BY id HAVING count(*) > 1;                      -- (none)
+ id | count 
+----+-------
+(0 rows)
+
+-- Section 11b: the deferred-drain enqueue must reach the spanning root THROUGH a
+-- diamond leaf (regression for the partition-only ancestor walk that missed a
+-- root reachable only via the leaf's non-first inheritance parent and silently
+-- dropped its deferred cleanup).  Churn the diamond leaf, VACUUM it (enqueues),
+-- drain, and confirm enforcement and integrity hold across the cycle.
+INSERT INTO dchild(id, ts) SELECT g, '2026-02-01' FROM generate_series(100, 120) g;
+DELETE FROM dchild WHERE id BETWEEN 100 AND 110;
+VACUUM dchild;
+SELECT pg_drain_spanning_index('dr_id_g');
+ pg_drain_spanning_index 
+-------------------------
+                      11
+(1 row)
+
+INSERT INTO dchild(id, ts) VALUES (100, '2026-02-02');  -- ok: id=100 was deleted + drained
+INSERT INTO dchild(id, ts) VALUES (115, '2026-02-03');  -- ERROR: id=115 still live, enforced
+ERROR:  duplicate key value violates unique constraint "dr_id_g"
+DETAIL:  Key (id)=(115) already exists.
 SELECT id, count(*) FROM dr GROUP BY id HAVING count(*) > 1;                      -- (none)
  id | count 
 ----+-------

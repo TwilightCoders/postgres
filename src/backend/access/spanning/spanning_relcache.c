@@ -268,9 +268,13 @@ progresql_leaf_has_spanning_ancestor(Relation relation)
  * through the same hook (the normal index path skips spanning indexes).
  *
  * The answer changes only when a spanning index is added to or dropped from this
- * relation or an ancestor; spanning-index build invalidates the relevant
- * relcaches (#42) and RelationClearRelation resets the cached flag, so the cache
- * tracks those changes.  This lets the per-insert maintenance hook early-out
+ * relation or an ancestor.  Spanning-index BUILD/ATTACH explicitly invalidate the
+ * relevant leaf relcaches (#42), so an added index is tracked promptly; a DROP
+ * does NOT, so a stale "true" can linger until the leaf relcache is invalidated
+ * for some other reason.  That is fail-safe: the per-insert maintenance hook
+ * re-resolves the ancestor/index set every statement (spanning_exec.c) and
+ * early-outs when none remains, so a stale "true" only costs that re-resolution
+ * and can never admit a cross-partition duplicate.  This lets the hook early-out
  * with a single field read for the do-no-harm common case (any table not in a
  * spanning index).
  */

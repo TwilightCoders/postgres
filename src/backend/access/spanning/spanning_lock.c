@@ -43,6 +43,7 @@
 
 #include "access/itup.h"
 #include "access/tupdesc.h"
+#include "common/hashfn.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/lock.h"
@@ -94,8 +95,8 @@ spanning_userkey_hash(Relation indexRel, IndexTuple itup)
 														   collid, val));
 		}
 
-		/* order-sensitive combine: rotate-left-1 then xor */
-		hash = ((hash << 1) | (hash >> 31)) ^ colhash;
+		/* order-sensitive combine: PostgreSQL's canonical 32-bit mixer */
+		hash = hash_combine(hash, colhash);
 	}
 
 	return hash;

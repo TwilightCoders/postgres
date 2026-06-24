@@ -1387,6 +1387,30 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	}
 
 	/*
+	 * ProgreSQL: a declarative partition that is a storage-bearing leaf must
+	 * register its partseq against EVERY spanning (GLOBAL) index on its
+	 * ancestors -- not just the direct parent.  The index-clone loop above only
+	 * inspects the direct parent's index list, so a leaf added under an already
+	 * multi-level tree (a grandchild of the spanning root, whose direct parent
+	 * is an intermediate sub-partitioned node that carries no spanning index of
+	 * its own) would otherwise get no partseq and fail closed ("spanning index
+	 * has no partseq for partition") at the first INSERT.  The ancestor-walking
+	 * backfill registers it -- a no-op scan on the freshly-created empty rel --
+	 * and is idempotent (get-or-allocate) for the direct-child case the loop
+	 * already handled.
+	 */
+	if (stmt->partbound != NULL && rel->rd_rel->relkind == RELKIND_RELATION)
+	{
+		Relation	newrel;
+
+		CommandCounterIncrement();
+		newrel = table_open(relationId, AccessShareLock);
+		progresql_backfill_spanning_indexes_for_attached_partition(newrel);
+		progresql_clone_referenced_fks_to_child(newrel);
+		table_close(newrel, AccessShareLock);
+	}
+
+	/*
 	 * Now add any newly specified CHECK constraints to the new relation. Same
 	 * as for defaults above, but these need to come after partitioning is set
 	 * up.  We save the constraint names that were used, to avoid dupes below.
