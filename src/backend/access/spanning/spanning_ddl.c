@@ -517,6 +517,104 @@ spanning_remap_keyatts_to_leaf(IndexInfo *idxInfo, const AttrNumber *rootKeyAtts
 }
 
 /*
+ * spanning_backfill_leaf
+ *
+ * Backfill one storage-bearing leaf's existing rows into a spanning index.
+ * Shared by the ATTACH backfill, the CREATE-index-on-populated-root build, and
+ * the post-rewrite rebuild that routes through the former: each walks a set of
+ * leaves and, for every live tuple in each, inserts a
+ * (user_columns..., partseq) key so cross-partition uniqueness sees the
+ * pre-existing rows.
+ *
+ *   idxRel       the spanning index being populated (RowExclusiveLock held)
+ *   idxInfo      its IndexInfo; ii_IndexAttrNumbers is remapped per leaf here
+ *   rootKeyAtts  the key attnums relative to rootOid (the caller snapshots
+ *                these before the first remap, since the remap mutates idxInfo)
+ *   rootOid      the relation idxInfo's key attnums are expressed against
+ *   leafOid      the leaf to scan
+ *   heapRel      passed as index_insert's heapRelation -- the spanning root,
+ *                NOT leafRel.  nbtinsert keys its heap-liveness skip
+ *                (_bt_simpledel_pass / _bt_bottomupdel_pass, which cannot
+ *                safely process TIDs spread across multiple partitions) on the
+ *                index being spanning, and resolves the real heap from the
+ *                stored partseq.
+ *
+ * The caller must have an active snapshot pushed -- table_beginscan reads
+ * GetActiveSnapshot() and DDL does not push one automatically.  Only relations
+ * with physical storage are spanning leaves; intermediate parents the tree-walk
+ * returns (the declarative root, sub-partitioned mid-level nodes, abstract
+ * inheritance parents) hold no rows of their own and are skipped here.
+ */
+static void
+spanning_backfill_leaf(Relation idxRel, IndexInfo *idxInfo,
+					   const AttrNumber *rootKeyAtts, Oid rootOid,
+					   Oid leafOid, Relation heapRel)
+{
+	Relation	leafRel;
+	TupleTableSlot *slot;
+	TableScanDesc scan;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	int32		partseq;
+
+	leafRel = table_open(leafOid, AccessShareLock);
+
+	if (leafRel->rd_rel->relkind != RELKIND_RELATION)
+	{
+		table_close(leafRel, AccessShareLock);
+		return;
+	}
+
+	/*
+	 * This leaf's index-local partseq (get-or-allocate; stable across
+	 * rebuilds): the trailing discriminator stored in each backfilled entry.
+	 * For a freshly created, still-empty leaf this just allocates the partseq
+	 * so later INSERTs resolve; the scan below is then a no-op.
+	 */
+	partseq = SpanningGetOrAllocPartseq(idxRel, leafOid);
+
+	/* read this leaf's columns by name (layout may differ from the root) */
+	spanning_remap_keyatts_to_leaf(idxInfo, rootKeyAtts, rootOid, leafOid);
+
+	slot = table_slot_create(leafRel, NULL);
+	scan = table_beginscan(leafRel, GetActiveSnapshot(), 0, NULL);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		int			k;
+
+		FormIndexDatum(idxInfo, slot, NULL, values, isnull);
+
+		/* Trailing key column: this leaf's partseq. */
+		k = idxInfo->ii_NumIndexKeyAttrs - 1;
+		values[k] = Int32GetDatum(partseq);
+		isnull[k] = false;
+
+		/* UNIQUE_CHECK_YES so pre-existing cross-leaf duplicates are caught. */
+		index_insert(idxRel, values, isnull, &slot->tts_tid,
+					 heapRel, UNIQUE_CHECK_YES, false, idxInfo);
+	}
+
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+
+	/*
+	 * Reset this leaf's cached relcache state.  Adding a spanning index changes
+	 * every leaf's HOT-blocking attribute set (the spanning key columns become
+	 * HOT-blocking via progresql_add_spanning_hotblocking_attrs), so a
+	 * spanning-key UPDATE must be forced cold.  ALTER TABLE / CREATE INDEX
+	 * invalidate the partitioned root but not its leaves, so a backend that
+	 * cached a leaf's rd_hotblockingattr BEFORE this build would keep the stale
+	 * (pre-spanning) set, treat a spanning-key UPDATE as HOT, drop the spanning
+	 * entry, and silently break cross-partition uniqueness (#42).  This also
+	 * re-arms the executor maintenance hook for subsequent DML on the leaf.
+	 */
+	CacheInvalidateRelcacheByRelid(leafOid);
+
+	table_close(leafRel, AccessShareLock);
+}
+
+/*
  * progresql_backfill_spanning_indexes_for_attached_partition
  *
  * After ATTACH PARTITION, walk all spanning indexes on partitioned-root
@@ -584,74 +682,17 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			foreach(ll, leafoids)
 			{
 				Oid			leafOid = lfirst_oid(ll);
-				Relation	leafRel;
-				TupleTableSlot *slot;
-				TableScanDesc scan;
-				Datum		values[INDEX_MAX_KEYS];
-				bool		isnull[INDEX_MAX_KEYS];
-				Snapshot	snapshot;
-				int32		partseq;
-
-				leafRel = table_open(leafOid, AccessShareLock);
-
-				/* only storage-bearing leaves carry rows and a partseq */
-				if (leafRel->rd_rel->relkind != RELKIND_RELATION)
-				{
-					table_close(leafRel, AccessShareLock);
-					continue;
-				}
 
 				/*
-				 * This leaf's index-local partseq (get-or-allocate): the
-				 * trailing discriminator stored in each backfilled entry.  For a
-				 * freshly created, still-empty leaf this just allocates the
-				 * partseq so later INSERTs resolve; the scan below is a no-op.
+				 * spanning_backfill_leaf scans under the active snapshot, which
+				 * DDL does not push automatically, so wrap each leaf.  (partseq
+				 * allocation and key remap touch only catalogs, so running them
+				 * under the snapshot too is harmless.)
 				 */
-				partseq = SpanningGetOrAllocPartseq(idxRel, leafOid);
-
-				/* read this leaf's columns by name (layout may differ from root) */
-				spanning_remap_keyatts_to_leaf(idxInfo, rootKeyAtts,
-											   parentOid, leafOid);
-
-				snapshot = GetTransactionSnapshot();
-				PushActiveSnapshot(snapshot);
-
-				slot = table_slot_create(leafRel, NULL);
-				scan = table_beginscan(leafRel, GetActiveSnapshot(), 0, NULL);
-
-				while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-				{
-					int			k;
-
-					FormIndexDatum(idxInfo, slot, NULL, values, isnull);
-
-					/* Trailing key column: this leaf's partseq. */
-					k = idxInfo->ii_NumIndexKeyAttrs - 1;
-					values[k] = Int32GetDatum(partseq);
-					isnull[k] = false;
-
-					/*
-					 * heapRelation = parentRel (the spanning root) is a
-					 * placeholder; nbtinsert keys its heap-liveness skip on the
-					 * index being spanning, and the real heap is resolved from
-					 * the partseq.  UNIQUE_CHECK_YES so pre-existing
-					 * cross-leaf duplicates are reported at attach time.
-					 */
-					index_insert(idxRel, values, isnull, &slot->tts_tid,
-								 parentRel, UNIQUE_CHECK_YES, false, idxInfo);
-				}
-
-				table_endscan(scan);
-				ExecDropSingleTupleTableSlot(slot);
+				PushActiveSnapshot(GetTransactionSnapshot());
+				spanning_backfill_leaf(idxRel, idxInfo, rootKeyAtts,
+									   parentOid, leafOid, parentRel);
 				PopActiveSnapshot();
-
-				/*
-				 * Reset the leaf's cached "has spanning ancestor" flag so the
-				 * executor maintenance hook fires for subsequent DML on it.
-				 */
-				CacheInvalidateRelcacheByRelid(leafOid);
-
-				table_close(leafRel, AccessShareLock);
 			}
 
 			index_close(idxRel, RowExclusiveLock);
@@ -739,8 +780,8 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 	 * Enumerate every storage-bearing leaf beneath this root, at any depth,
 	 * whether the tree is built from declarative partitions, table inheritance
 	 * (INHERITS), or a mix of both.  find_all_inheritors walks pg_inherits
-	 * recursively and returns the root plus all descendants; the relkind filter
-	 * in the loop below keeps only leaves that actually hold rows.
+	 * recursively and returns the root plus all descendants; spanning_backfill_leaf
+	 * skips the non-storage parents among them (only leaves actually hold rows).
 	 */
 	leafoids = find_all_inheritors(RelationGetRelid(rel), AccessShareLock, NULL);
 
@@ -756,87 +797,9 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 	foreach(lc, leafoids)
 	{
 		Oid			partOid = lfirst_oid(lc);
-		Relation	partRel;
-		TupleTableSlot *slot;
-		TableScanDesc scan;
-		Datum		values[INDEX_MAX_KEYS];
-		bool		isnull[INDEX_MAX_KEYS];
-		int32		partseq;
 
-		partRel = table_open(partOid, AccessShareLock);
-
-		/*
-		 * Only relations with physical storage are spanning leaves.  Skip every
-		 * intermediate parent the tree-walk returns: the declarative root,
-		 * sub-partitioned mid-level nodes, and abstract inheritance parents that
-		 * hold no rows of their own --- their rows (if any) are reached through
-		 * their own storage-bearing children.  This is what lets a single
-		 * spanning index cover table inheritance at the top with
-		 * partitioned/bucketed leaves below, at any depth.
-		 */
-		if (partRel->rd_rel->relkind != RELKIND_RELATION)
-		{
-			table_close(partRel, AccessShareLock);
-			continue;
-		}
-
-		/*
-		 * ProgreSQL C1: this partition's index-local partseq (get-or-allocate;
-		 * stable across rebuilds).  It is the trailing discriminator stored in
-		 * each spanning index entry below.
-		 */
-		partseq = SpanningGetOrAllocPartseq(idxRel, partOid);
-
-		/* read this leaf's columns by name (layout may differ from root) */
-		spanning_remap_keyatts_to_leaf(idxInfo, rootKeyAtts,
-									   RelationGetRelid(rel), partOid);
-
-		slot = table_slot_create(partRel, NULL);
-		scan = table_beginscan(partRel, GetActiveSnapshot(), 0, NULL);
-
-		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-		{
-			int			k;
-
-			FormIndexDatum(idxInfo, slot, NULL, values, isnull);
-
-			/*
-			 * The trailing key column is this partition's index-local
-			 * partseq, the stable discriminator that resolves back to the
-			 * partition via pg_index_partition.
-			 */
-			k = idxInfo->ii_NumIndexKeyAttrs - 1;
-			values[k] = Int32GetDatum(partseq);
-			isnull[k] = false;
-
-			/*
-			 * Pass rel (the partitioned root) as heapRelation, not partRel.
-			 * The root has rd_tableam == NULL, which signals nbtinsert.c to
-			 * skip the heap-liveness deletion passes (_bt_simpledel_pass and
-			 * _bt_bottomupdel_pass) that cannot safely process TIDs spread
-			 * across multiple partitions.
-			 */
-			index_insert(idxRel, values, isnull, &slot->tts_tid,
-						 rel, UNIQUE_CHECK_YES, false, idxInfo);
-		}
-
-		table_endscan(scan);
-		ExecDropSingleTupleTableSlot(slot);
-		table_close(partRel, AccessShareLock);
-
-		/*
-		 * Invalidate this leaf's relcache.  Adding a spanning index to an
-		 * already-populated partitioned table changes every leaf's hot-blocking
-		 * attribute set: the spanning key columns become HOT-blocking on the
-		 * leaf (progresql_add_spanning_hotblocking_attrs), so a spanning-key
-		 * UPDATE must be forced cold.  ALTER TABLE / CREATE INDEX invalidate the
-		 * partitioned root but not its leaves, so a backend that cached a leaf's
-		 * rd_hotblockingattr BEFORE this build would keep the stale (pre-spanning)
-		 * set, treat a spanning-key UPDATE as HOT, drop the spanning entry, and
-		 * silently break cross-partition uniqueness (#42).  Forcing a leaf
-		 * relcache rebuild on every backend closes that window.
-		 */
-		CacheInvalidateRelcacheByRelid(partOid);
+		spanning_backfill_leaf(idxRel, idxInfo, rootKeyAtts,
+							   RelationGetRelid(rel), partOid, rel);
 	}
 
 	list_free(leafoids);
