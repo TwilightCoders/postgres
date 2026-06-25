@@ -4,6 +4,24 @@ Changes ProgreSQL adds on top of stock PostgreSQL (`REL_18_STABLE`). Vanilla
 PostgreSQL behavior is unchanged unless a table opts in with the `GLOBAL` keyword.
 Newest first.
 
+## 2026-06-25
+
+### Fixed
+- **Rare hang in cross-partition uniqueness checks under concurrent partition
+  DDL.** When enforcing a `GLOBAL` unique/PK, `_bt_check_unique` opened a
+  conflicting candidate's (and the new tuple's) partition with a heavyweight
+  `AccessShareLock` while holding the index leaf's buffer content lock. If a
+  `DROP` / `DETACH` / `TRUNCATE` held that partition's `AccessExclusiveLock` while
+  inserts collided on its keys, the buffer content lock landed inside the wait
+  cycle — invisible to the deadlock detector — and could hang. The self side now
+  opens with `NoLock` (the executor already holds the partition's lock), and the
+  candidate side acquires the lock non-blocking (`ConditionalLockRelationOid`),
+  releasing the buffer and re-descending if a concurrent DDL holds it. (audit #2)
+
+### Changed
+- Internal: the ATTACH-time and CREATE-index-on-populated-root backfill paths now
+  share a single `spanning_backfill_leaf()` helper. No behavior change. (audit #9)
+
 ## 2026-06-22
 
 ### Added
