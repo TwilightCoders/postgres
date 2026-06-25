@@ -40,7 +40,7 @@ static BTStack _bt_search_insert(Relation rel, Relation heaprel,
 static TransactionId _bt_check_unique(Relation rel, BTInsertState insertstate,
 									  Relation heapRel,
 									  IndexUniqueCheck checkUnique, bool *is_unique,
-									  uint32 *speculativeToken);
+									  uint32 *speculativeToken, Oid *retryPartition);
 static OffsetNumber _bt_findinsertloc(Relation rel,
 									  BTInsertState insertstate,
 									  bool checkingunique,
@@ -276,9 +276,40 @@ search:
 	{
 		TransactionId xwait;
 		uint32		speculativeToken;
+		Oid			retryPartition;
 
 		xwait = _bt_check_unique(rel, &insertstate, heapRel, checkUnique,
-								 &is_unique, &speculativeToken);
+								 &is_unique, &speculativeToken, &retryPartition);
+
+		/*
+		 * ProgreSQL: _bt_check_unique needs a conflicting partition opened that
+		 * it could not lock without blocking under the leaf buffer content lock
+		 * (a concurrent DROP/DETACH holds that partition's AccessExclusiveLock).
+		 * Release the buffer and the spanning value lock -- as the xwait path
+		 * below does -- then take the partition lock here in the correct order
+		 * (heavyweight lock with no buffer content lock held) and re-descend.
+		 * The lock is kept for the rest of the insert so the retry's probe of
+		 * that partition succeeds, guaranteeing forward progress.  This closes
+		 * the lock-ordering inversion with no uniqueness impact: the conflicting
+		 * entry stays in the tree as the SnapshotDirty marker across the retry.
+		 */
+		if (unlikely(OidIsValid(retryPartition)))
+		{
+			_bt_relbuf(rel, insertstate.buf);
+			insertstate.buf = InvalidBuffer;
+
+			if (spanning_locked)
+			{
+				SpanningUnlockUserKey(&spanning_locktag);
+				spanning_locked = false;
+			}
+
+			LockRelationOid(retryPartition, AccessShareLock);
+
+			if (stack)
+				_bt_freestack(stack);
+			goto search;
+		}
 
 		if (unlikely(TransactionIdIsValid(xwait)))
 		{
@@ -528,7 +559,7 @@ _bt_search_insert(Relation rel, Relation heaprel, BTInsertState insertstate)
 static TransactionId
 _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				 IndexUniqueCheck checkUnique, bool *is_unique,
-				 uint32 *speculativeToken)
+				 uint32 *speculativeToken, Oid *retryPartition)
 {
 	IndexTuple	itup = insertstate->itup;
 	IndexTuple	curitup = NULL;
@@ -560,6 +591,13 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 
 	/* Assume unique until we find a duplicate */
 	*is_unique = true;
+
+	/*
+	 * ProgreSQL: cleared unless we need the caller to re-descend after taking a
+	 * conflicting partition's lock in the correct order (see the candidate-side
+	 * open below).
+	 */
+	*retryPartition = InvalidOid;
 
 	InitDirtySnapshot(SnapshotDirty);
 
@@ -723,38 +761,54 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 							if (OidIsValid(child_relid))
 							{
 								/*
-								 * Open the resolved partition defensively.  Cross-
-								 * backend safety rests on the partition-parent
-								 * AccessExclusiveLock: every path that removes a
-								 * partition takes it, while a spanning-maintaining
-								 * INSERT holds AccessShareLock on the root, so they
-								 * serialize and this syscache resolution cannot name
-								 * a relation that has already vanished.  Use
-								 * try_table_open rather than table_open so that if a
-								 * future path ever weakens that locking, we degrade to
-								 * a clean skip (treat as unresolved) instead of an
-								 * elog/crash on the storage-less root.
+								 * Probe the resolved conflicting partition's heap.
+								 * Acquire its AccessShareLock CONDITIONALLY: when it is
+								 * free we take it without blocking -- so no heavyweight
+								 * lock is ever waited for while the leaf buffer content
+								 * lock is held -- and open the relation with NoLock,
+								 * which is assert-safe now that we hold the lock.
+								 * try_table_open still returns NULL on a vanished relid,
+								 * preserving the defensive degrade to "unresolved" if the
+								 * partition-removal invariant is ever weakened.
 								 *
-								 * Lock-ordering note: this AccessShareLock on the
-								 * conflicting partition is taken while the spanning leaf
-								 * buffer content lock is held.  A concurrent DROP/DETACH
-								 * of that partition holds its AccessExclusiveLock, so
-								 * this open can block under the content lock -- but the
-								 * 2-party race is safe: the DDL also needs the root's
-								 * AccessExclusiveLock, which this INSERT's root
-								 * AccessShareLock holds, so they serialize at the root or
-								 * deadlock-and-abort (no uniqueness/correctness impact).
-								 * A narrow residual liveness window (a third backend
-								 * waiting on the held leaf page during the DDL's lock
-								 * wait) is left for a future change to close by releasing
-								 * the buffer before waiting on the partition lock and
-								 * re-descending, as the conflict-wait path already does.
+								 * If the conditional acquire fails, a concurrent
+								 * DROP/DETACH holds the partition's AccessExclusiveLock
+								 * (and is itself blocked behind this INSERT's root
+								 * AccessShareLock, by that same invariant).  Blocking on
+								 * it here would pin the leaf buffer for the whole wait --
+								 * the latency residual this restructure closes.  Instead
+								 * signal the caller (via *retryPartition) to release the
+								 * buffer and the spanning value lock and re-descend after
+								 * taking the partition lock in the correct order.
 								 */
-								spanChildRel = try_table_open(child_relid, AccessShareLock);
-								if (spanChildRel != NULL)
-									checkRel = spanChildRel;
+								if (ConditionalLockRelationOid(child_relid,
+															   AccessShareLock))
+								{
+									spanChildRel = try_table_open(child_relid, NoLock);
+									if (spanChildRel != NULL)
+										checkRel = spanChildRel;
+									else
+									{
+										/* vanished despite the invariant: drop lock, skip */
+										UnlockRelationOid(child_relid, AccessShareLock);
+										span_unresolved = true;
+									}
+								}
 								else
-									span_unresolved = true;
+								{
+									*retryPartition = child_relid;
+									if (nbuf != InvalidBuffer)
+										_bt_relbuf(rel, nbuf);
+									/*
+									 * The caller re-descends (goto search), so the
+									 * binary-search bounds cached during this check
+									 * must be invalidated -- exactly as the xwait
+									 * return below does.
+									 */
+									insertstate->bounds_valid = false;
+									itup_key->keysz = saved_keysz;
+									return InvalidTransactionId;
+								}
 							}
 							else
 							{
@@ -874,18 +928,19 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 										SpanningResolvePartseqRelid(rel, partseq);
 
 									/*
-									 * Open defensively, matching the candidate-side
-									 * open above: degrade to "treat self as live"
-									 * rather than table_open a vanished rel or probe
-									 * the storage-less root if a future weakening of
-									 * partition-removal locking ever resolves this to
-									 * a gone partition.  self_relid is the partition
-									 * THIS insert just wrote and is maintaining, so it
-									 * is guaranteed live today.
+									 * self_relid is the partition THIS insert is
+									 * writing, so we already hold RowExclusiveLock on it
+									 * (or AccessShareLock when backfilling): it cannot
+									 * vanish under us and is guaranteed live.  Open with
+									 * NoLock -- assert-safe given that already-held lock,
+									 * and taking no fresh heavyweight lock under the
+									 * buffer content lock.  try_table_open still degrades
+									 * to "treat self as live" on the impossible vanished
+									 * case.
 									 */
 									if (OidIsValid(self_relid))
 									{
-										selfChildRel = try_table_open(self_relid, AccessShareLock);
+										selfChildRel = try_table_open(self_relid, NoLock);
 										if (selfChildRel != NULL)
 											selfCheckRel = selfChildRel;
 										else
@@ -911,14 +966,14 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 								 * continue searching.
 								 */
 								if (selfChildRel)
-									table_close(selfChildRel, AccessShareLock);
+									table_close(selfChildRel, NoLock);
 								if (spanChildRel)
 									table_close(spanChildRel, AccessShareLock);
 								break;
 							}
 
 							if (selfChildRel)
-								table_close(selfChildRel, AccessShareLock);
+								table_close(selfChildRel, NoLock);
 						}
 
 						/*
