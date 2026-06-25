@@ -4,7 +4,18 @@ Changes ProgreSQL adds on top of stock PostgreSQL (`REL_18_STABLE`). Vanilla
 PostgreSQL behavior is unchanged unless a table opts in with the `GLOBAL` keyword.
 Newest first.
 
-## 2026-06-25
+## 2026-06-25 (v18.3-0.2.3)
+
+### Changed
+- **`progresql_version()` now returns the fork *release* version** (`'0.2.3'`,
+  matching the `v18.3-X.Y.Z` tag) instead of a separate, hand-maintained
+  "feature-set" number that had silently stayed at `'1.0'` across several feature
+  releases. There is now one coherent fork version that can't drift from the
+  tag / tap / image: clients still fork-detect (the function exists at all) and
+  now version-gate on a number that actually moves (e.g. `>= '0.2.0'`). The
+  `progresql_global` regress test pins the value so future changes stay visible.
+
+## 2026-06-25 (v18.3-0.2.2)
 
 ### Fixed
 - **Rare hang in cross-partition uniqueness checks under concurrent partition

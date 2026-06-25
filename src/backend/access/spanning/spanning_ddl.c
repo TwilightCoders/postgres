@@ -50,12 +50,14 @@
 /*
  * progresql_version
  *
- * SQL-callable fork identity + feature-set version.  This is the supported
- * public hook for client tooling (e.g. an ORM adapter) to
+ * SQL-callable fork identity + version.  Returns the fork RELEASE version (the
+ * X.Y.Z in the v18.3-X.Y.Z tag), not a separate number -- so it matches the tag,
+ * tap, and image, and can't drift from them.  The supported public hook for
+ * client tooling (e.g. an ORM adapter) to
  * (a) detect that the server is the ProgreSQL fork rather than vanilla
  * PostgreSQL -- the underlying server_version reports plain "18.3" either way --
- * via `to_regproc('progresql_version') IS NOT NULL`, and (b) gate features and
- * specs on the returned feature-set version as the fork evolves.
+ * via `to_regproc('progresql_version') IS NOT NULL`, and (b) version-gate
+ * features on the returned release version (e.g. `>= '0.2.0'`) as the fork evolves.
  */
 PG_FUNCTION_INFO_V1(progresql_version);
 Datum

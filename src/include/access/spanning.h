@@ -21,12 +21,20 @@
 #include "utils/relcache.h"
 
 /*
- * ProgreSQL fork feature-set version, independent of the underlying PostgreSQL
- * version (which reports plain "18.3").  Exposed to SQL via the built-in
- * progresql_version() -- the supported hook for fork detection + feature
- * gating by client tooling (e.g. an ORM adapter).
+ * ProgreSQL fork release version -- the X.Y.Z that follows the PostgreSQL base
+ * in the release tag (v18.3-X.Y.Z), independent of the PostgreSQL base version
+ * itself (server_version reports that as plain "18.3").  Exposed to SQL via the
+ * built-in progresql_version() -- the supported hook for client tooling (e.g.
+ * an ORM adapter) to detect the fork and version-gate features.
+ *
+ * This is the one in-tree source of truth for the fork version; bump it in
+ * lockstep with the release tag (it is part of cutting a release, alongside the
+ * CHANGELOG/tag/formula/image), and the progresql_global regress test pins it so
+ * a change is always visible in the diff.  (Earlier this was a decoupled
+ * "feature-set" number that silently stayed at "1.0" across several feature
+ * releases -- tying it to the release version is what stops that drift.)
  */
-#define PROGRESQL_VERSION_STR "1.0"
+#define PROGRESQL_VERSION_STR "0.2.3"
 
 extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 										  ItemPointer tupleid,
