@@ -1,16 +1,41 @@
-# C3 — Audit item #2: `_bt_check_unique` lock-ordering restructure (design)
+# C3 — Audit item #2: `_bt_check_unique` lock-ordering restructure
 
-> Status: **DESIGN ONLY — not implemented.** The current code is documented-safe
-> (deadlock-free, no correctness impact); the only residual is a narrow latency
-> window. This restructure touches the hottest correctness path in the fork, so
-> it is deliberately gated on a focused, reviewed session with the empirical
-> repro + soak called for at the bottom — not an unattended change.
+> Status: **IMPLEMENTED 2026-06-25** — commit `28d1ba9993`. The sections below are
+> the original design rationale; two things changed in the build:
 >
-> Companion to the in-code "Lock-ordering note" at
-> `src/backend/access/nbtree/nbtinsert.c` (candidate-side open) and the `C1` row
-> in `C3-spanning-bug-hunt-findings.md` ("VERIFIED SAFE — serialized by the
-> partition-parent AccessExclusiveLock vs the INSERT's AccessShareLock on the
-> root").
+> 1. **Severity was understated.** The pre-fix inversion is not "latency-only":
+>    under concurrent partition-AEL DDL racing cross-partition inserts it puts an
+>    LWLock (the buffer content lock) in the wait cycle, which the deadlock
+>    detector cannot see — an **undetected HANG**. Reproduced with a stress
+>    (churners holding each partition's AccessExclusiveLock while inserters
+>    collide cross-partition); the old code flakily hangs there. So #2 fixes a
+>    real (rare) availability bug, not just polish.
+> 2. **The shipped fix is a blend of A and B, not pure A.** Pure `NoLock`
+>    (Option A) is only valid on the **self** side, where the executor already
+>    holds the insert-target partition's lock (`relation_open`'s
+>    `CheckRelationLockedByMe(AccessShareLock)` assertion is satisfied). On the
+>    **candidate** side we generally do NOT hold the conflicting partition's lock,
+>    so pure `NoLock` trips that assertion. Shipped instead:
+>    - **Self side** → `NoLock` open (assert-safe; the self partition is live).
+>    - **Candidate side** → `ConditionalLockRelationOid` (non-blocking, so no wait
+>      under the buffer lock) + `NoLock` open on success; on failure, signal the
+>      caller (`*retryPartition`) to release the buffer + value lock and
+>      re-descend after taking the partition lock in correct order — the Option B
+>      retry, reusing the `xwait` machinery.
+>
+> Bug found + fixed during validation: the retry-return must invalidate the
+> cached binary-search bounds (`insertstate->bounds_valid = false`) before the
+> caller re-descends, exactly as the `xwait` return does; omitting it tripped
+> `Assert("!insertstate->bounds_valid")` in `_bt_search_insert` under the stress.
+>
+> Validated (cassert + amcheck): regression 243/243, isolation 123/123 (incl.
+> `spanning-detach-concurrent`), the partition-AEL retry stress ×4 (no hang, no
+> assertion, 0 dups, amcheck OK), and the `--defer-vacuum --ddl-churn` soak
+> (1.64M txns, 571 DDL cycles, 0 dups, amcheck OK, 0 deadlocks/crashes).
+>
+> Companion to the (now-rewritten) in-code note at
+> `src/backend/access/nbtree/nbtinsert.c` and the `C1` row in
+> `C3-spanning-bug-hunt-findings.md`.
 
 ## The finding
 

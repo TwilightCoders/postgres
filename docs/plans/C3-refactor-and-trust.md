@@ -91,10 +91,20 @@ PG-Core-credibility number and a named flag-drop criterion. Feature cost (GLOBAL
 local PK, uncontended): −10.7%/−48.5%/−35.5% at c=1/8/32 (value-lock + descend-twice
 overhead, paid only when used).
 
-Remaining for the flag (unchanged, all user-gated or design-gated): outside review;
-the C2 perf-default flip decision; the **contended-key-space** perf number (needs
+**Audit #2 — DONE (`28d1ba9993`).** The `_bt_check_unique` lock-ordering inversion
+is fixed: self-side `NoLock` open + candidate-side `ConditionalLockRelationOid` +
+release-and-redescend (the `xwait` retry). The stress that drove it out (churners
+holding each partition's AccessExclusiveLock while inserters collide
+cross-partition) showed the **pre-fix code flakily HANGS** — an undetected LWLock
+deadlock, so the old "latency-only residual" framing understated it; #2 fixes a
+real availability bug. Validated cassert+amcheck: regress 243/243, isolation
+123/123, retry stress ×4 (no hang/assert/dups), `--ddl-churn` soak (1.64M txns,
+571 cycles, 0 dups, amcheck OK). See `C3-item2-btcheck-lockorder-design.md`.
+
+Remaining for the flag (all user-gated or design-gated): outside review; the C2
+perf-default flip decision; and the **contended-key-space** perf number (needs
 `spanning_bench.sh` to expose `--idspace` + careful workload design — a naive small
-idspace just measures conflict-abort throughput); and audit #2 implementation.
+idspace just measures conflict-abort throughput).
 
 ### PROGRESS 2026-06-13 (deferred-path scale-soak PASS; HEAD re-verified green)
 The perf-default staircase advanced and the committed tree was re-verified after
