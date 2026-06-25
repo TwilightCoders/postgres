@@ -1,0 +1,61 @@
+Parsed test spec with 3 sessions
+
+starting permutation: det ins_b show
+step det: ALTER TABLE spans DETACH PARTITION spans_a CONCURRENTLY;
+step ins_b: INSERT INTO spans VALUES (1, '2025-06-01');
+step show: SELECT tableoid::regclass AS part, id FROM spans ORDER BY id, part;
+           SELECT relpartbound IS NULL AS spans_a_detached
+             FROM pg_class WHERE relname = 'spans_a';
+part   |id
+-------+--
+spans_b| 1
+(1 row)
+
+spans_a_detached
+----------------
+t               
+(1 row)
+
+
+starting permutation: ins_b det show
+step ins_b: INSERT INTO spans VALUES (1, '2025-06-01');
+ERROR:  duplicate key value violates unique constraint "spans_pkey"
+step det: ALTER TABLE spans DETACH PARTITION spans_a CONCURRENTLY;
+step show: SELECT tableoid::regclass AS part, id FROM spans ORDER BY id, part;
+           SELECT relpartbound IS NULL AS spans_a_detached
+             FROM pg_class WHERE relname = 'spans_a';
+part|id
+----+--
+(0 rows)
+
+spans_a_detached
+----------------
+t               
+(1 row)
+
+
+starting permutation: s1b s1read det s1c ins_b show
+step s1b: BEGIN;
+step s1read: SELECT count(*) FROM spans;
+count
+-----
+    1
+(1 row)
+
+step det: ALTER TABLE spans DETACH PARTITION spans_a CONCURRENTLY; <waiting ...>
+step s1c: COMMIT;
+step det: <... completed>
+step ins_b: INSERT INTO spans VALUES (1, '2025-06-01');
+step show: SELECT tableoid::regclass AS part, id FROM spans ORDER BY id, part;
+           SELECT relpartbound IS NULL AS spans_a_detached
+             FROM pg_class WHERE relname = 'spans_a';
+part   |id
+-------+--
+spans_b| 1
+(1 row)
+
+spans_a_detached
+----------------
+t               
+(1 row)
+
