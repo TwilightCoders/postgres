@@ -76,6 +76,12 @@ documented-safe, latency-only residual).
   pg_upgrade (14), recovery crash incl. INHERITS (27), logical replication incl.
   INHERITS (14). The integration surfaces that exercise backfill via
   dump/restore/upgrade/inherit are green.
+- new isolation spec **`spanning-detach-concurrent`** (`258c642024`): closes the
+  long-standing gap "DETACH … CONCURRENTLY: path verified by lock analysis, lacks
+  an empirical spec". 3 permutations confirm the detached partition's global key
+  stays enforced until the concurrent detach completes, then is freed exactly once
+  (retirement-on-concurrent-detach; enforced-while-attached; wait-then-complete).
+  Deterministic; passes alongside spanning-{unique,detach,relcache} (now 4/4).
 
 **Perf baseline (`spanning_bench.sh`, optimized fork vs vanilla 18.3) — see
 `C3-perf-baseline-2026-06-24.md`.** Do-no-harm: TPC-B and partitioned-local-PK
