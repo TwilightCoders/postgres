@@ -51,6 +51,45 @@ HARD one — do it as a FOCUSED pass, AFTER (B) testing exists as the net:
 
 ## (B) Trust-testing — what drops the README flag
 
+### PROGRESS 2026-06-24 (perf baseline measured; full validation matrix green on HEAD+#9)
+Autonomous overnight pass on november. The refactor-audit tail was closed and the
+**"scale-test / perf" flag-drop criterion now has data**.
+
+**Audit #9 (DRY: shared `spanning_backfill_leaf()` helper) — DONE + validated to
+release bar.** Commit `09bb6b4f60`. Folded the two near-identical per-leaf backfill
+loops (ATTACH backfill + CREATE-index-on-populated build) into one helper, −37
+lines, behavior-preserving. Independently re-reviewed for behavior-equivalence
+(EQUIVALENT: snapshot discipline, push/pop balance, heapRel/rootOid threading,
+relkind filter, resource pairing all verified). **Audit #2** (the `_bt_check_unique`
+heavyweight-lock-under-buffer-content-lock at the two spanning probe sites) is
+**designed, not coded** — see `C3-item2-btcheck-lockorder-design.md`; deliberately
+gated on a reviewed session (hottest correctness path; current state is
+documented-safe, latency-only residual).
+
+**Full validation matrix (cassert + amcheck, HEAD `b033a35545` + #9 overlay):**
+- regression **243/243**, isolation **122/122** (incl. progresql_inherit — both
+  backfill paths — and spanning-{unique,detach,relcache}).
+- soak `--defer-vacuum --ddl-churn --secs 900`: **1.74M txns, 569 DDL drop/recreate
+  cycles, duplicate ids=0 / tags=0, amcheck st_pkey+st_tag_key OK, 0 deadlocks/0
+  crashes → PASS**.
+- spanning TAP **69/69 across 4 integration suites**: pg_dump roundtrip (14),
+  pg_upgrade (14), recovery crash incl. INHERITS (27), logical replication incl.
+  INHERITS (14). The integration surfaces that exercise backfill via
+  dump/restore/upgrade/inherit are green.
+
+**Perf baseline (`spanning_bench.sh`, optimized fork vs vanilla 18.3) — see
+`C3-perf-baseline-2026-06-24.md`.** Do-no-harm: TPC-B and partitioned-local-PK
+insert are within measurement noise of vanilla (−0.3%..+1.7%, identical at c=32) —
+**the fork is free when the spanning feature is unused**, which is the core
+PG-Core-credibility number and a named flag-drop criterion. Feature cost (GLOBAL vs
+local PK, uncontended): −10.7%/−48.5%/−35.5% at c=1/8/32 (value-lock + descend-twice
+overhead, paid only when used).
+
+Remaining for the flag (unchanged, all user-gated or design-gated): outside review;
+the C2 perf-default flip decision; the **contended-key-space** perf number (needs
+`spanning_bench.sh` to expose `--idspace` + careful workload design — a naive small
+idspace just measures conflict-abort throughput); and audit #2 implementation.
+
 ### PROGRESS 2026-06-13 (deferred-path scale-soak PASS; HEAD re-verified green)
 The perf-default staircase advanced and the committed tree was re-verified after
 the perf-flag struct change.
