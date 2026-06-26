@@ -4,6 +4,23 @@ Changes ProgreSQL adds on top of stock PostgreSQL (`REL_18_STABLE`). Vanilla
 PostgreSQL behavior is unchanged unless a table opts in with the `GLOBAL` keyword.
 Newest first.
 
+## 2026-06-25 (v18.3-0.2.4)
+
+### Fixed
+- **A `FOREIGN KEY` referencing a spanning (`GLOBAL`) inheritance root failed to
+  validate when the referencing table already held rows**, which broke
+  `pg_dump` → restore: a restore loads the data first and *then* re-adds the
+  foreign keys, and that bulk re-validation rejected every referencing row. The
+  spanning rule "descend into the leaves rather than scanning `ONLY` the root"
+  had been applied to the per-row referential checks (`RI_FKey_check`,
+  `ri_Check_Pk_Match`) but not to `RI_Initial_Check`, the bulk validator that
+  `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` runs. It now descends into the
+  leaves there too, so adding such a key to a populated table — and the full
+  dump → restore round-trip — succeeds. Cross-leaf FK cloning was confirmed
+  deterministic and order-independent in the process. Pinned by a new `pg_dump`
+  round-trip case (`006_spanning_roundtrip.pl`) and a determinism regress test
+  (`progresql_fk_clone`).
+
 ## 2026-06-25 (v18.3-0.2.3)
 
 ### Changed

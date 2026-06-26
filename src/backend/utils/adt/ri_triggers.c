@@ -1631,7 +1631,14 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	quoteRelationName(fkrelname, fk_rel);
 	fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
 		"" : "ONLY ";
-	pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+	/*
+	 * A spanning (GLOBAL) referenced key lives on an inheritance/partition
+	 * root whose matching rows are in the leaves, so the validation scan must
+	 * descend into them -- ONLY would see just the (often empty) root heap and
+	 * spuriously reject every referencing row.  Mirrors RI_FKey_check.
+	 */
+	pk_only = (pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			   RelationHasSpanningIndex(pk_rel)) ?
 		"" : "ONLY ";
 	appendStringInfo(&querybuf,
 					 " FROM %s%s fk LEFT OUTER JOIN %s%s pk ON",

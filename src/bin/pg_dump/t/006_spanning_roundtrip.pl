@@ -7,6 +7,15 @@
 # cross-partition uniqueness.  A regression here is the one real silent
 # data-loss path: a leaked discriminator restores as a plain index and quietly
 # drops cross-partition uniqueness.
+#
+# It also covers a FOREIGN KEY that references a spanning INHERITS root, which is
+# enforced by cloning the constraint once per leaf plus a base constraint on the
+# root.  pg_dump must emit ONLY the base FK (the clones are derived); restore
+# must re-clone to the IDENTICAL fanout.  That round-trip determinism is what an
+# earlier investigation mis-read as "the same base FK produced different clone
+# counts" -- it was two different schemas, not non-determinism.  The in-process
+# determinism is pinned in regress/sql/progresql_fk_clone.sql; this is the half
+# that needs a real dump/restore.
 
 use strict;
 use warnings FATAL => 'all';
@@ -38,7 +47,25 @@ CREATE TABLE tag_a PARTITION OF tag FOR VALUES FROM ('2024-01-01') TO ('2025-01-
 CREATE TABLE tag_b PARTITION OF tag FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 CREATE UNIQUE INDEX tag_label_uq ON tag (label) GLOBAL;
 INSERT INTO tag VALUES (1, 'x', '2024-03-01'), (2, 'y', '2025-03-01');
+
+-- A FOREIGN KEY referencing a spanning INHERITS root.  node has two leaves, so
+-- the FK is enforced by a base constraint (-> node) plus one clone per leaf
+-- (-> node_a, -> node_b): fanout == 3.  pg_dump must emit only the base FK.
+CREATE TABLE node (id bigint NOT NULL, ts timestamptz NOT NULL);
+CREATE TABLE node_a () INHERITS (node);
+CREATE TABLE node_b () INHERITS (node);
+CREATE UNIQUE INDEX node_id_g ON node (id) GLOBAL;
+INSERT INTO node_a VALUES (10, '2024-01-01');
+INSERT INTO node_b VALUES (11, '2025-01-01');
+CREATE TABLE noderef (rid int PRIMARY KEY,
+    nid bigint REFERENCES node(id) ON DELETE CASCADE);
+INSERT INTO noderef VALUES (1, 10), (2, 11);
 SQL
+
+# the source fans the FK out to base + one clone per leaf (3)
+is( $src->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conname LIKE 'noderef_nid_fkey%'}),
+	'3', 'source: FK over spanning inheritance root fans out to base + one clone per leaf');
 
 # 1. plain-text dump and inspect the emitted SQL
 my $plain = "$tempdir/plain.sql";
@@ -53,6 +80,15 @@ unlike($txt, qr/\bpartseq\b/,
 	'dump does not leak the internal partseq discriminator column');
 unlike($txt, qr/PRIMARY KEY \(id, tableoid\)/,
 	'dump does not leak a tableoid discriminator into the key list');
+
+# the FK over a spanning inheritance root is dumped as exactly ONE base FK
+# (referencing the root); the per-leaf clones are derived and must NOT be dumped
+# independently, or restore would double them.
+my @fk_base = ($txt =~ /FOREIGN KEY \(nid\) REFERENCES (?:public\.)?node\(id\)/g);
+is(scalar @fk_base, 1,
+	'FK over a spanning inheritance root is dumped as exactly one base constraint');
+unlike($txt, qr/FOREIGN KEY \(nid\) REFERENCES (?:public\.)?node_[ab]\b/,
+	'dump does not emit the per-leaf FK clones (they are derived)');
 
 # 2. restore into a fresh cluster
 my $dst = PostgreSQL::Test::Cluster->new('dst');
@@ -82,6 +118,16 @@ like($err, qr/duplicate key value/,
 ($rc, $out, $err) = $dst->psql('postgres',
 	q{INSERT INTO tag VALUES (3, 'x', '2025-07-01')});
 isnt($rc, 0, 'cross-partition duplicate UNIQUE rejected after restore');
+
+# the FK re-clones to the IDENTICAL fanout after restore (3), not a different
+# count -- the round-trip determinism, proven across a real dump/restore.
+is( $dst->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conname LIKE 'noderef_nid_fkey%'}),
+	'3', 'FK over spanning inheritance root re-clones to the identical fanout after restore');
+($rc, $out, $err) = $dst->psql('postgres',
+	q{INSERT INTO noderef VALUES (3, 88888)});
+isnt($rc, 0,
+	'restored FK over spanning inheritance root still rejects a missing parent');
 
 # 5. custom-format dump + pg_restore round-trip enforces uniqueness too
 my $custom = "$tempdir/custom.dump";

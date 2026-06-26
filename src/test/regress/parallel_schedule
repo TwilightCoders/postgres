@@ -134,6 +134,9 @@ test: progresql_fk
 # progresql_inherit runs serially: it queries the global pg_index_partition
 # catalog (partseq counts) and uses common table names.
 test: progresql_inherit
+# progresql_fk_clone runs serially: it counts FK constraints over inheritance
+# leaves and queries pg_index_partition, so keep it off the shared group.
+test: progresql_fk_clone
 test: progresql_dumpdef
 
 # ----------
