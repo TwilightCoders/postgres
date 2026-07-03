@@ -48,6 +48,7 @@ tests += {
       # unique IDs before any upstream submission (see PRODUCTION_READINESS.md).
       't/031_spanning.pl',
       't/032_spanning_inherit.pl',
+      't/033_spanning_conflict.pl',
     ],
   },
 }

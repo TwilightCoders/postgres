@@ -34,12 +34,30 @@
  * "feature-set" number that silently stayed at "1.0" across several feature
  * releases -- tying it to the release version is what stops that drift.)
  */
-#define PROGRESQL_VERSION_STR "0.2.4"
+#define PROGRESQL_VERSION_STR "0.2.5"
 
 extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 										  ItemPointer tupleid,
 										  Relation partition,
 										  EState *estate);
+
+/*
+ * Apply-worker variant: maintain the spanning indexes for a replicated
+ * INSERT / cold UPDATE, but on a cross-partition uniqueness conflict do NOT
+ * raise a raw violation -- detect it (non-blocking) and return the conflicting
+ * local tuple so the caller can classify it through logical-replication conflict
+ * detection (confl_insert_exists / confl_update_exists) instead of an opaque,
+ * retry-looping apply_error.  Returns true and fills *conflictIndex /
+ * *conflictSlot when a live cross-partition duplicate exists; the caller is
+ * expected to report it at ERROR (the ensuing abort releases the slot and the
+ * leaf it was fetched from).  Returns false (indexes maintained) otherwise.
+ */
+extern bool ExecInsertSpanningIndexTuplesApply(TupleTableSlot *slot,
+											   ItemPointer tupleid,
+											   Relation partition,
+											   EState *estate,
+											   Oid *conflictIndex,
+											   TupleTableSlot **conflictSlot);
 extern void ProgresqlReleasePartitionCache(EState *estate);
 
 /*

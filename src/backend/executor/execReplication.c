@@ -632,11 +632,31 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 		 * ProgreSQL: the apply worker writes through this simple path, not
 		 * ExecInsert, so it must maintain any spanning (GLOBAL) index on the
 		 * partitioned root itself -- otherwise a subscriber silently admits
-		 * cross-partition duplicates.  A cross-partition conflict raises a
-		 * unique violation, same as the local executor.
+		 * cross-partition duplicates.  A cross-partition uniqueness conflict is
+		 * classified and reported through conflict detection (CT_INSERT_EXISTS),
+		 * the same as an ordinary unique index, rather than raised as an opaque
+		 * apply error the apply worker cannot classify or resolve.
 		 */
 		if (RelationHasSpanningAncestor(rel))
-			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid, rel, estate);
+		{
+			Oid				conflictIndex;
+			TupleTableSlot *conflictSlot;
+
+			if (ExecInsertSpanningIndexTuplesApply(slot, &slot->tts_tid, rel,
+												   estate, &conflictIndex,
+												   &conflictSlot))
+			{
+				ConflictTupleInfo *conflicttuple = palloc0_object(ConflictTupleInfo);
+
+				conflicttuple->slot = conflictSlot;
+				conflicttuple->indexoid = conflictIndex;
+				GetTupleTransactionInfo(conflictSlot, &conflicttuple->xmin,
+										&conflicttuple->origin, &conflicttuple->ts);
+				ReportApplyConflict(estate, resultRelInfo, ERROR,
+									CT_INSERT_EXISTS, NULL, slot,
+									list_make1(conflicttuple));
+			}
+		}
 
 		/* AFTER ROW INSERT Triggers */
 		ExecARInsertTriggers(estate, resultRelInfo, slot,
@@ -731,10 +751,30 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 		 * (TU_None/TU_Summarizing) leaves the existing entry valid; a cold
 		 * update (TU_All) relocates the tuple to a fresh root, so a new spanning
 		 * entry for the new TID is required or the apply worker loses the row
-		 * from the spanning index (silent cross-partition duplicates).
+		 * from the spanning index (silent cross-partition duplicates).  A
+		 * cross-partition conflict introduced by the update is classified and
+		 * reported (CT_UPDATE_EXISTS) rather than raised as an opaque apply error.
 		 */
 		if (RelationHasSpanningAncestor(rel) && update_indexes == TU_All)
-			ExecInsertSpanningIndexTuples(slot, &slot->tts_tid, rel, estate);
+		{
+			Oid				conflictIndex;
+			TupleTableSlot *conflictSlot;
+
+			if (ExecInsertSpanningIndexTuplesApply(slot, &slot->tts_tid, rel,
+												   estate, &conflictIndex,
+												   &conflictSlot))
+			{
+				ConflictTupleInfo *conflicttuple = palloc0_object(ConflictTupleInfo);
+
+				conflicttuple->slot = conflictSlot;
+				conflicttuple->indexoid = conflictIndex;
+				GetTupleTransactionInfo(conflictSlot, &conflicttuple->xmin,
+										&conflicttuple->origin, &conflicttuple->ts);
+				ReportApplyConflict(estate, resultRelInfo, ERROR,
+									CT_UPDATE_EXISTS, searchslot, slot,
+									list_make1(conflicttuple));
+			}
+		}
 
 		/* AFTER ROW UPDATE Triggers */
 		ExecARUpdateTriggers(estate, resultRelInfo,

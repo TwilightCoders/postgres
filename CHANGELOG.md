@@ -4,6 +4,26 @@ Changes ProgreSQL adds on top of stock PostgreSQL (`REL_18_STABLE`). Vanilla
 PostgreSQL behavior is unchanged unless a table opts in with the `GLOBAL` keyword.
 Newest first.
 
+## 2026-07-03 (v18.3-0.2.5)
+
+### Fixed
+- **A cross-partition (spanning / `GLOBAL`) uniqueness conflict hit by the
+  logical-replication apply worker is now classified as a conflict**
+  (`confl_insert_exists` / `confl_update_exists` in
+  `pg_stat_subscription_stats`), the same as an ordinary unique index — instead
+  of being raised as a raw, unclassified `apply_error` that the worker retried
+  forever. A spanning leaf has no local unique index, so uniqueness is enforced
+  only by the spanning index on the partitioned root, which the apply worker
+  maintains out-of-band; that path previously raised a bare violation *outside*
+  `CheckAndReportConflict`, so the conflict never reached PG 18's conflict
+  detection (every `confl_*` counter stayed 0) and was neither observable nor
+  resolvable. The apply worker now maintains the spanning index with a
+  non-blocking `UNIQUE_CHECK_PARTIAL` and, on a flagged conflict, resolves the
+  conflicting cross-partition tuple (by the stored `partseq`) and reports it
+  through the normal conflict path. The local-executor path is unchanged (a
+  direct duplicate still raises immediately). Only affects tables with a spanning
+  index under logical replication; pinned by `033_spanning_conflict.pl`.
+
 ## 2026-06-25 (v18.3-0.2.4)
 
 ### Fixed

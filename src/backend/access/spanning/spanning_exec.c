@@ -307,3 +307,170 @@ ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 					 se->indexInfo);
 	}
 }
+
+/*
+ * spanning_probe_conflict
+ *		Find a live tuple, in a partition OTHER than (myPartseq, myTid), whose
+ *		user key equals the just-written row's -- the cross-partition duplicate
+ *		that stock per-leaf uniqueness cannot see.  Returns a materialized slot
+ *		holding that conflicting local tuple (with its leaf left open, released
+ *		by the caller's ensuing abort), or NULL if the UNIQUE_CHECK_PARTIAL flag
+ *		was a false alarm (the other side aborted / was vacuumed away).
+ *
+ *		The root carries no table AM, so we scan TID-only and fetch each
+ *		candidate from its own leaf, reading the stored partseq out of the index
+ *		tuple to resolve which leaf owns it -- exactly as _bt_check_unique does
+ *		on the raising path.
+ */
+static TupleTableSlot *
+spanning_probe_conflict(ProgresqlSpanningEntry *se, EState *estate,
+						Datum *values, bool *isnull,
+						int32 myPartseq, ItemPointer myTid)
+{
+	Relation		idxRel = se->indexRel;
+	Relation		rootRel = se->parentRel;
+	IndexInfo	   *ii = se->indexInfo;
+	int				nuniqs = se->discrimKeyPos;		/* user cols precede partseq */
+	ScanKeyData		scankeys[INDEX_MAX_KEYS];
+	IndexScanDesc	scan;
+	ItemPointer		tid;
+	TupleTableSlot *result = NULL;
+
+	/* A NULL in any user-key column is distinct under standard UNIQUE rules. */
+	for (int i = 0; i < nuniqs; i++)
+		if (isnull[i])
+			return NULL;
+
+	/*
+	 * The equality operators/strategies for the scan keys live in the unique
+	 * index info, which BuildIndexInfo does not populate; build it once (the
+	 * probe is only reached on a flagged conflict, so this is off the hot path).
+	 */
+	if (ii->ii_UniqueOps == NULL)
+		BuildSpeculativeIndexInfo(idxRel, ii);
+
+	for (int i = 0; i < nuniqs; i++)
+		ScanKeyEntryInitialize(&scankeys[i], 0, i + 1,
+							   ii->ii_UniqueStrats[i], InvalidOid,
+							   idxRel->rd_indcollation[i],
+							   ii->ii_UniqueProcs[i], values[i]);
+
+	scan = index_beginscan(rootRel, idxRel, SnapshotAny, NULL, nuniqs, 0);
+	scan->xs_want_itup = true;		/* we need the stored partseq */
+	index_rescan(scan, scankeys, nuniqs, NULL, 0);
+
+	while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
+	{
+		bool			seqnull;
+		Datum			seqval;
+		int32			partseq;
+		Oid				leafOid;
+		Relation		leafRel;
+		TupleTableSlot *cslot;
+
+		seqval = index_getattr(scan->xs_itup, se->discrimKeyPos + 1,
+							   RelationGetDescr(idxRel), &seqnull);
+		if (seqnull)
+			continue;
+		partseq = DatumGetInt32(seqval);
+
+		/* The entry we just wrote for this very row is not a conflict. */
+		if (partseq == myPartseq && ItemPointerEquals(tid, myTid))
+			continue;
+
+		leafOid = SpanningResolvePartseqRelid(idxRel, partseq);
+		if (!OidIsValid(leafOid))
+			continue;			/* partition detached out from under us */
+
+		leafRel = table_open(leafOid, AccessShareLock);
+		cslot = table_slot_create(leafRel, NULL);
+
+		/*
+		 * Only a tuple visible to a fresh snapshot is a real conflict; a stale
+		 * index entry pointing at a since-dead tuple is not.
+		 */
+		if (table_tuple_fetch_row_version(leafRel, tid, GetLatestSnapshot(),
+										  cslot))
+		{
+			ExecMaterializeSlot(cslot);
+			result = cslot;
+			/*
+			 * Leave leafRel open: the caller reports the conflict at ERROR and
+			 * the ensuing abort releases the lock and drops the slot.
+			 */
+			break;
+		}
+
+		ExecDropSingleTupleTableSlot(cslot);
+		table_close(leafRel, AccessShareLock);
+	}
+
+	index_endscan(scan);
+	return result;
+}
+
+/*
+ * ExecInsertSpanningIndexTuplesApply
+ *		See access/spanning.h.
+ */
+bool
+ExecInsertSpanningIndexTuplesApply(TupleTableSlot *slot, ItemPointer tupleid,
+								   Relation partition, EState *estate,
+								   Oid *conflictIndex,
+								   TupleTableSlot **conflictSlot)
+{
+	ProgresqlPartitionCacheEntry *pe;
+	Oid			partOid = RelationGetRelid(partition);
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+
+	if (!RelationHasSpanningAncestor(partition))
+		return false;
+
+	pe = progresql_build_partition_cache_entry(estate, partition);
+	if (pe->nEntries == 0)
+		return false;
+
+	for (int i = 0; i < pe->nEntries; i++)
+	{
+		ProgresqlSpanningEntry *se = &pe->entries[i];
+		bool		satisfiesConstraint;
+
+		FormIndexDatum(se->indexInfo, slot, estate, values, isnull);
+
+		if (se->partseq < 0)
+			elog(ERROR, "spanning index \"%s\" has no partseq for partition %u",
+				 RelationGetRelationName(se->indexRel), partOid);
+		values[se->discrimKeyPos] = Int32GetDatum(se->partseq);
+		isnull[se->discrimKeyPos] = false;
+
+		/*
+		 * UNIQUE_CHECK_PARTIAL inserts the entry and reports whether the key is
+		 * unique WITHOUT raising or taking the blocking value lock (see
+		 * nbtinsert.c) -- so a cross-partition conflict can be handed to
+		 * logical-replication conflict detection, classified and resolvable,
+		 * rather than raised as an opaque, retry-looping apply error.
+		 */
+		satisfiesConstraint =
+			index_insert(se->indexRel, values, isnull, tupleid,
+						 se->parentRel, UNIQUE_CHECK_PARTIAL, false,
+						 se->indexInfo);
+
+		if (!satisfiesConstraint)
+		{
+			TupleTableSlot *cslot =
+				spanning_probe_conflict(se, estate, values, isnull,
+										se->partseq, tupleid);
+
+			if (cslot != NULL)
+			{
+				*conflictIndex = RelationGetRelid(se->indexRel);
+				*conflictSlot = cslot;
+				return true;
+			}
+			/* False alarm from PARTIAL: no live duplicate; the entry stands. */
+		}
+	}
+
+	return false;
+}
