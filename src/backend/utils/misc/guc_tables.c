@@ -2156,10 +2156,14 @@ struct config_bool ConfigureNamesBool[] =
 			gettext_noop("Defers spanning-index vacuuming into a coalesced background drain."),
 			gettext_noop("When on, leaf-partition VACUUM enqueues a cross-partition "
 						 "spanning index's dead entries for a single coalesced drain "
-						 "instead of scanning the whole spanning index once per leaf."),
+						 "instead of scanning the whole spanning index once per leaf. "
+						 "UNSAFE: the coalesced drain fails to retire dead entries under "
+						 "sustained UPDATE churn, so duplicate index entries accumulate "
+						 "(phantom unique violations, index corruption); defaults off "
+						 "until the drain is fixed. The eager path is correct."),
 		},
 		&spanning_defer_vacuum,
-		true,
+		false,
 		NULL, NULL, NULL
 	},
 

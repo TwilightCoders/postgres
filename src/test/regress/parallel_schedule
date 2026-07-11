@@ -128,6 +128,9 @@ test: progresql_concurrency
 # progresql_drain runs serially: it queries the global pg_spanning_drainq catalog
 # and toggles spanning_defer_vacuum, so it must not overlap other vacuum tests.
 test: progresql_drain
+# progresql_churn_vacuum runs serially: it VACUUMs and inspects index pages, so it
+# must not overlap other vacuum tests (same reason as progresql_drain).
+test: progresql_churn_vacuum
 # progresql_fk runs serially: it uses common table names (p, cc, ...) and ATTACHes
 # partitions, so keep it off the shared parallel group to avoid name collisions.
 test: progresql_fk

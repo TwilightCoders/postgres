@@ -1,0 +1,53 @@
+-- Eager spanning-index VACUUM reclaims dead entries under sustained churn.
+--
+-- A spanning leaf has no local index for the spanning key, so its dead spanning
+-- entries are retired by progresql_vacuum_spanning_indexes during the leaf's own
+-- VACUUM.  The eager path (spanning_defer_vacuum = off, the default) reclaims
+-- them in the same VACUUM, before the heap slots are reaped.  The deferred DHR
+-- drain (spanning_defer_vacuum = on) fails to retire them under sustained churn,
+-- so duplicate entries for a single live row accumulate -- phantom unique
+-- violations and index corruption.  This pins the correct (default) behavior:
+-- after heavy delete+recreate churn of one id, a VACUUM leaves exactly one live
+-- index entry for it, not an accumulated duplicate chain.
+--
+-- (bt_page_items requires pageinspect; a duplicate chain is otherwise invisible
+-- to a heap GROUP BY oracle -- the corruption is index-only.)
+
+CREATE EXTENSION pageinspect;
+
+-- Confirm the default is the eager (correct) path.
+SHOW spanning_defer_vacuum;
+
+CREATE TABLE cv (id bigint NOT NULL, ts timestamptz NOT NULL, v text,
+    PRIMARY KEY (id) GLOBAL) PARTITION BY RANGE (ts);
+CREATE TABLE cv0 PARTITION OF cv FOR VALUES FROM ('2024-01-01') TO ('2027-01-01');
+-- keep the drain queue / heap state deterministic for the test
+ALTER TABLE cv0 SET (autovacuum_enabled = false);
+INSERT INTO cv VALUES (1, '2025-06-01', 'seed');
+
+-- Churn one id 40 times (delete+recreate), no VACUUM: 40 dead versions pile up.
+DO $$ BEGIN
+    FOR i IN 1..40 LOOP
+        DELETE FROM cv WHERE id = 1;
+        INSERT INTO cv VALUES (1, '2025-06-01', 'v' || i);
+    END LOOP;
+END $$;
+
+-- Eager VACUUM must retire every dead spanning entry, leaving one live entry.
+VACUUM cv0;
+
+-- The spanning index has exactly one leaf entry for the one live row -- not a
+-- 41-entry duplicate chain.  (Block 1 is the root/leaf of this single-page index.)
+SELECT count(*) AS live_index_entries FROM bt_page_items('cv_pkey', 1);
+
+-- The churned row still UPDATEs -- a stale duplicate aliasing a reused slot would
+-- make this a phantom "duplicate key" violation.
+UPDATE cv SET v = 'final' WHERE id = 1;
+SELECT v FROM cv WHERE id = 1;
+
+-- Cross-partition uniqueness still enforced (the index was not damaged).
+CREATE TABLE cv1 PARTITION OF cv FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+INSERT INTO cv VALUES (1, '2027-06-01', 'dup');   -- ERROR: cross-partition dup
+
+DROP TABLE cv;
+DROP EXTENSION pageinspect;

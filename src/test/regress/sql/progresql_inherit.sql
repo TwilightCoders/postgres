@@ -130,16 +130,17 @@ INSERT INTO da(id, ts) VALUES (1, '2026-01-02');   -- ERROR: same root, enforced
 INSERT INTO dr(id, ts) VALUES (1, '2026-01-03');   -- ERROR: enforced at the root too
 INSERT INTO dchild(id, ts) VALUES (2, '2026-01-04');  -- ok
 SELECT id, count(*) FROM dr GROUP BY id HAVING count(*) > 1;                      -- (none)
--- Section 11b: the deferred-drain enqueue must reach the spanning root THROUGH a
--- diamond leaf (regression for the partition-only ancestor walk that missed a
--- root reachable only via the leaf's non-first inheritance parent and silently
--- dropped its deferred cleanup).  Churn the diamond leaf, VACUUM it (enqueues),
--- drain, and confirm enforcement and integrity hold across the cycle.
+-- Section 11b: a diamond leaf's dead spanning entries must be retired through the
+-- ancestor walk that reaches the spanning root via the leaf's non-first
+-- inheritance parent (regression for a partition-only walk that missed such a
+-- root and silently dropped its cleanup).  Under the default eager path, VACUUM
+-- retires them in-line (progresql_vacuum_spanning_indexes), so the deferred drain
+-- finds nothing left to retire.  Confirm enforcement + integrity across the cycle.
 INSERT INTO dchild(id, ts) SELECT g, '2026-02-01' FROM generate_series(100, 120) g;
 DELETE FROM dchild WHERE id BETWEEN 100 AND 110;
 VACUUM dchild;
-SELECT pg_drain_spanning_index('dr_id_g');
-INSERT INTO dchild(id, ts) VALUES (100, '2026-02-02');  -- ok: id=100 was deleted + drained
+SELECT pg_drain_spanning_index('dr_id_g');               -- 0: eager VACUUM already retired them
+INSERT INTO dchild(id, ts) VALUES (100, '2026-02-02');  -- ok: id=100 deleted + eager-retired
 INSERT INTO dchild(id, ts) VALUES (115, '2026-02-03');  -- ERROR: id=115 still live, enforced
 SELECT id, count(*) FROM dr GROUP BY id HAVING count(*) > 1;                      -- (none)
 DROP TABLE dr CASCADE;
