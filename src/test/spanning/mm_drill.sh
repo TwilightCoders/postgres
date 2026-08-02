@@ -7,7 +7,7 @@
 # so the PK-fallback is empty and FULL is honored.
 set -uo pipefail
 
-PREFIX="/Users/volte/Workspace/TwilightCoders/ProgreSQL/build/install"
+PREFIX="${PROGRESQL_PREFIX:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/build/install}"
 BIN="$PREFIX/bin"
 ROOT="/tmp/mm-drill"; A="$ROOT/A"; B="$ROOT/B"
 PA=5530; PB=5531; LOGA="$ROOT/a.log"; LOGB="$ROOT/b.log"
