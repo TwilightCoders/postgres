@@ -355,6 +355,16 @@ spanning_probe_conflict(ProgresqlSpanningEntry *se, EState *estate,
 							   idxRel->rd_indcollation[i],
 							   ii->ii_UniqueProcs[i], values[i]);
 
+	/*
+	 * The conflicting tuple is fetched from its leaf with a fresh MVCC
+	 * snapshot, which must be registered (pushed active) before the heap
+	 * visibility check: HeapTupleSatisfiesMVCC asserts regd_count/active_count
+	 * under cassert, and an unregistered snapshot could be invalidated mid-fetch
+	 * otherwise.  Mirrors FindConflictTuple.  (The index scan itself uses
+	 * SnapshotAny, passed explicitly, and is unaffected by the active snapshot.)
+	 */
+	PushActiveSnapshot(GetLatestSnapshot());
+
 	scan = index_beginscan(rootRel, idxRel, SnapshotAny, NULL, nuniqs, 0);
 	scan->xs_want_itup = true;		/* we need the stored partseq */
 	index_rescan(scan, scankeys, nuniqs, NULL, 0);
@@ -389,7 +399,7 @@ spanning_probe_conflict(ProgresqlSpanningEntry *se, EState *estate,
 		 * Only a tuple visible to a fresh snapshot is a real conflict; a stale
 		 * index entry pointing at a since-dead tuple is not.
 		 */
-		if (table_tuple_fetch_row_version(leafRel, tid, GetLatestSnapshot(),
+		if (table_tuple_fetch_row_version(leafRel, tid, GetActiveSnapshot(),
 										  cslot))
 		{
 			ExecMaterializeSlot(cslot);
@@ -406,6 +416,7 @@ spanning_probe_conflict(ProgresqlSpanningEntry *se, EState *estate,
 	}
 
 	index_endscan(scan);
+	PopActiveSnapshot();
 	return result;
 }
 
