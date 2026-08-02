@@ -1,220 +1,158 @@
-# Spanning-index duplicate-entry corruption under delete+recreate churn
+# Spanning-index duplicate-entry corruption under sustained churn
 
-**Status: ROOT-CAUSED + FIXED (2026-07-11).** The bug is entirely in the
-**deferred DHR drain** (`spanning_defer_vacuum = on`), which is the GUC **default**
-and what the mesh runs: the coalesced drain fails to retire dead spanning entries
-under sustained churn, so duplicates accumulate (phantom violations, corruption).
-The **eager path (`spanning_defer_vacuum = off`) is correct** — validated under
-300 delete+recreate churns and 500 mixed cold-UPDATE+recreate across 100 ids /
-2 partitions: exactly 1 index entry per live row, amcheck CLEAN, heap reaped, no
-phantom violations.
+**Status: root-caused and fixed (2026-07-11), commit `af2296c944`.**
 
-**Fix (code):** flip the GUC default `spanning_defer_vacuum` to `false` (eager,
-correct) — `guc_tables.c`. The broken deferred drain becomes opt-in with an
-UNSAFE warning in its description. Follow-up: fix-or-remove the drain itself
-(non-urgent — eager is correct).
+Under sustained UPDATE-heavy churn, the **deferred drain** path
+(`spanning_defer_vacuum = on`) fails to retire dead spanning-index entries.
+Duplicate entries accumulate for a single live `(id, partseq)`, and once a stale
+entry's heap slot is reused by a live tuple, the cross-partition uniqueness probe
+finds it and raises a **phantom `duplicate key` violation on a legitimate
+UPDATE**. The heap is never wrong — the damage is index-only — but it is
+permanent until `REINDEX`.
 
-**Fix (operational, immediate, no new binary):** `ALTER SYSTEM SET
-spanning_defer_vacuum = off; SELECT pg_reload_conf();` on both mesh nodes (the
-eager path is already in the running 1.0 binary) + one `REINDEX INDEX data_pkey`
-per node to clear existing dupes → corruption stops accumulating permanently.
-
-**Correction to earlier analysis below:** the "both defer modes accumulate / no
-config workaround" conclusion was WRONG — `SET spanning_defer_vacuum` does not
-cross psql sessions, so every early repro was secretly `defer=on`. Only a
-server-level `-c spanning_defer_vacuum=off` exercises the eager path, and it is
-clean. Historical analysis retained below for the record.
+The **eager** path (`spanning_defer_vacuum = off`) is correct. The fix flips the
+GUC default to `off` and marks the deferred path UNSAFE in its description.
 
 ---
 
-**(Historical) Status:** root-caused to a mechanism family; exact line-level
-trigger not yet pinned (needs a repro). Data-integrity bug, production-observed
-on both mesh nodes. Blocks the 0.2.5 conflict-classification release.
-
 ## Symptom
 
-`bt_index_check('data_pkey')` (structure-only) raises **"item order invariant
-violated"** on both mesh nodes. Downstream:
+`bt_index_check(<spanning index>)` (structure-only) raises **"item order
+invariant violated"**. Downstream effects, in the order they tend to be noticed:
 
-- Plain non-key `UPDATE`s on specific ids raise a spurious `data_pkey`
-  `UniqueViolation` (the row is not actually duplicated in the heap).
-- The logical-replication apply worker crash-loops (~5s cycle) on a `data_pkey`
-  duplicate-key when it applies an `UPDATE` to a poisoned id.
-- No heap duplicates: `SELECT id, count(*) FROM data GROUP BY id HAVING
-  count(*)>1` is 0 across all three spanning trees.
+- Plain non-key `UPDATE`s on specific ids raise a spurious `UniqueViolation`,
+  though the row is not duplicated in the heap.
+- The logical-replication apply worker crash-loops when it applies an `UPDATE`
+  to an affected id.
+- On `--enable-cassert` builds, a page split through an affected page trips the
+  suffix-truncation invariant in `_bt_truncate` (`nbtutils.c:3876`): the
+  split-point choice meets non-monotonic heap TIDs among the duplicate entries.
+  On a non-cassert build this is a silent wrong truncation rather than a crash —
+  another reason cassert is mandatory for spanning validation.
+- No heap duplicates: `SELECT id, count(*) ... GROUP BY id HAVING count(*) > 1`
+  returns nothing.
 
-## Evidence (claudepilot mesh specimens, 2026-07-06)
+## Mechanism
 
-- `bt_page_items('data_pkey', 1054)` offsets 3–6 all carry the **identical
-  key** (id `019ef28e-…`, **partseq 6**), heap tids `(55,15)` and `(110,2)×3`.
-  The live tuple for that id is at `(110,59)` — so **multiple index entries for
-  one (id, partseq) bind to dead heap versions**, three of them on a single
-  (reused) tid.
-- november DETAIL: two entries `(2532,4)` and `(2532,5)` both → heap `(122,1)`.
-- Corrupt-page LSNs are **post-revert 1.0** (november `5/B8AFC108` >
-  `5/1F86D4B0` @ Jul-3 23:08Z) — written by the 1.0 binary, **not** the rc1
-  build. Shared 1.0 writer/cleanup code.
-- Four victim ids; three cluster in a **few-hour window during the July-3
-  rebuild** (delete N + recreate N per conversation, hundreds back-to-back).
-  Correlates with a **write burst**, not a uniform background rate.
-- entity/evidence/source GLOBAL indexes: structure-clean on both nodes. Only
-  `data_pkey` (the hottest-churned tree) is corrupt.
-- Mesh GUCs: `spanning_defer_vacuum = on`, `autovacuum = on`. `pg_spanning_drainq`
-  is currently **empty** — the corruption is committed, not pending-in-queue.
+The fork can defer spanning dead-entry reclaim. A leaf VACUUM enqueues a
+`pg_spanning_drainq` record instead of scanning the spanning index, and a later
+coalesced `pg_drain_spanning_index` retires the dead entries in one pass. The
+design's safety rests on heap slots being kept un-reusable until the drain runs
+(`vacuumlazy.c:2627`) — so a stale entry can never alias a live row.
 
-## REPRODUCED (2026-07-08) — local, minimal
+**That invariant does not hold under sustained churn.** A recreated tuple reuses
+a just-freed heap slot before the old spanning entry for that slot has been
+retired, so a duplicate same-key entry ends up bound to the now-live reused TID.
+From that point the partseq-filtered bulkdelete *cannot* reclaim it: the TID is
+live, so the entry never appears in any dead-TID list. It survives until
+`REINDEX` rebuilds the index from the heap.
 
-Scripts: `/tmp/defer_repro.sh`, `/tmp/drain_recover.sh`, `/tmp/recover_test.sh`
-(cassert build `build/install-025rc1`). Minimal repro: one partitioned table
-with a GLOBAL PK, `autovacuum=off`, churn a single id via delete+recreate.
+The `LP_DEAD` reclaim in `_bt_check_unique` (`nbtinsert.c:1047`) is a non-durable
+dirty hint, so it cannot be relied on to close the gap; the durable path is the
+drain, and the drain is what fails to keep pace.
 
-Findings:
-- Churn accumulates **stale duplicate index entries for the one live row**,
-  proportional to churn volume (~2 per 200 cycles, ~5 per 300).
-- **Config-independent:** identical with `spanning_defer_vacuum` **on and off**.
-- **Permanent / non-self-healing:** 4× quiescent `VACUUM` (defer=off) or
-  `VACUUM + pg_drain_spanning_index` (defer=on) does NOT reduce the count. The
-  deferred drain also gets **stuck** (drainq stays 1). Only **`REINDEX`**
-  recovers (→ 1).
-- **Therefore `spanning_defer_vacuum=off` is NOT a mitigation** (earlier
-  guidance retracted). There is no config workaround; the code fix is required.
+### Three symptom classes
 
-Causal picture (matches the mesh `(110,2)×3` specimen): under churn a recreated
-tuple **reuses a just-freed heap slot**; the old spanning entry for that slot is
-not removed before reuse, so a duplicate same-key entry ends up bound to the
-now-live reused TID. VACUUM's partseq-filtered bulkdelete (the vacuum_collision
-fix) then **cannot** reclaim it — the TID is live, so the stale entry isn't in
-any dead-TID list. It persists until REINDEX rebuilds from the heap.
+Any future fix to the deferred path must address all three:
 
-## Census (january data_pkey, 2026-07-08, claudepilot)
-
-Full page-walk: **8,388 distinct keys with duplicate adjacent entries / 9,551
-adjacencies across 7,840 leaf pages.** This is **pervasive** — effectively every
-sustained-cold-UPDATE hot row (live conversation rows: 171/176/128 entries) has
-accumulated a dup chain — not a handful of victims. REINDEX-both is warranted.
-
-### Three symptom classes (all must be in the fix's acceptance)
-0. **Page-split assertion crash (cassert)** — when a poisoned page splits,
-   `_bt_truncate`'s split-point choice meets non-monotonic heap TIDs among the
-   duplicate entries and trips the suffix-truncation invariant
-   (`TRAP` at nbtutils.c:3876). Red test must **force a page split through an
-   accumulated-duplicate page** (fill a poisoned page to split point). On a
-   non-cassert build this is a silent tolerated wrong-truncation, not a crash —
-   so cassert is (again) the validation build that surfaces it.
-
-1. **False unique-violation** — the operational blocker. **Entry count does NOT
-   predict it**: a 176-entry key UPDATEs fine while a 2-entry victim violates on
-   every touch. The discriminator is **heap-slot-reuse state**: a violation
-   happens only when a stale entry's TID was reused by a **live** tuple, so the
-   uniqueness scan probes it, finds a live tuple, and reports a conflict. Most
-   dup entries are benign (bind to dead tuples, correctly skipped).
-   - **Red-test gap:** the current repro reproduces the *accumulation* (benign
-     dead dups) but NOT yet the *violating* state. The fix's red test must force
-     TID reuse into a live tuple (churn + VACUUM-reclaim + recreate onto the
-     reclaimed slot) so a stale entry aliases a live tuple, then show a plain
-     UPDATE false-violates — and that the fix removes it.
-2. **Perf degradation** — every hot-row UPDATE's uniqueness check scans the
-   growing dup chain (176 entries and climbing). Slow degradation on the hottest
-   rows even where nothing violates. The fix (no dup accumulation) resolves both.
-
-## Mechanism (confirmed family; exact trigger open)
-
-The fork defers spanning dead-entry reclaim (`spanning_defer_vacuum = on`): a
-leaf VACUUM enqueues a `pg_spanning_drainq` record instead of scanning the
-spanning index, and a later coalesced `pg_drain_spanning_index` retires the dead
-entries. The design claims heap slots are kept "un-reusable until the drain
-runs" (vacuumlazy.c:2627), which is what should make the deferral safe.
-
-Under a **sustained delete+recreate burst** (the standard rebuild workload — and
-this stays in the product; parser upgrades re-normalize from the raw floor), one
-id churns through many tuple versions with heavy TID reuse. The observed end
-state — multiple index entries for one (id, partseq) all bound to dead/reused
-tids, never marked `LP_DEAD`, surviving into `amcheck` — means the reclaim/reuse
-safety broke: **dead spanning entries were not retired before their heap slots
-were reused**, so entries accumulated and alias reused slots. The `LP_DEAD`
-reclaim in `_bt_check_unique` (nbtinsert.c:1047) is a non-durable dirty-hint;
-the durable path is the deferred drain. A crash between VACUUM-defer and drain
-(the July-3 window had crashes, incl. the rc1 crash-loop) is the leading
-suspect for losing the "un-reusable until drain" guarantee.
+1. **False unique-violation** — the operational blocker. **Entry count does not
+   predict it.** A key with 176 stale entries can UPDATE fine while a 2-entry
+   case violates on every touch. The discriminator is heap-slot-reuse state: a
+   violation occurs only when a stale entry's TID was reused by a *live* tuple.
+   Most duplicate entries are benign — they bind to dead tuples and are correctly
+   skipped.
+2. **Page-split assertion crash** (cassert) — as above.
+3. **Progressive slowdown** — every hot-row UPDATE's uniqueness check scans the
+   growing duplicate chain, so the hottest rows degrade steadily even where
+   nothing violates.
 
 ### Ruled out
+
+Recorded so these are not re-investigated:
+
 - Diamond / multi-ancestor cache double-insert — `progresql_spanning_ancestors`
-  dedups (spanning_relcache.c).
+  dedups (`spanning_relcache.c`).
 - COPY double-insert — the two `copyfrom.c` call sites are mutually exclusive
-  (multi-insert-flush vs single-row).
-- INSERT+UPDATE double-call — guarded (cross-partition update = DELETE+INSERT,
-  only the INSERT side maintains; nodeModifyTable.c:2362).
-- rc1 `UNIQUE_CHECK_PARTIAL` as the *source* — corrupt-page LSNs predate/are
-  independent of rc1; november carries it with minimal rc1 exposure. (rc1's
-  crash-loop may have *contributed* crashes, not the duplicate entries.)
+  (multi-insert-flush vs. single-row).
+- INSERT+UPDATE double-call — guarded; a cross-partition update is DELETE+INSERT
+  and only the INSERT side maintains the spanning index
+  (`nodeModifyTable.c:2362`).
+- The `UNIQUE_CHECK_PARTIAL` apply-worker path (0.2.5) as the *source* — affected
+  pages carry LSNs predating it. That feature surfaced the bug; it did not cause
+  it. This is a pre-existing 1.0-era defect.
 
-## Cadence (recurrence rate, measured on the live mesh)
+## Reproduction
 
-- november: re-stalled ~30h after a REINDEX (with rebuild-adjacent churn).
-- january: **amcheck-failing within ~10h of a REINDEX under *ordinary* steady-
-  state pump churn** — no rebuild burst, pumps clean, purely structural
-  accumulation.
-- november: **re-corrupted within *hours*** of a REINDEX (2026-07-10). So this is
-  a **continuous** bug at normal write rates, not a burst artifact; REINDEX is
-  only a single-digit-hours-to-~30h stopgap. Operationally now absorbed by
-  claudepilot's automated tripwire→auto-REINDEX heal on both nodes, but that
-  makes the code fix the only durable lever — the mesh cannot run un-reindexed.
+Minimal shape: one partitioned table with a `GLOBAL` PK, `autovacuum = off`,
+churning a single id. Both churn shapes reproduce and both must stay covered:
 
-## Fix acceptance bar (from the workload owner)
+- **delete + recreate** (the bulk-rebuild pattern), and
+- **repeated non-key cold UPDATE** of one row — forced cold via an indexed column
+  or page fill. This is the hotter real-world pattern.
 
-**7 days of january steady-state churn + one full rebuild burst, `bt_index_check`
-clean (structure) throughout.** If the fix carries a tunable, that's the profile
-to tune against. (No config workaround exists today — both defer modes
-accumulate — so the fix is a code change, and this is its gate.)
+Accumulation is proportional to churn volume (roughly 2 stale entries per 200
+cycles, 5 per 300) and is **not self-healing**: repeated quiescent `VACUUM` plus
+`pg_drain_spanning_index` does not reduce the count, and the drain itself can get
+stuck with the queue non-empty. Only `REINDEX` recovers.
 
-## Acceptance criterion (from the workload owner)
+Pinned in-tree by `progresql_churn_vacuum`, which churns one id 40× and asserts
+exactly one live index entry afterwards via `bt_page_items`. It requires
+`EXTRA_INSTALL=contrib/pageinspect`.
 
-The delete+recreate burst is the **standard maintenance workload**, not a
-synthetic stress. The fix must keep reclaim in pace under **sustained** churn
-(hundreds of conversations back-to-back, recurring). This likely rules out a
-tuning knob on the autovacuum-gated drain and points at making dead-entry
-cleanup durable/eager enough that a rebuild pass cannot outrun it, and/or making
-the "un-reusable until drain" guarantee crash-durable. P2.1's real rebuild is
-the agreed soak test.
+## Validation of the eager path
 
-## Next steps
-1. **Repro — DONE.** Reproduced on both churn shapes; **the red test must cover
-   both** (the UPDATE path is the hotter real-world pattern):
-   - delete+recreate (rebuild burst),
-   - repeated non-key **cold** UPDATE of one row (pump metadata refresh — force
-     cold via an indexed column or page-fill). Both accumulate ~identically and
-     are config-independent + permanent-until-REINDEX.
-2. **Pin the exact reclaim gap.** Read the spanning-index VACUUM bulkdelete
-   (`vacuumlazy.c`, partseq-filtered — the vacuum_collision fix) and the
-   insert-under-TID-reuse path: where does a duplicate same-key entry survive
-   because its heap slot was reused (TID now live) before the old entry was
-   removed? Confirm whether the fix belongs in (a) removing/superseding the old
-   entry at insert time when its slot is being reused, (b) letting bulkdelete
-   dedup live-TID duplicates, or (c) an eager pre-reuse retirement.
-3. **Fix + validate on a cassert build** against the two-shape red test (cassert
-   is now mandatory for spanning validation — the november gate that missed the
-   rc1 snapshot crash had none). P2.1's real rebuild is the soak test.
+Validated under 300 delete+recreate churns and 500 mixed cold-UPDATE+recreate
+across 100 ids / 2 partitions: exactly one index entry per live row, `amcheck`
+clean, heap slots reaped, no phantom violations. Full regress green on a cassert
+build.
 
-### Interim posture (until the fix lands)
-- **No config workaround exists** — `spanning_defer_vacuum=off` does NOT prevent
-  accumulation (retracted). Do not rely on it.
-- **REINDEX unblocks but does not prevent recurrence.** `REINDEX INDEX
-  data_pkey` clears the corruption to unblock a stalled node (Dale-gated), but
-  churn re-accumulates. So: **hold rebuild bursts (P2.1) until the fix**, or plan
-  to re-REINDEX after each burst.
-- **Prevention/monitoring:** nightly structure-only `bt_index_check`
-  transition-alarm on both nodes (claudepilot MeshWatchdogJob) — live/building.
+**Cost.** The eager path reinstates the per-leaf spanning-index scan the drain
+was written to avoid — the O(N²) sweep the deferral targeted. Measured at
+**~740µs/row on a rebuild burst**: bounded, and not a correctness concern.
 
-### Open production action (Dale-gated, pending on 2026-07-08)
-november apply-stalled ~2 days on a poisoned id. Blessed unblock: plain
-`REINDEX INDEX data_pkey` on november (NOT concurrently; it's apply-stalled).
-No `defer` change. january untouched (specimen). Awaiting Dale's go.
+An earlier "eager is catastrophically slow" measurement was a **confound** and
+should not be cited: an 81k-row delete took 11.5 minutes, but ~91% of that was a
+*missing index on the referencing side of a foreign key* causing sequential scans
+during FK checks. With that index present the same delete takes 62.5s. The
+lesson is worth keeping — attribute a slow bulk DML to the spanning index only
+after ruling out ordinary missing-index effects.
 
-## Relationship to other in-flight work
-- **rc1 snapshot crash** (separate bug, fixed, unvalidated): `spanning_probe_conflict`
-  passed an unregistered `GetLatestSnapshot()` to the heap fetch → cassert TRAP.
-  Fixed (push active snapshot); needs a cassert re-validate. Independent of this
-  corruption.
-- **0.2.5 conflict-classification** feature: correct design (validated on
-  november), blocked behind this corruption fix — do not ship conflict-handling
-  on an index that can double-write entries under churn.
+## Recovery for an affected installation
+
+1. `ALTER SYSTEM SET spanning_defer_vacuum = off; SELECT pg_reload_conf();` —
+   this needs no new binary, since the eager path exists in any build that has
+   the GUC; only the *default* changed. Accumulation stops immediately.
+2. `REINDEX INDEX <spanning index>` once per affected index to clear entries
+   already accumulated. Plain `REINDEX`, not `CONCURRENTLY` — the concurrent path
+   is unproven for spanning indexes.
+
+Without step 1, `REINDEX` alone is only a stopgap: at ordinary write rates
+`bt_index_check` can fail again within hours.
+
+## Follow-up (low priority)
+
+Fix or remove the deferred drain itself. It is now opt-in and documented as
+unsafe, so this is a performance-reclamation task, not a correctness one — it
+buys back the ~740µs/row and only matters if large rebuild bursts become
+frequent. If it is fixed rather than removed, the candidate loci are:
+
+- superseding the old entry at insert time when its heap slot is being reused,
+- letting bulkdelete dedup live-TID duplicates, or
+- an eager pre-reuse retirement.
+
+The acceptance bar should be sustained churn — several days of steady-state
+write traffic plus one full rebuild burst, with `bt_index_check` clean
+throughout — not a synthetic short stress, since the failure is an
+accumulation that a brief run will not surface.
+
+## Correction to earlier analysis
+
+An intermediate conclusion recorded here — that the corruption was
+*config-independent* and that `spanning_defer_vacuum = off` was therefore not a
+mitigation — was **wrong**, and the retraction is the useful part of this record.
+The error: `SET spanning_defer_vacuum` does not carry across `psql` sessions, so
+every early repro ran with the deferred path silently still enabled. Only a
+server-level setting (`-c spanning_defer_vacuum=off`, or `ALTER SYSTEM` plus
+reload) actually exercises the eager path. Verify that a GUC under test is in
+force at the level the test assumes before concluding that toggling it changes
+nothing.
