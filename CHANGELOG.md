@@ -4,9 +4,37 @@ Changes ProgreSQL adds on top of stock PostgreSQL (`REL_18_STABLE`). Vanilla
 PostgreSQL behavior is unchanged unless a table opts in with the `GLOBAL` keyword.
 Newest first.
 
-## 2026-07-03 (v18.3-0.2.5)
+## 2026-08-02 (v18.3-0.2.5)
 
 ### Fixed
+- **The deferred VACUUM drain corrupted the spanning index under churn; it is now
+  disabled by default** (`spanning_defer_vacuum` defaults to `off`). Under
+  sustained UPDATE-heavy churn — both delete+recreate and repeated cold-UPDATE —
+  the coalesced drain failed to retire some dead spanning-index entries. Duplicate
+  entries accumulated for a single live `(id, partseq)`, and once a stale entry's
+  heap slot was reused by a live tuple, the cross-partition uniqueness probe
+  examined it and raised a **phantom `duplicate key` violation on a legitimate
+  UPDATE**. It also wedged the logical-replication apply worker and, on
+  `--enable-cassert` builds, tripped page-split assertions. `bt_index_check`
+  reports `item order invariant violated`. The heap was never wrong — the damage
+  is index-only — but it is permanent until `REINDEX`. This is a pre-existing
+  defect in the deferred path, not a regression in this release. The **eager**
+  path (each leaf's VACUUM retires its own entries before the heap slots are
+  reaped) is correct and is now the default; it costs ~740µs/row on a rebuild
+  burst, which is bounded and not a correctness concern. Existing installations
+  should set `spanning_defer_vacuum = off` and `REINDEX` any spanning index that
+  `bt_index_check` reports as damaged. Pinned by `progresql_churn_vacuum`;
+  full analysis in `docs/plans/spanning-dedup-corruption.md`.
+- **The apply worker's cross-partition conflict probe crashed on assert-enabled
+  builds.** Resolving the conflicting tuple fetched it from its leaf with an
+  *unregistered* snapshot, tripping
+  `Assert("snapshot->regd_count > 0 || snapshot->active_count > 0")` in
+  `HeapTupleSatisfiesMVCC` and crash-looping the server on any spanning conflict.
+  The probe now pushes the snapshot active for the duration of the fetch, mirroring
+  `FindConflictTuple`. Assert-disabled builds were not affected in practice, but
+  the snapshot could in principle be invalidated mid-fetch. Guarded by
+  `033_spanning_conflict.pl` run against a `--enable-cassert` build — the
+  configuration that catches it.
 - **A cross-partition (spanning / `GLOBAL`) uniqueness conflict hit by the
   logical-replication apply worker is now classified as a conflict**
   (`confl_insert_exists` / `confl_update_exists` in

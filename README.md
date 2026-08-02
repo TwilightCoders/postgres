@@ -236,19 +236,29 @@ partition tree (`tablecmds.c`, `index.c`, `heap.c`):
   probe O(log n) on the hot write path). So retiring one leaf's dead entries
   needs a full index scan — and N leaf VACUUMs would each scan the whole index:
   **O(N²) per sweep**.
-- The fix (GUC `spanning_defer_vacuum`, default **on**): a leaf VACUUM *enqueues*
-  its dead entries to the durable **`pg_spanning_drainq`** catalog and leaves the
-  heap slots `LP_DEAD` (un-reaped, so they can't be reused). A single coalesced
-  **drain** then retires every queued partition's entries in *one* index scan and
-  reaps the now-safe slots — **O(N)**. Measured: per-leaf VACUUM cost goes from
-  growing-with-N to flat; the sweep drops ~10× at 64 partitions and the gap
-  widens. The drain runs automatically (an autovacuum work item) or on demand via
-  `pg_drain_spanning_index(regclass)`. It applies to leaves with local indexes
-  too: the drain vacuums each leaf's local indexes for the dead set before reaping
-  (so the deferral is universal, not limited to no-local-index leaves).
-- Correctness rests on an audited invariant: a held `LP_DEAD` slot can only be
-  reaped by the gated drain (a new tuple can never reuse it first), so a stale
-  entry's address can never alias a live row before the entry is retired.
+- The intended optimization (GUC `spanning_defer_vacuum`) is a coalesced drain: a
+  leaf VACUUM *enqueues* its dead entries to the durable **`pg_spanning_drainq`**
+  catalog and leaves the heap slots `LP_DEAD` (un-reaped, so they can't be
+  reused). A single **drain** then retires every queued partition's entries in
+  *one* index scan and reaps the now-safe slots — **O(N)**. Measured: per-leaf
+  VACUUM cost goes from growing-with-N to flat; the sweep drops ~10× at 64
+  partitions. The drain runs as an autovacuum work item or on demand via
+  `pg_drain_spanning_index(regclass)`.
+- **This path is unsafe and defaults to `off`.** Its correctness rested on the
+  invariant that a held `LP_DEAD` slot can only be reaped by the gated drain — so
+  a stale entry could never alias a live row before being retired. Under sustained
+  UPDATE churn that invariant does not hold in practice: the drain fails to retire
+  some dead entries, duplicates accumulate for a single live `(id, partseq)`, and
+  once a stale entry's slot is reused by a live tuple the uniqueness probe raises a
+  **phantom `duplicate key` violation on a legitimate UPDATE**. The damage is
+  index-only (the heap stays correct) but permanent until `REINDEX`, and
+  `bt_index_check` reports `item order invariant violated`. Do not enable it.
+- The **eager** path (the default): each leaf's VACUUM retires its own spanning
+  entries before the heap slots are reaped. Correct, and pinned by
+  `progresql_churn_vacuum`. It reinstates the O(N²) sweep cost the drain was
+  written to avoid — measured at ~740µs/row on a rebuild burst, bounded and
+  non-correctness. Fixing or removing the deferred drain is tracked in
+  `docs/plans/spanning-dedup-corruption.md`.
 
 ---
 
