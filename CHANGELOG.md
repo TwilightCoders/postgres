@@ -4,6 +4,40 @@ Changes ProgreSQL adds on top of stock PostgreSQL (`REL_18_STABLE`). Vanilla
 PostgreSQL behavior is unchanged unless a table opts in with the `GLOBAL` keyword.
 Newest first.
 
+## 2026-08-13 (v18.3-0.2.6)
+
+### Fixed
+- **A `WHERE` predicate on a `GLOBAL` index is now enforced.** It was parsed,
+  recorded in `pg_index.indpred`, and echoed back by `pg_get_indexdef` — but
+  never evaluated, so every row got an index entry and uniqueness applied across
+  all of them. That is a strictly **tighter** constraint than the one declared,
+  and it failed silently: rows the predicate excludes still collided, and
+  `CREATE INDEX` could fail over pre-existing data that was perfectly legal under
+  the declared predicate. The predicate is now evaluated on all three paths that
+  maintain a spanning index — the executor insert path, the logical-replication
+  apply path, and the `CREATE INDEX` / `ATTACH` backfill. Because a spanning
+  index lives on the root while its predicate is evaluated against a *leaf*
+  tuple, the predicate's `Var`s are remapped to the leaf by column name, the same
+  way the key attnums already were; a leaf whose columns are ordered differently
+  from the root would otherwise have tested the wrong column entirely.
+- **A partial spanning index's predicate columns now block HOT updates on the
+  leaves**, as its key columns already did. An update that moves a row across the
+  predicate boundary changes whether the row belongs in the index at all; if it
+  went HOT the old entry would survive as a redirect and resolve through the HOT
+  chain to the new tuple, raising a phantom `duplicate key` violation on exactly
+  the "close this version, insert its replacement" pattern partial indexes exist
+  to serve. Stock gets this via `ii_Predicate`'s varattnos; a spanning index is
+  not in the leaf's own index list, so the fork must contribute them itself.
+  Expect a change to a predicate column to cost a cold (non-HOT) update.
+- **Upgrading:** new writes are correct immediately, but an index **built** under
+  the old behavior still holds entries for rows its predicate rejects. `REINDEX`
+  any partial `GLOBAL` index created before 0.2.6 to drop them.
+
+Pinned by `progresql_partial`, which covers both directions at every path —
+rows the predicate rejects must coexist across leaves, rows it accepts must still
+collide — plus supersede/replace churn and inheritance children whose column
+order diverges from the root and from each other.
+
 ## 2026-08-02 (v18.3-0.2.5)
 
 ### Fixed

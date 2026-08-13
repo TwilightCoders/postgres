@@ -122,7 +122,7 @@ forward-ports:
 
 | Function | Returns |
 |---|---|
-| `progresql_version()` | the fork **release** version (`'0.2.5'`, matching the `v18.3-X.Y.Z` tag), distinct from the PostgreSQL base reported by `server_version` — the supported fork-detection + version-gate hook (stock PostgreSQL has no such function) |
+| `progresql_version()` | the fork **release** version (`'0.2.6'`, matching the `v18.3-X.Y.Z` tag), distinct from the PostgreSQL base reported by `server_version` — the supported fork-detection + version-gate hook (stock PostgreSQL has no such function) |
 | `pg_index_is_global(regclass)` | whether an existing index is a spanning index; `NULL` for a non-index argument |
 | `pg_index_global_columns(regclass)` | the index's user-facing key column names, **excluding** the trailing `partseq` discriminator; `NULL` for a non-index or expression key |
 
@@ -400,18 +400,16 @@ git rebase upstream/REL_18_STABLE progresql-18
   grandchildren would have no `partseq` and would silently escape the index. The
   order matters — build the multi-level tree first, then add `GLOBAL`; or use an
   inheritance root, under which depth can be added freely at any time.
-- **A `WHERE` predicate on a `GLOBAL` index is accepted and stored but not
-  enforced** (known bug). `CREATE UNIQUE INDEX ... WHERE <pred> GLOBAL` is parsed,
-  recorded in `pg_index.indpred`, and echoed back by `pg_get_indexdef` — but the
-  predicate is never evaluated when the index is maintained, so *every* row is
-  indexed and uniqueness is enforced across all of them. The result is a strictly
-  **tighter** constraint than the one declared, with no error: rows that do not
-  satisfy the predicate still collide. This affects the executor insert path, the
-  logical-replication apply path, and the `CREATE INDEX` backfill (so the index
-  may fail to build over pre-existing data that is legal under the declared
-  predicate). Until it is fixed, express "one live row per key" with a sentinel
-  column in the key — e.g. `valid_to timestamptz NOT NULL DEFAULT 'infinity'` with
-  a `GLOBAL` index on `(key..., valid_to)` — rather than a partial predicate.
+- A partial `GLOBAL` index (`CREATE UNIQUE INDEX ... WHERE <pred> GLOBAL`) is
+  supported, and its **predicate columns block HOT updates on the leaves** — the
+  same way its key columns do, and for a sharper reason: an update that moves a
+  row across the predicate boundary changes whether the row belongs in the index
+  at all, so it must not be HOT. Expect a change to a predicate column to cost a
+  cold (non-HOT) update. (Before 0.2.6 the predicate was accepted and stored but
+  never evaluated, so the index silently enforced uniqueness over *every* row —
+  a strictly tighter constraint than declared. Upgrading fixes new writes; an
+  index built under the old behavior holds entries for rows the predicate
+  rejects, so `REINDEX` it to drop them.)
 - The per-statement cache is exactly that — per statement; it is rebuilt for
   each top-level DML.
 - **Logical replication of `UPDATE`/`DELETE`** from a spanning-indexed table

@@ -1,0 +1,129 @@
+--
+-- ProgreSQL: partial (WHERE ...) spanning GLOBAL indexes
+--
+-- A GLOBAL index with a predicate must cover only the rows the predicate
+-- accepts.  The failure this pins was silent OVER-enforcement: the predicate
+-- was stored and echoed by pg_get_indexdef but never evaluated, so every row
+-- was indexed and uniqueness applied across all of them -- a strictly tighter
+-- constraint than the one declared, with no error.
+--
+-- Both directions matter.  Under-enforcement (a qualifying row that fails to
+-- get an entry) would silently lose cross-partition uniqueness, which is worse
+-- than the bug being fixed, so every "accepts" case below is paired with a
+-- "still rejects" case.
+--
+-- ---------------------------------------------------------------- declarative
+CREATE TABLE pp (src int NOT NULL, ext text NOT NULL, t date NOT NULL,
+                 dead timestamptz)
+  PARTITION BY RANGE (t);
+CREATE TABLE pp_a PARTITION OF pp FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE TABLE pp_b PARTITION OF pp FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+CREATE UNIQUE INDEX pp_live ON pp (src, ext) WHERE dead IS NULL GLOBAL;
+-- the predicate must round-trip through the catalog
+SELECT pg_get_indexdef('pp_live'::regclass);
+                                       pg_get_indexdef                                       
+---------------------------------------------------------------------------------------------
+ CREATE UNIQUE INDEX pp_live ON public.pp USING btree (src, ext) WHERE (dead IS NULL) GLOBAL
+(1 row)
+
+-- rows the predicate REJECTS are not indexed: duplicates coexist across leaves
+INSERT INTO pp VALUES (1, 'dead', '2025-06-01', '2025-06-02');
+INSERT INTO pp VALUES (1, 'dead', '2026-06-01', '2026-06-02');
+SELECT count(*) FROM pp WHERE ext = 'dead';
+ count 
+-------
+     2
+(1 row)
+
+-- rows the predicate ACCEPTS are still enforced across leaves
+INSERT INTO pp VALUES (2, 'live', '2025-06-01', NULL);
+INSERT INTO pp VALUES (2, 'live', '2026-06-01', NULL);  -- must fail
+ERROR:  duplicate key value violates unique constraint "pp_live"
+DETAIL:  Key (src, ext)=(2, live) already exists.
+-- close the live version, then insert its replacement: the classic partial-index
+-- pattern.  This is what a HOT update would break -- the old entry would survive
+-- as a redirect and resolve through the HOT chain to the new tuple.
+UPDATE pp SET dead = now() WHERE ext = 'live' AND dead IS NULL;
+INSERT INTO pp VALUES (2, 'live', '2026-06-01', NULL);
+SELECT count(*) AS total, count(*) FILTER (WHERE dead IS NULL) AS live
+  FROM pp WHERE ext = 'live';
+ total | live 
+-------+------
+     2 |    1
+(1 row)
+
+-- sustained supersede/replace churn keeps exactly one live row ...
+DO $$ BEGIN FOR i IN 1..5 LOOP
+  UPDATE pp SET dead = now() WHERE ext = 'live' AND dead IS NULL;
+  INSERT INTO pp VALUES (2, 'live', '2025-06-01', NULL);
+END LOOP; END $$;
+SELECT count(*) AS total, count(*) FILTER (WHERE dead IS NULL) AS live
+  FROM pp WHERE ext = 'live';
+ total | live 
+-------+------
+     7 |    1
+(1 row)
+
+-- ... and enforcement still holds afterwards
+INSERT INTO pp VALUES (2, 'live', '2026-06-01', NULL);  -- must fail
+ERROR:  duplicate key value violates unique constraint "pp_live"
+DETAIL:  Key (src, ext)=(2, live) already exists.
+-- ------------------------------------------------------------------- backfill
+-- Building over pre-existing rows must apply the predicate too: data that is
+-- legal under the declared predicate must not block the build.
+CREATE TABLE pb (src int NOT NULL, ext text NOT NULL, t date NOT NULL,
+                 dead timestamptz)
+  PARTITION BY RANGE (t);
+CREATE TABLE pb_a PARTITION OF pb FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE TABLE pb_b PARTITION OF pb FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+INSERT INTO pb VALUES (1, 'dead', '2025-06-01', '2025-06-02');
+INSERT INTO pb VALUES (1, 'dead', '2026-06-01', '2026-06-02');
+CREATE UNIQUE INDEX pb_live ON pb (src, ext) WHERE dead IS NULL GLOBAL;  -- builds
+-- but pre-existing rows the predicate ACCEPTS must still collide
+CREATE TABLE pc (src int NOT NULL, ext text NOT NULL, t date NOT NULL,
+                 dead timestamptz)
+  PARTITION BY RANGE (t);
+CREATE TABLE pc_a PARTITION OF pc FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE TABLE pc_b PARTITION OF pc FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+INSERT INTO pc VALUES (1, 'live', '2025-06-01', NULL);
+INSERT INTO pc VALUES (1, 'live', '2026-06-01', NULL);
+CREATE UNIQUE INDEX pc_live ON pc (src, ext) WHERE dead IS NULL GLOBAL;  -- must fail
+ERROR:  duplicate key value violates unique constraint "pc_live"
+DETAIL:  Key (src, ext)=(1, live) already exists.
+-- ------------------------------------------------ inheritance, divergent order
+-- The predicate is root-relative and evaluated against a LEAF tuple, so its Vars
+-- need the same by-name remap the key attnums get.  These children order their
+-- columns differently from the root and from each other, so an unmapped
+-- predicate would test an entirely different column on each.
+CREATE TABLE pr (src int NOT NULL, ext text NOT NULL, dead timestamptz);
+CREATE TABLE pr1 (pad int, dead timestamptz, ext text NOT NULL, src int NOT NULL);
+CREATE TABLE pr2 (dead timestamptz, pad2 int, src int NOT NULL, ext text NOT NULL);
+ALTER TABLE pr1 INHERIT pr;
+ALTER TABLE pr2 INHERIT pr;
+-- root: src=1 ext=2 dead=3   pr1: dead=2   pr2: dead=1
+SELECT attrelid::regclass::text AS rel, attname, attnum FROM pg_attribute
+  WHERE attrelid IN ('pr'::regclass,'pr1'::regclass,'pr2'::regclass)
+    AND attname = 'dead'
+  ORDER BY 1;
+ rel | attname | attnum 
+-----+---------+--------
+ pr  | dead    |      3
+ pr1 | dead    |      2
+ pr2 | dead    |      1
+(3 rows)
+
+CREATE UNIQUE INDEX pr_live ON pr (src, ext) WHERE dead IS NULL GLOBAL;
+INSERT INTO pr1 (pad, dead, ext, src) VALUES (1, now(), 'x', 3);
+INSERT INTO pr2 (dead, pad2, src, ext) VALUES (now(), 2, 3, 'x');
+SELECT count(*) FROM pr WHERE ext = 'x';
+ count 
+-------
+     2
+(1 row)
+
+INSERT INTO pr1 (pad, dead, ext, src) VALUES (3, NULL, 'y', 4);
+INSERT INTO pr2 (dead, pad2, src, ext) VALUES (NULL, 4, 4, 'y');  -- must fail
+ERROR:  duplicate key value violates unique constraint "pr_live"
+DETAIL:  Key (src, ext)=(4, y) already exists.
+DROP TABLE pr1, pr2, pr CASCADE;
+DROP TABLE pc, pb, pp CASCADE;

@@ -140,6 +140,9 @@ test: progresql_inherit
 # progresql_fk_clone runs serially: it counts FK constraints over inheritance
 # leaves and queries pg_index_partition, so keep it off the shared group.
 test: progresql_fk_clone
+# progresql_partial runs serially: it uses common table names and ALTER ...
+# INHERIT, same reason as progresql_inherit.
+test: progresql_partial
 test: progresql_dumpdef
 
 # ----------
