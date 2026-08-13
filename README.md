@@ -129,6 +129,49 @@ forward-ports:
 For a `PRIMARY KEY` / `UNIQUE` *constraint*, resolve its `conindid` first and pass
 that to `pg_index_is_global` / `pg_index_global_columns`.
 
+#### If your tooling reads `indkey` directly — read this first
+
+Tools written against stock PostgreSQL generally derive a table's key columns
+straight from `pg_index.indkey`. **That yields a wrong answer on a spanning
+index**, and the failure is silent, so it is worth understanding before you put a
+`GLOBAL` primary key on anything.
+
+A spanning index carries its discriminator as a trailing key column, and that
+column is `tableoid` — a **system** column, attnum **-6**:
+
+```
+ idx     | indisprimary | indnatts | indnkeyatts | indnuniqatts | indkey
+ mf_pkey | t            |        2 |           2 |            1 | 1 -6
+```
+
+Stock PostgreSQL rejects `CREATE INDEX ... (tableoid)` outright (`index creation
+on system columns is not supported`), so a negative attnum in `indkey` is a state
+vanilla guarantees is unreachable — which is precisely why existing tooling does
+not defend against it. Note also that `indnkeyatts` **counts** the discriminator,
+while `indnuniqatts` is the user-facing key count.
+
+The concrete failure: an ORM that derives the primary key from `indkey` without
+filtering system columns concludes the table has a composite key `(id, tableoid)`.
+Observed with the Rails PostgreSQL adapter, whose `primary_keys` join uses
+`indkey[idx]` with no attnum filter — every `reload` / `update` / `destroy` then
+emits
+
+```sql
+WHERE "t"."id" = $1 AND "t"."tableoid" IS NULL
+```
+
+`tableoid` is never NULL, so those statements match zero rows **while reporting
+success**: `update!` returns true and nothing is written.
+
+Two ways to be correct:
+
+- **Preferred:** use `pg_index_global_columns()` above, which excludes the
+  discriminator by construction.
+- **For tooling you must patch rather than replace:** filter system attnums —
+  `AND a.attnum > 0`. This is a no-op against stock PostgreSQL (which can never
+  have a negative attnum there) and load-bearing here, so it is safe to carry
+  upstream in a shared tool rather than maintaining a fork-specific branch.
+
 ---
 
 ## Quickstart
@@ -357,6 +400,18 @@ git rebase upstream/REL_18_STABLE progresql-18
   grandchildren would have no `partseq` and would silently escape the index. The
   order matters — build the multi-level tree first, then add `GLOBAL`; or use an
   inheritance root, under which depth can be added freely at any time.
+- **A `WHERE` predicate on a `GLOBAL` index is accepted and stored but not
+  enforced** (known bug). `CREATE UNIQUE INDEX ... WHERE <pred> GLOBAL` is parsed,
+  recorded in `pg_index.indpred`, and echoed back by `pg_get_indexdef` — but the
+  predicate is never evaluated when the index is maintained, so *every* row is
+  indexed and uniqueness is enforced across all of them. The result is a strictly
+  **tighter** constraint than the one declared, with no error: rows that do not
+  satisfy the predicate still collide. This affects the executor insert path, the
+  logical-replication apply path, and the `CREATE INDEX` backfill (so the index
+  may fail to build over pre-existing data that is legal under the declared
+  predicate). Until it is fixed, express "one live row per key" with a sentinel
+  column in the key — e.g. `valid_to timestamptz NOT NULL DEFAULT 'infinity'` with
+  a `GLOBAL` index on `(key..., valid_to)` — rather than a partial predicate.
 - The per-statement cache is exactly that — per statement; it is rebuilt for
   each top-level DML.
 - **Logical replication of `UPDATE`/`DELETE`** from a spanning-indexed table
