@@ -34,7 +34,7 @@
  * "feature-set" number that silently stayed at "1.0" across several feature
  * releases -- tying it to the release version is what stops that drift.)
  */
-#define PROGRESQL_VERSION_STR "0.2.5"
+#define PROGRESQL_VERSION_STR "0.2.6"
 
 extern void ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 										  ItemPointer tupleid,
@@ -85,10 +85,22 @@ extern void progresql_clean_spanning_indexes_for_partition(Relation partRel,
 extern void progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel);
 extern void progresql_rebuild_spanning_for_rewritten_partition(Oid relid);
 extern void BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId);
-/* remap a spanning index's root-relative user-key attnums to a leaf, by name */
+/*
+ * Remap a spanning index's root-relative user-key attnums -- and, for a partial
+ * index, its root-relative predicate -- to a leaf, by column name.
+ */
 extern void spanning_remap_keyatts_to_leaf(IndexInfo *idxInfo,
 										   const AttrNumber *rootKeyAtts,
+										   List *rootPredicate,
 										   Oid rootOid, Oid leafOid);
+
+/*
+ * Does this (leaf-remapped) index's partial predicate accept the row in slot?
+ * Always true for a non-partial index.  estate supplies the per-tuple context.
+ */
+extern bool spanning_index_predicate_holds(IndexInfo *idxInfo,
+										   TupleTableSlot *slot,
+										   EState *estate);
 
 /* spanning_relcache.c — leaf->root resolution + HOT-blocking attrs (E7) */
 extern List *progresql_spanning_ancestors(Oid relid);

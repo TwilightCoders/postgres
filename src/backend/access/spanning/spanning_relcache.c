@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/skey.h"
 #include "access/stratnum.h"
 #include "access/sysattr.h"
@@ -29,7 +30,10 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_inherits.h"
 #include "nodes/bitmapset.h"
+#include "nodes/nodes.h"
 #include "nodes/pg_list.h"
+#include "optimizer/optimizer.h"
+#include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -190,6 +194,62 @@ progresql_add_spanning_hotblocking_attrs(Relation relation,
 				*hotblockingattrs =
 					bms_add_member(*hotblockingattrs,
 								   leafattno - FirstLowInvalidHeapAttributeNumber);
+			}
+
+			/*
+			 * A partial spanning index's PREDICATE columns must block HOT for
+			 * the same reason its key columns do -- in fact more sharply.  An
+			 * update that moves a row across the predicate boundary changes
+			 * whether the row belongs in the index at all.  If such an update
+			 * went HOT, the old entry would survive as a redirect and resolve
+			 * through the HOT chain to the *new* tuple, so the liveness probe
+			 * would report a conflict for a row the predicate no longer covers
+			 * -- a phantom violation on exactly the "close this version and
+			 * insert its replacement" pattern partial indexes exist to serve.
+			 * Stock gets this for free by pulling ii_Predicate's varattnos into
+			 * the index attribute set; a spanning index is not in the leaf's own
+			 * index list, so we must do it here.
+			 */
+			{
+				Datum		predDatum;
+				bool		predIsNull;
+
+				predDatum = heap_getattr(tup, Anum_pg_index_indpred,
+										 RelationGetDescr(pg_index_rel),
+										 &predIsNull);
+				if (!predIsNull)
+				{
+					char	   *predString = TextDatumGetCString(predDatum);
+					Node	   *pred = (Node *) stringToNode(predString);
+					Bitmapset  *predattrs = NULL;
+					int			x = -1;
+
+					/* index predicates are stored with varno 1 */
+					pull_varattnos(pred, 1, &predattrs);
+
+					while ((x = bms_next_member(predattrs, x)) >= 0)
+					{
+						AttrNumber	rootattno =
+							x + FirstLowInvalidHeapAttributeNumber;
+						char	   *pattname;
+						AttrNumber	pleafattno;
+
+						if (rootattno <= 0)		/* system column: skip */
+							continue;
+						pattname = get_attname(parentOid, rootattno, true);
+						if (pattname == NULL)
+							continue;
+						pleafattno = get_attnum(leafOid, pattname);
+						pfree(pattname);
+						if (pleafattno == InvalidAttrNumber)
+							continue;
+
+						*hotblockingattrs =
+							bms_add_member(*hotblockingattrs,
+										   pleafattno - FirstLowInvalidHeapAttributeNumber);
+					}
+					pfree(predString);
+				}
 			}
 		}
 		systable_endscan(scan);

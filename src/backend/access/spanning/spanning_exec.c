@@ -149,11 +149,14 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 			se->discrimKeyPos = se->indexInfo->ii_NumIndexKeyAttrs - 1;
 
 			/*
-			 * The index's key attnums are relative to the root the index lives
-			 * on; remap them to this leaf by column name so FormIndexDatum reads
-			 * the right columns when the leaf orders them differently (a
-			 * reordered inheritance child, or a partition with a divergent
-			 * layout).  Done once per cached (leaf, index) entry.
+			 * The index's key attnums -- and a partial index's predicate --
+			 * are relative to the root the index lives on; remap them to this
+			 * leaf by column name so FormIndexDatum reads the right columns,
+			 * and the predicate tests the right ones, when the leaf orders them
+			 * differently (a reordered inheritance child, or a partition with a
+			 * divergent layout).  Done once per cached (leaf, index) entry, on
+			 * a freshly built IndexInfo, so passing ii_Predicate as the
+			 * root-relative source cannot compound across leaves.
 			 */
 			{
 				AttrNumber	rootKeyAtts[INDEX_MAX_KEYS];
@@ -161,6 +164,7 @@ progresql_build_partition_cache_entry(EState *estate, Relation partition)
 				memcpy(rootKeyAtts, se->indexInfo->ii_IndexAttrNumbers,
 					   se->indexInfo->ii_NumIndexKeyAttrs * sizeof(AttrNumber));
 				spanning_remap_keyatts_to_leaf(se->indexInfo, rootKeyAtts,
+											   se->indexInfo->ii_Predicate,
 											   parentOid,
 											   RelationGetRelid(partition));
 			}
@@ -233,6 +237,48 @@ ProgresqlReleasePartitionCache(EState *estate)
 }
 
 /*
+ * spanning_index_predicate_holds
+ *
+ * A partial index covers only the rows satisfying its predicate, so a row the
+ * predicate rejects must get no entry at all -- otherwise the index enforces
+ * uniqueness over rows it does not describe, which is a strictly tighter
+ * constraint than the one declared, and silently so.  Mirrors the partial-index
+ * test stock does in ExecInsertIndexTuples.
+ *
+ * idxInfo must already have been remapped to this leaf
+ * (spanning_remap_keyatts_to_leaf), since the predicate is evaluated against a
+ * leaf tuple.  The prepared ExprState is cached on the IndexInfo, whose
+ * lifetime is the per-statement partition cache entry.
+ *
+ * The caller's ecxt_scantuple is saved and restored: this runs inside another
+ * node's index-maintenance work, and clobbering it would corrupt that.
+ */
+bool
+spanning_index_predicate_holds(IndexInfo *idxInfo, TupleTableSlot *slot,
+							   EState *estate)
+{
+	ExprContext	   *econtext;
+	TupleTableSlot *save_scantuple;
+	bool			result;
+
+	if (idxInfo->ii_Predicate == NIL)
+		return true;
+
+	if (idxInfo->ii_PredicateState == NULL)
+		idxInfo->ii_PredicateState =
+			ExecPrepareQual(idxInfo->ii_Predicate, estate);
+
+	econtext = GetPerTupleExprContext(estate);
+	save_scantuple = econtext->ecxt_scantuple;
+	econtext->ecxt_scantuple = slot;
+
+	result = ExecQual(idxInfo->ii_PredicateState, econtext);
+
+	econtext->ecxt_scantuple = save_scantuple;
+	return result;
+}
+
+/*
  * ExecInsertSpanningIndexTuples
  *
  * Insert an entry for the given tuple into every ProgreSQL spanning index on
@@ -282,6 +328,10 @@ ExecInsertSpanningIndexTuples(TupleTableSlot *slot,
 	for (int i = 0; i < pe->nEntries; i++)
 	{
 		ProgresqlSpanningEntry *se = &pe->entries[i];
+
+		/* a partial index takes no entry for a row its predicate rejects */
+		if (!spanning_index_predicate_holds(se->indexInfo, slot, estate))
+			continue;
 
 		FormIndexDatum(se->indexInfo, slot, estate, values, isnull);
 
@@ -446,6 +496,10 @@ ExecInsertSpanningIndexTuplesApply(TupleTableSlot *slot, ItemPointer tupleid,
 	{
 		ProgresqlSpanningEntry *se = &pe->entries[i];
 		bool		satisfiesConstraint;
+
+		/* a partial index takes no entry for a row its predicate rejects */
+		if (!spanning_index_predicate_holds(se->indexInfo, slot, estate))
+			continue;
 
 		FormIndexDatum(se->indexInfo, slot, estate, values, isnull);
 

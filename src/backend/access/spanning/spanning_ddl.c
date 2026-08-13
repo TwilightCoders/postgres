@@ -499,7 +499,7 @@ progresql_clean_spanning_indexes_for_partition(Relation partRel, bool drop_map)
  */
 void
 spanning_remap_keyatts_to_leaf(IndexInfo *idxInfo, const AttrNumber *rootKeyAtts,
-							   Oid rootOid, Oid leafOid)
+							   List *rootPredicate, Oid rootOid, Oid leafOid)
 {
 	int			nkey = idxInfo->ii_NumIndexKeyAttrs;
 	int			i;
@@ -516,6 +516,37 @@ spanning_remap_keyatts_to_leaf(IndexInfo *idxInfo, const AttrNumber *rootKeyAtts
 		pfree(name);
 	}
 	idxInfo->ii_IndexAttrNumbers[nkey - 1] = rootKeyAtts[nkey - 1];
+
+	/*
+	 * A partial index's predicate is root-relative too, and is evaluated
+	 * against a *leaf* tuple, so its Vars need the same by-name translation --
+	 * otherwise a leaf whose columns are ordered differently would test the
+	 * wrong column.  Always re-derive from the caller's root-relative copy
+	 * rather than from ii_Predicate: this runs once per leaf, and mapping an
+	 * already-mapped predicate would compound the translation.
+	 *
+	 * map_partition_varattnos does the by-name Var mapping (index predicates
+	 * are stored with varno 1).  Both relations are already lock-held by the
+	 * caller, hence NoLock.
+	 */
+	if (rootPredicate != NIL)
+	{
+		if (rootOid == leafOid)
+			idxInfo->ii_Predicate = rootPredicate;
+		else
+		{
+			Relation	rootRel = relation_open(rootOid, NoLock);
+			Relation	leafRel = relation_open(leafOid, NoLock);
+
+			idxInfo->ii_Predicate = map_partition_varattnos(rootPredicate, 1,
+														   leafRel, rootRel);
+			relation_close(leafRel, NoLock);
+			relation_close(rootRel, NoLock);
+		}
+
+		/* the cached ExprState was compiled against the pre-remap expression */
+		idxInfo->ii_PredicateState = NULL;
+	}
 }
 
 /*
@@ -549,8 +580,8 @@ spanning_remap_keyatts_to_leaf(IndexInfo *idxInfo, const AttrNumber *rootKeyAtts
  */
 static void
 spanning_backfill_leaf(Relation idxRel, IndexInfo *idxInfo,
-					   const AttrNumber *rootKeyAtts, Oid rootOid,
-					   Oid leafOid, Relation heapRel)
+					   const AttrNumber *rootKeyAtts, List *rootPredicate,
+					   Oid rootOid, Oid leafOid, Relation heapRel)
 {
 	Relation	leafRel;
 	TupleTableSlot *slot;
@@ -558,6 +589,7 @@ spanning_backfill_leaf(Relation idxRel, IndexInfo *idxInfo,
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 	int32		partseq;
+	EState	   *estate = NULL;
 
 	leafRel = table_open(leafOid, AccessShareLock);
 
@@ -576,7 +608,12 @@ spanning_backfill_leaf(Relation idxRel, IndexInfo *idxInfo,
 	partseq = SpanningGetOrAllocPartseq(idxRel, leafOid);
 
 	/* read this leaf's columns by name (layout may differ from the root) */
-	spanning_remap_keyatts_to_leaf(idxInfo, rootKeyAtts, rootOid, leafOid);
+	spanning_remap_keyatts_to_leaf(idxInfo, rootKeyAtts, rootPredicate,
+								   rootOid, leafOid);
+
+	/* a partial index needs an expression context to test its predicate */
+	if (idxInfo->ii_Predicate != NIL)
+		estate = CreateExecutorState();
 
 	slot = table_slot_create(leafRel, NULL);
 	scan = table_beginscan(leafRel, GetActiveSnapshot(), 0, NULL);
@@ -584,6 +621,19 @@ spanning_backfill_leaf(Relation idxRel, IndexInfo *idxInfo,
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{
 		int			k;
+
+		/*
+		 * A partial index covers only the rows its predicate accepts; the rest
+		 * must not be backfilled, or the index would enforce uniqueness over
+		 * rows it does not describe (and could fail to build over pre-existing
+		 * data that is perfectly legal under the declared predicate).
+		 */
+		if (estate != NULL)
+		{
+			ResetPerTupleExprContext(estate);
+			if (!spanning_index_predicate_holds(idxInfo, slot, estate))
+				continue;
+		}
 
 		FormIndexDatum(idxInfo, slot, NULL, values, isnull);
 
@@ -599,6 +649,8 @@ spanning_backfill_leaf(Relation idxRel, IndexInfo *idxInfo,
 
 	table_endscan(scan);
 	ExecDropSingleTupleTableSlot(slot);
+	if (estate != NULL)
+		FreeExecutorState(estate);
 
 	/*
 	 * Reset this leaf's cached relcache state.  Adding a spanning index changes
@@ -666,6 +718,7 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			Relation	idxRel;
 			IndexInfo  *idxInfo;
 			AttrNumber	rootKeyAtts[INDEX_MAX_KEYS];
+			List	   *rootPredicate;
 			ListCell   *ll;
 
 			idxRel = index_open(indexOid, RowExclusiveLock);
@@ -677,9 +730,10 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 			}
 
 			idxInfo = BuildIndexInfo(idxRel);
-			/* index key attnums are root-relative; remapped per leaf by name */
+			/* key attnums and predicate are root-relative; remapped per leaf */
 			memcpy(rootKeyAtts, idxInfo->ii_IndexAttrNumbers,
 				   idxInfo->ii_NumIndexKeyAttrs * sizeof(AttrNumber));
+			rootPredicate = idxInfo->ii_Predicate;
 
 			foreach(ll, leafoids)
 			{
@@ -693,7 +747,8 @@ progresql_backfill_spanning_indexes_for_attached_partition(Relation attachrel)
 				 */
 				PushActiveSnapshot(GetTransactionSnapshot());
 				spanning_backfill_leaf(idxRel, idxInfo, rootKeyAtts,
-									   parentOid, leafOid, parentRel);
+									   rootPredicate, parentOid, leafOid,
+									   parentRel);
 				PopActiveSnapshot();
 			}
 
@@ -768,15 +823,17 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 	Relation	idxRel;
 	IndexInfo  *idxInfo;
 	AttrNumber	rootKeyAtts[INDEX_MAX_KEYS];
+	List	   *rootPredicate;
 	List	   *leafoids;
 	ListCell   *lc;
 	Snapshot	snapshot;
 
 	idxRel = index_open(indexRelationId, RowExclusiveLock);
 	idxInfo = BuildIndexInfo(idxRel);
-	/* index key attnums are root-relative; remapped per leaf by name */
+	/* key attnums and predicate are root-relative; remapped per leaf by name */
 	memcpy(rootKeyAtts, idxInfo->ii_IndexAttrNumbers,
 		   idxInfo->ii_NumIndexKeyAttrs * sizeof(AttrNumber));
+	rootPredicate = idxInfo->ii_Predicate;
 
 	/*
 	 * Enumerate every storage-bearing leaf beneath this root, at any depth,
@@ -800,7 +857,7 @@ BuildSpanningIndexFromPartitions(Relation rel, Oid indexRelationId)
 	{
 		Oid			partOid = lfirst_oid(lc);
 
-		spanning_backfill_leaf(idxRel, idxInfo, rootKeyAtts,
+		spanning_backfill_leaf(idxRel, idxInfo, rootKeyAtts, rootPredicate,
 							   RelationGetRelid(rel), partOid, rel);
 	}
 
