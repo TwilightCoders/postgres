@@ -135,27 +135,81 @@ user of that tool, and is defensible to the tool's maintainers on its own merits
 4. Revisit the representation only if a *different* motivation appears — see
    below.
 
-## Unverified observation, recorded for whoever revisits this
+## The simplification hypothesis — PROTOTYPED AND FALSIFIED
 
-If the discriminator became a non-key attribute, two leaves holding the same user
-key would produce index tuples with **identical keys** rather than distinct ones.
-Stock btree would then reject the second insert natively, on the same page lock
-that serialises any ordinary unique index — which is the behaviour
-`indnuniqatts`, the `_bt_check_unique` special-casing, and possibly the whole
-cross-partition value lock (`spanning_lock.c`) exist to reconstruct.
+The idea worth testing was: if the discriminator became a non-key attribute, two
+leaves holding the same user key would produce index tuples with **identical
+keys**, so stock btree would reject the second insert natively, on the same page
+lock that serialises any ordinary unique index. That would potentially retire
+`indnuniqatts`, the `_bt_check_unique` special-casing, and the cross-partition
+value lock (`spanning_lock.c`) — shrinking the fork's diff against upstream,
+which is the north star.
 
-That suggests the non-key representation might substantially *simplify* the fork
-rather than merely relocate a field. It is not a reason to do it for
-introspection — Option B still doesn't fix that — but it could be a reason to do
-it for its own sake, and it would materially shrink the fork's diff against
-upstream, which is the north star.
+**It does not work, for a fundamental reason.** The discriminator being a *key*
+column is what supplies the total order btree requires, because **heap TIDs are
+not unique across the leaves a spanning index spans.**
 
-**This is a hypothesis, not a finding.** It has not been prototyped, and the
-interactions that would need to hold up are non-trivial: btree deduplication
-(disabled for indexes with INCLUDE columns, which may be exactly what makes this
-safe, or may not), suffix truncation of non-key attributes at page splits, the
-partseq-filtered VACUUM bulkdelete, and whether the leaf-only availability of
-non-key attributes is compatible with every site that currently reads the
-discriminator. Any attempt should start with a throwaway prototype answering
-"does stock uniqueness actually do the right thing here", before touching
-anything shipped.
+Every leaf's heap numbers its own blocks from zero, so two leaves trivially hold
+tuples at the same `(block, offset)`:
+
+```
+ leaf | ctid  | id
+ p_a  | (0,1) |  1
+ p_b  | (0,1) |  7
+```
+
+That is not a corner case in the index. A **routine cross-partition UPDATE** —
+one supported operation, no error involved — puts two entries for the same user
+key into the spanning index with colliding TIDs. Measured on a live `PRIMARY KEY
+(id) GLOBAL`, moving `id=42` from `sp_a` to `sp_b`:
+
+```
+ itemoffset | heap_tid |          data
+          1 | (0,1)    | 2a 00 00 00 01 00 00 00     <- id=42, partseq 1 (sp_a)
+          2 | (0,1)    | 2a 00 00 00 02 00 00 00     <- id=42, partseq 2 (sp_b)
+```
+
+Identical key (`2a 00 00 00` = 42), identical heap TID `(0,1)`. **The only thing
+distinguishing these two index tuples is the trailing partseq.** Demote it to a
+non-key attribute and they become indistinguishable in btree's sort order.
+
+btree does not tolerate that. From `_bt_truncate` (`nbtutils.c`):
+
+> Lehman and Yao require that the downlink to the right page ... be a strict
+> lower bound on items on the right page, and a non-strict upper bound for items
+> on the left page. Assert that heap TIDs follow these invariants, since a heap
+> TID value is apparently needed as a tiebreaker.
+
+```c
+Assert(ItemPointerCompare(BTreeTupleGetMaxHeapTID(lastleft),
+                          BTreeTupleGetHeapTID(firstright)) < 0);
+```
+
+**Strictly** less than. Equal-key tuples must have strictly ordered heap TIDs, or
+a page split between them cannot produce a valid separator. With a non-key
+discriminator, the two entries above violate that the moment a split lands
+between them — and on a non-assert build it is a silently wrong pivot rather than
+a crash.
+
+We already know what that looks like in this index: it is the exact assertion
+that fired during the duplicate-entry corruption incident
+(`docs/plans/spanning-dedup-corruption.md`), whose signature was equal-key
+entries with non-monotonic heap TIDs and `bt_index_check` reporting `item order
+invariant violated`.
+
+**Conclusion.** The trailing partseq key column is not an incidental
+implementation choice that happens to leak into `pg_index` — it is load-bearing
+for btree's total-order invariant, and it is load-bearing *because* a spanning
+index addresses multiple heaps. Any future attempt to move it out of the key must
+first answer what else supplies a strict total order over entries whose heap TIDs
+can collide. Uniqueness across leaves is the easy half; ordering is the hard
+half, and it is the half the hypothesis missed.
+
+Corollaries worth keeping:
+
+- The `_bt_check_unique` incision does not go away under any of these variants
+  regardless — it exists to resolve a TID to the leaf that owns it, which is
+  needed whenever entries address more than one heap, key column or not.
+- The value lock (`spanning_lock.c`) would only become redundant if same-user-key
+  entries collapsed to one btree page, which is the very collapse that breaks
+  ordering. The two are the same trade, not independent wins.
